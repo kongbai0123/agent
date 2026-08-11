@@ -95,6 +95,8 @@ def test_policy_hash_and_checkout_match_pinned_hermes_release() -> None:
 
 
 def test_policy_registers_exact_tools_with_pinned_hermes_runtime(tmp_path: Path) -> None:
+    if not (HERMES_SOURCE / "tools" / "registry.py").is_file():
+        pytest.skip("Hermes source checkout is an installation-time integration fixture")
     project = tmp_path / "project"
     project.mkdir()
     script = r"""
