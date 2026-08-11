@@ -1,0 +1,134 @@
+{
+  "schema_version": 1,
+  "project_id": "rag-regression",
+  "top_k": 3,
+  "minimum_mean_recall": 0.9,
+  "documents": [
+    {
+      "id": "aurora-backup",
+      "text": "Aurora backup policy keeps encrypted snapshots for a retention period of 30 days."
+    },
+    {
+      "id": "cedar-payroll",
+      "text": "Cedar payroll changes must be submitted before the Friday cutoff at 17:00."
+    },
+    {
+      "id": "cobalt-rate-limit",
+      "text": "Cobalt API rate limit is 120 requests per minute and excess requests return status 429."
+    },
+    {
+      "id": "delta-incident",
+      "text": "Delta incident policy requires a P1 response within 15 minutes."
+    },
+    {
+      "id": "ember-password",
+      "text": "Ember password policy requires at least 14 characters and multi-factor authentication."
+    },
+    {
+      "id": "falcon-rollback",
+      "text": "Falcon release policy triggers rollback after three consecutive health-check failures."
+    },
+    {
+      "id": "glacier-archive",
+      "text": "Glacier archive policy retains cold-storage records for seven years."
+    },
+    {
+      "id": "harbor-onboarding",
+      "text": "Harbor onboarding requires identity verification within 24 hours."
+    },
+    {
+      "id": "iris-invoice",
+      "text": "Iris invoice terms require payment within 30 calendar days."
+    },
+    {
+      "id": "juniper-replica",
+      "text": "Juniper database monitoring alerts when replica lag exceeds five seconds."
+    },
+    {
+      "id": "kinetic-support",
+      "text": "Kinetic support hours are Monday through Friday from 09:00 to 18:00."
+    },
+    {
+      "id": "lunar-residency",
+      "text": "Lunar data residency policy stores customer records in Taiwan."
+    },
+    {
+      "id": "maple-maintenance",
+      "text": "Maple maintenance window runs every Sunday from 02:00 to 04:00."
+    },
+    {
+      "id": "nova-export",
+      "text": "Nova export supports both CSV and JSON output formats."
+    },
+    {
+      "id": "orchid-audit-log",
+      "text": "Orchid audit log policy retains security events for 365 days."
+    },
+    {
+      "id": "prism-webhook",
+      "text": "Prism webhook authentication signs every callback with HMAC SHA-256."
+    }
+  ],
+  "queries": [
+    {
+      "id": "q01",
+      "text": "What is the Aurora backup retention period?",
+      "expected_document_ids": ["aurora-backup"]
+    },
+    {
+      "id": "q02",
+      "text": "What is the Cedar payroll Friday cutoff?",
+      "expected_document_ids": ["cedar-payroll"]
+    },
+    {
+      "id": "q03",
+      "text": "What is the Cobalt API rate limit?",
+      "expected_document_ids": ["cobalt-rate-limit"]
+    },
+    {
+      "id": "q04",
+      "text": "How quickly must a Delta P1 incident receive a response?",
+      "expected_document_ids": ["delta-incident"]
+    },
+    {
+      "id": "q05",
+      "text": "What is the Ember password minimum length?",
+      "expected_document_ids": ["ember-password"]
+    },
+    {
+      "id": "q06",
+      "text": "When does Falcon trigger a release rollback?",
+      "expected_document_ids": ["falcon-rollback"]
+    },
+    {
+      "id": "q07",
+      "text": "How long does Glacier retain archive records?",
+      "expected_document_ids": ["glacier-archive"]
+    },
+    {
+      "id": "q08",
+      "text": "Where does Lunar data residency store customer records?",
+      "expected_document_ids": ["lunar-residency"]
+    },
+    {
+      "id": "q09",
+      "text": "When is the Maple maintenance window?",
+      "expected_document_ids": ["maple-maintenance"]
+    },
+    {
+      "id": "q10",
+      "text": "Which output formats does Nova export support?",
+      "expected_document_ids": ["nova-export"]
+    },
+    {
+      "id": "q11",
+      "text": "How long does Orchid retain an audit log?",
+      "expected_document_ids": ["orchid-audit-log"]
+    },
+    {
+      "id": "q12",
+      "text": "Which HMAC algorithm authenticates a Prism webhook?",
+      "expected_document_ids": ["prism-webhook"]
+    }
+  ]
+}

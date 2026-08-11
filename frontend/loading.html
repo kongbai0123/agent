@@ -1,0 +1,278 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>正在啟動 · Local AI Workbench</title>
+  <link rel="icon" type="image/png" href="app-icon.png?v=1">
+  <style>
+    :root {
+      color-scheme: light;
+      font-family: "Segoe UI", "Microsoft JhengHei", sans-serif;
+      color: #28272d;
+      background: #f2f0ec;
+    }
+    * { box-sizing: border-box; }
+    body {
+      min-height: 100vh;
+      margin: 0;
+      display: grid;
+      place-items: center;
+      padding: 24px;
+      background:
+        radial-gradient(circle at 50% 30%, rgba(87, 98, 224, .10), transparent 34%),
+        #f2f0ec;
+    }
+    .startup-card {
+      width: min(460px, 100%);
+      padding: 28px 30px 24px;
+      border: 1px solid #ddd9d2;
+      border-radius: 20px;
+      background: rgba(255, 255, 255, .94);
+      box-shadow: 0 18px 50px rgba(45, 42, 55, .10);
+    }
+    .brand { display: flex; align-items: center; gap: 12px; }
+    .brand-mark {
+      width: 38px;
+      height: 38px;
+      display: block;
+      flex: none;
+      object-fit: contain;
+    }
+    h1 { margin: 0; font-size: 19px; line-height: 1.25; }
+    .subtitle { margin: 3px 0 0; color: #77727d; font-size: 13px; }
+    .stage-row { display: flex; justify-content: space-between; gap: 16px; margin-top: 27px; }
+    #stage-title { margin: 0; font-size: 15px; font-weight: 650; }
+    #elapsed { flex: none; color: #79747e; font-size: 12px; }
+    .progress-track {
+      height: 7px;
+      margin-top: 12px;
+      overflow: hidden;
+      border-radius: 999px;
+      background: #e7e4df;
+    }
+    .progress-bar {
+      width: 12%;
+      height: 100%;
+      border-radius: inherit;
+      background: linear-gradient(90deg, #5662df, #7a6ee8);
+      transition: width .45s ease;
+    }
+    .stage-note { min-height: 38px; margin: 10px 0 0; color: #6d6872; font-size: 13px; line-height: 1.5; }
+    .steps { display: grid; gap: 9px; margin: 20px 0 0; padding: 0; list-style: none; }
+    .step { display: flex; align-items: center; gap: 9px; color: #918c95; font-size: 13px; }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: #d4d0d7; }
+    .step.active { color: #3e3b44; font-weight: 600; }
+    .step.active .dot { background: #5662df; box-shadow: 0 0 0 4px rgba(86, 98, 223, .12); }
+    .step.done { color: #5f7c68; }
+    .step.done .dot { background: #45a466; }
+    .slow-box {
+      display: none;
+      margin-top: 18px;
+      padding: 11px 12px;
+      border: 1px solid #e9d9a8;
+      border-radius: 10px;
+      color: #725e27;
+      background: #fffaf0;
+      font-size: 12px;
+      line-height: 1.5;
+    }
+    .slow-box.visible { display: block; }
+    .actions { display: flex; justify-content: flex-end; margin-top: 14px; }
+    button {
+      border: 1px solid #d8d4dd;
+      border-radius: 9px;
+      padding: 7px 11px;
+      color: #4e4a54;
+      background: #fff;
+      font: inherit;
+      font-size: 12px;
+      cursor: pointer;
+    }
+    button:hover { border-color: #8e87df; color: #4c55c9; }
+    @media (prefers-reduced-motion: reduce) { .progress-bar { transition: none; } }
+  </style>
+</head>
+<body>
+  <main class="startup-card" aria-labelledby="app-title">
+    <div class="brand">
+      <img class="brand-mark" src="app-icon.png?v=1" alt="" aria-hidden="true">
+      <div>
+        <h1 id="app-title">Local AI Workbench</h1>
+        <p class="subtitle">正在準備本機工作環境</p>
+      </div>
+    </div>
+
+    <div class="stage-row">
+      <p id="stage-title" aria-live="polite">啟動操作介面</p>
+      <span id="elapsed">已等待 0 秒</span>
+    </div>
+    <div class="progress-track" role="progressbar" aria-label="啟動階段進度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="12">
+      <div class="progress-bar" id="progress-bar"></div>
+    </div>
+    <p class="stage-note" id="stage-note" aria-live="polite">畫面已就緒，接著載入後端服務與專案索引。</p>
+
+    <ol class="steps" aria-label="啟動步驟">
+      <li class="step done"><span class="dot"></span>啟動操作介面</li>
+      <li class="step active"><span class="dot"></span>載入後端與專案索引</li>
+      <li class="step"><span class="dot"></span>檢查模型服務</li>
+      <li class="step"><span class="dot"></span>準備工作區</li>
+    </ol>
+
+    <div class="slow-box" id="slow-box" role="status">
+      載入時間比平常長。大型索引或首次啟動可能需要更多時間；畫面仍會持續檢查，不代表程式已當機。
+    </div>
+    <div class="actions"><button type="button" id="retry">立即重新檢查</button></div>
+  </main>
+
+  <script>
+    (() => {
+      "use strict";
+
+      const params = new URLSearchParams(location.search);
+      const defaultBackend = "http://127.0.0.1:8000";
+      const requestedBackend = params.get("backend") || defaultBackend;
+      let backendUrl = defaultBackend;
+      try {
+        const candidate = new URL(requestedBackend);
+        if (candidate.protocol === "http:" && ["127.0.0.1", "localhost"].includes(candidate.hostname)) {
+          backendUrl = candidate.origin;
+        }
+      } catch (_) { /* Keep the safe loopback default. */ }
+
+      let targetUrl = new URL("index.html", `${backendUrl}/`);
+      try {
+        const candidate = new URL(params.get("target") || targetUrl.href);
+        if (candidate.origin === backendUrl) targetUrl = candidate;
+      } catch (_) { /* Keep the validated backend-origin default. */ }
+
+      const title = document.getElementById("stage-title");
+      const note = document.getElementById("stage-note");
+      const elapsed = document.getElementById("elapsed");
+      const progress = document.getElementById("progress-bar");
+      const progressTrack = document.querySelector("[role='progressbar']");
+      const steps = [...document.querySelectorAll(".step")];
+      const slowBox = document.getElementById("slow-box");
+      const retry = document.getElementById("retry");
+      const startedAt = Date.now();
+      let checking = false;
+      let finished = false;
+      let progressValue = 18;
+      let lastStartupStatus = null;
+      let consecutiveStatusFailures = 0;
+
+      function setStage(index, heading, detail, value) {
+        title.textContent = heading;
+        note.textContent = detail;
+        progressValue = value;
+        progress.style.width = `${value}%`;
+        progressTrack.setAttribute("aria-valuenow", String(value));
+        steps.forEach((step, stepIndex) => {
+          step.classList.toggle("done", stepIndex < index);
+          step.classList.toggle("active", stepIndex === index);
+        });
+      }
+
+      async function request(path, timeoutMs) {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), timeoutMs);
+        try {
+          return await fetch(`${backendUrl}${path}?startup=${Date.now()}`, {
+            cache: "no-store",
+            signal: controller.signal
+          });
+        } finally {
+          clearTimeout(timer);
+        }
+      }
+
+      async function readStartupStatus() {
+        const response = await fetch(`/startup-status.json?time=${Date.now()}`, { cache: "no-store" });
+        if (!response.ok) throw new Error("startup_status_unavailable");
+        return response.json();
+      }
+
+      function applyStartupStatus(status) {
+        if (!status || finished) return;
+        lastStartupStatus = status;
+        if (status.status === "failed") {
+          title.textContent = status.message || "啟動未完成";
+          note.textContent = status.detail || "請查看啟動紀錄後重試。";
+          slowBox.classList.add("visible");
+          return;
+        }
+        const current = Number(status.current_documents);
+        const total = Number(status.total_documents);
+        const documentText = Number.isFinite(current) && Number.isFinite(total) && total > 0
+          ? ` · 文件 ${current}/${total}`
+          : "";
+        title.textContent = status.message || title.textContent;
+        note.textContent = `${status.detail || "正在讀取後端回報"}${documentText}`;
+        const value = Math.max(progressValue, Math.min(99, Number(status.progress_percent) || progressValue));
+        progressValue = value;
+        progress.style.width = `${value}%`;
+        progressTrack.setAttribute("aria-valuenow", String(value));
+      }
+
+      async function checkReadiness() {
+        if (checking || finished) return;
+        checking = true;
+        try {
+          try {
+            applyStartupStatus(await readStartupStatus());
+            consecutiveStatusFailures = 0;
+          } catch (_) {
+            consecutiveStatusFailures += 1;
+          }
+          // 用公開的 /api/health 而非 /api/settings：後者含設定內容且需要工作階段憑證。
+          const healthResponse = await request("/api/health", 2600);
+          if (!healthResponse.ok) throw new Error("backend_not_ready");
+          const health = await healthResponse.json();
+          if (health.success !== true) throw new Error("backend_not_ready");
+
+          setStage(2, "後端與索引已就緒", "正在確認本機模型服務；即使模型暫時離線，仍可先進入工作區查看狀態。", 76);
+
+          setStage(3, "準備工作區", "正在完成最後的介面設定。", 92);
+          await new Promise(resolve => setTimeout(resolve, 350));
+          finished = true;
+          setStage(4, "啟動完成", "即將進入 Local AI Workbench。", 100);
+          setTimeout(() => location.replace(targetUrl.href), 450);
+        } catch (_) {
+          if (consecutiveStatusFailures >= 8) {
+            title.textContent = "無法連線到啟動服務";
+            note.textContent = "啟動服務可能已中止或連接埠已變更。請關閉此視窗後重新開啟程式。";
+            slowBox.classList.add("visible");
+          }
+          window.setTimeout(checkReadiness, 850);
+        } finally {
+          checking = false;
+        }
+      }
+
+      retry.addEventListener("click", () => {
+        note.textContent = "正在重新檢查後端與索引狀態。";
+        checkReadiness();
+      });
+
+      window.setInterval(() => {
+        const seconds = Math.floor((Date.now() - startedAt) / 1000);
+        const eta = Number(lastStartupStatus && lastStartupStatus.eta_seconds);
+        const samples = Number(lastStartupStatus && lastStartupStatus.history_samples);
+        elapsed.textContent = Number.isFinite(eta) && eta > 0
+          ? `已等待 ${seconds} 秒 · 約剩 ${Math.ceil(eta)} 秒`
+          : `已等待 ${seconds} 秒${samples === 0 ? " · 正在建立預估基準" : ""}`;
+        if (!finished && seconds >= 30) {
+          slowBox.classList.add("visible");
+          if (!lastStartupStatus || Date.now() / 1000 - Number(lastStartupStatus.updated_at || 0) > 15) {
+            title.textContent = "啟動狀態長時間未更新";
+            note.textContent = "後端進度超過 15 秒沒有更新；系統仍會繼續檢查，90 秒後由啟動器回報結果。";
+          }
+        }
+      }, 1000);
+
+      setStage(1, "載入後端與專案索引", "大型檔案或首次建立索引時，這個階段可能需要較久。", 18);
+      checkReadiness();
+    })();
+  </script>
+</body>
+</html>

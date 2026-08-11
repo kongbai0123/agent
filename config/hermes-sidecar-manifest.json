@@ -1,0 +1,205 @@
+{
+  "schema_version": 1,
+  "component": "NousResearch/hermes-agent",
+  "release": {
+    "package_version": "0.18.2",
+    "tag": "v2026.7.7.2",
+    "tag_object": "b7751df34688835a108e0d630f3495fc11f3df79",
+    "source_commit": "9de9c25f620ff7f1ce0fd5457d596052d5159596"
+  },
+  "official_installer": {
+    "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/v2026.7.7.2/scripts/install.ps1",
+    "sha256": "b4998d3b5fc9426f9fe2da1479424db0e840a5e67838a9f2bd14f7d52391cc81",
+    "protocol_version": 1,
+    "native_stages": [
+      "uv",
+      "python",
+      "repository",
+      "venv",
+      "dependencies"
+    ]
+  },
+  "docker_image": {
+    "repository": "docker.io/nousresearch/hermes-agent",
+    "tag": "v2026.7.7.2",
+    "index_digest": "sha256:9c841866021c54c4596849f6135717e8a4d52ba510b7f52c50aef1de1a283973",
+    "platform": "linux/amd64",
+    "platform_digest": "sha256:3db34ce19adfa080736a2a3feb0316dbcccc588faa9afe7fd8ae1c03b4f1a53a",
+    "pinned_reference": "docker.io/nousresearch/hermes-agent@sha256:3db34ce19adfa080736a2a3feb0316dbcccc588faa9afe7fd8ae1c03b4f1a53a"
+  },
+  "runtime": {
+    "relative_root": "runtime/hermes",
+    "relative_home": "runtime/hermes/home",
+    "relative_source": "runtime/hermes/source",
+    "relative_secrets": "runtime/hermes/secrets",
+    "relative_logs": "runtime/hermes/logs",
+    "relative_api_key": "runtime/hermes/secrets/api_server.key",
+    "config_templates": {
+      "native": {
+        "path": "config/hermes-sidecar-native-config.yaml",
+        "sha256": "ae35d2079900e7b8deef46bd396bf656ab67ca21cdc70c7409347bd713366f43"
+      },
+      "docker": {
+        "path": "config/hermes-sidecar-docker-config.yaml",
+        "sha256": "b03c867467c24bb9b8d4f9e9b164ab798a94d49bae200cb0100b58e87c1f6684"
+      },
+      "docker_readonly": {
+        "path": "config/hermes-sidecar-docker-readonly-config.yaml",
+        "sha256": "583845922fd3781ff3bf4f2fc86973bd5b49174506f7bb86bacd16d4e31074ba"
+      }
+    },
+    "container_home": "/opt/data",
+    "container_name": "local-ai-workbench-hermes",
+    "native_gateway_args": ["gateway", "run"],
+    "host": "127.0.0.1",
+    "host_port": 8642,
+    "container_host": "0.0.0.0",
+    "container_port": 8642,
+    "health_path": "/health",
+    "capabilities_path": "/v1/capabilities",
+    "toolsets_path": "/v1/toolsets"
+  },
+  "production_policy": {
+    "readiness": {
+      "startup_timeout_seconds": 60,
+      "probe_interval_milliseconds": 500,
+      "required_consecutive_successes": 2,
+      "health": {
+        "status": "ok",
+        "platform": "hermes-agent",
+        "version": "0.18.2"
+      },
+      "required_features": [
+        "run_approval_response",
+        "run_events_sse",
+        "run_status",
+        "run_stop",
+        "run_submission"
+      ],
+      "required_endpoints": {
+        "runs": "/v1/runs",
+        "run_status": "/v1/runs/{run_id}",
+        "run_events": "/v1/runs/{run_id}/events",
+        "run_approval": "/v1/runs/{run_id}/approval",
+        "run_stop": "/v1/runs/{run_id}/stop"
+      }
+    },
+    "monitoring": {
+      "probe_interval_seconds": 10,
+      "failure_threshold": 3,
+      "max_restarts_per_launch": 2,
+      "restart_backoff_seconds": 2
+    },
+    "rollback": {
+      "safe_tool_policy_profile": "NoTools",
+      "stop_owned_container_only": true,
+      "preserve_runtime_data": true
+    },
+    "evidence": {
+      "schema_version": 1,
+      "relative_directory": "runtime/hermes/evidence",
+      "forbidden_fields": [
+        "api_key",
+        "authorization",
+        "canary_session_ids",
+        "environment",
+        "project_id",
+        "project_root"
+      ]
+    }
+  },
+  "model": {
+    "default": "gemma4-hermes:latest",
+    "provider": "custom",
+    "context_length": 64000,
+    "max_output_tokens": 4096,
+    "base_urls": {
+      "native": "http://127.0.0.1:11434/v1",
+      "docker": "http://host.docker.internal:11434/v1"
+    }
+  },
+  "initial_policy": {
+    "platform_toolsets": {"api_server": []},
+    "mcp_servers": {},
+    "plugins": {"enabled": [], "disabled": []},
+    "safe_mode_environment": true,
+    "cors_origins": [],
+    "disabled_toolsets": [
+      "web",
+      "browser",
+      "terminal",
+      "file",
+      "code_execution",
+      "vision",
+      "video",
+      "image_gen",
+      "video_gen",
+      "x_search",
+      "tts",
+      "skills",
+      "todo",
+      "memory",
+      "context_engine",
+      "session_search",
+      "clarify",
+      "delegation",
+      "cronjob",
+      "homeassistant",
+      "spotify",
+      "discord",
+      "discord_admin",
+      "yuanbao",
+      "computer_use"
+    ]
+  },
+  "readonly_tool_policy": {
+    "profile": "project-readonly-v1",
+    "toolset": "workbench-readonly",
+    "tools": ["project_read_file", "project_search_files"],
+    "config_template": {
+      "path": "config/hermes-sidecar-docker-readonly-config.yaml",
+      "sha256": "583845922fd3781ff3bf4f2fc86973bd5b49174506f7bb86bacd16d4e31074ba"
+    },
+    "python_policy": {
+      "path": "config/hermes-readonly-policy/sitecustomize.py",
+      "sha256": "f2e3625c3be19882f7847427ec0050c0fdb05d14204534576ae1d5a9f5662583",
+      "container_directory": "/opt/workbench-policy"
+    },
+    "project_mount": "/workspace/project",
+    "environment": {
+      "PYTHONPATH": "/opt/workbench-policy",
+      "WORKBENCH_POLICY_PROFILE": "project-readonly-v1",
+      "WORKBENCH_PROJECT_ROOT": "/workspace/project"
+    },
+    "labels": {
+      "com.local-ai-workbench.component": "hermes-sidecar",
+      "com.local-ai-workbench.policy": "project-readonly-v1",
+      "com.local-ai-workbench.owner": "workbench"
+    },
+    "tmpfs": {
+      "/tmp": "rw,nosuid,size=512m",
+      "/var/tmp": "rw,noexec,nosuid,size=256m",
+      "/run": "rw,exec,nosuid,size=64m"
+    },
+    "writes_enabled": false,
+    "shell_enabled": false,
+    "network_tools_enabled": false
+  },
+  "security": {
+    "minimum_api_key_bytes": 32,
+    "loopback_publish_only": true,
+    "cors_disabled": true,
+    "app_approval_is_os_boundary": false,
+    "requires_os_isolation_before_tools": true,
+    "docker_pull_requires_data_drive_storage": true,
+    "legacy_windows_home_forbidden": "%LOCALAPPDATA%/hermes"
+  },
+  "sources": [
+    "https://github.com/NousResearch/hermes-agent/releases/tag/v2026.7.7.2",
+    "https://github.com/NousResearch/hermes-agent/blob/v2026.7.7.2/scripts/install.ps1",
+    "https://github.com/NousResearch/hermes-agent/blob/v2026.7.7.2/website/docs/user-guide/docker.md",
+    "https://github.com/NousResearch/hermes-agent/blob/v2026.7.7.2/docs/api-server.md",
+    "https://github.com/NousResearch/hermes-agent/blob/v2026.7.7.2/website/docs/user-guide/configuration.md",
+    "https://github.com/NousResearch/hermes-agent/blob/v2026.7.7.2/hermes_cli/tools_config.py"
+  ]
+}

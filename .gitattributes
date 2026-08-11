@@ -1,0 +1,28 @@
+# 統一換行處理。加入這個檔案之前，工作區是 CRLF、索引是 LF，
+# 導致 106 個檔案永遠顯示為 modified（34,910 行的假差異），git diff 與 blame 都失效。
+* text=auto eol=lf
+
+# Windows 專用腳本必須是 CRLF，否則 cmd.exe 與部分 PowerShell 主機會解析失敗。
+*.bat  text eol=crlf
+*.cmd  text eol=crlf
+*.ps1  text eol=crlf
+*.vbs  text eol=crlf
+
+# 二進位資產不做任何轉換。
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.exe  binary
+*.woff  binary
+*.woff2 binary
+*.ttf  binary
+*.pdf  binary
+*.zip  binary
+*.db   binary
+*.sqlite binary
+
+# 產生的度量檔請以 LF 儲存，讓 sha256 在各平台一致。
+SAFIR/benchmark/results/*.json text eol=lf
+SAFIR/benchmark/dataset_zh.json text eol=lf

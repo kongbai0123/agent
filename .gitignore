@@ -1,0 +1,59 @@
+# Virtual Environment
+.venv/
+venv/
+ENV/
+
+# Local Logs
+ollama.log
+ollama_err.log
+*.log
+
+# Databases & Runtime Data
+data/
+backend/data/
+backend/settings.json
+projects/
+runtime/*
+!runtime/server-discovery-config.json.example
+archive/
+workspaces/
+artifacts/
+**/projects/**
+**/conversations/**
+**/sessions/**
+**/attachments/**
+**/turns/**
+**/messages/**
+**/runs/**
+*.jsonl
+*.db
+*.sqlite
+*.sqlite3
+
+# Local secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Backups & Archives
+backend.zip
+frontend_backup_0709/
+scripts/apply_audit_fixes_*.py
+
+# Python Cache
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# IDE / Editor configuration
+.idea/
+.vscode/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.swp

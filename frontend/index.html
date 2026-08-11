@@ -1,0 +1,1473 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="csp-nonce" content="{{CSP_NONCE}}">
+    <title>Local AI Workbench</title>
+    <link rel="icon" type="image/png" href="app-icon.png?v=1">
+    <!-- 主題預載：在 CSS 繪製前套用已儲存主題，避免閃爍（預設為暖紙淺色） -->
+    <script src="theme-init.js"></script>
+    <!-- 引入 Lucide Icons 庫 -->
+    <script src="vendor/lucide-1.27.0.min.js"></script>
+    <!-- P0-6：正式 Markdown parser 與 sanitizer（載入失敗時前端自動退回內建 parser） -->
+    <script src="vendor/marked-12.0.2.min.js"></script>
+    <script src="vendor/dompurify-3.1.5.min.js"></script>
+    <!-- 引入 KaTeX 數學公式渲染庫 (已下載本地化以防 CSP/跨域阻攔) -->
+    <link rel="stylesheet" href="katex.min.css">
+    <script src="katex.min.js"></script>
+    <script src="auto-render.min.js"></script>
+    <link rel="stylesheet" href="style.css?v=5.14.0-output-skills">
+</head>
+<body class="basic-chat-mode">
+    <div class="app-container workbench-shell">
+
+        <!-- ================= Top Bar ================= -->
+        <header class="top-bar" role="banner">
+            <div class="top-bar-brand">
+                <img src="app-icon.png?v=1" class="logo-icon" alt="" aria-hidden="true">
+                <span class="top-bar-title">Local AI Workbench</span>
+            </div>
+            <div class="top-bar-chips" role="status" aria-label="系統狀態列">
+                <!-- 系統狀態（沿用既有 system-status 結構） -->
+                <div class="system-status status-chip" id="system-status" title="系統連線狀態">
+                    <span class="status-indicator warning"></span>
+                    <span class="status-text">檢測中...</span>
+                </div>
+                <button class="status-chip chip-clickable" id="chip-model" title="開啟模型管理" aria-label="目前模型，點擊開啟模型管理">
+                    <i data-lucide="box" aria-hidden="true"></i>
+                    <span id="active-model-name">未選擇模型</span>
+                </button>
+                <button class="status-chip chip-clickable" id="chip-rag" title="RAG 狀態，點擊開啟知識庫" aria-label="RAG 狀態">
+                    <i data-lucide="database" aria-hidden="true"></i>
+                    <span id="chip-rag-text">RAG ON</span>
+                </button>
+                <button class="status-chip chip-clickable" id="chip-docs" title="知識庫規模，點擊開啟知識庫" aria-label="知識庫文件數">
+                    <i data-lucide="files" aria-hidden="true"></i>
+                    <span id="chip-docs-text">0 docs</span>
+                </button>
+                <button class="status-chip chip-clickable" id="chip-speed" title="生成速度，點擊開啟模型指標" aria-label="生成速度">
+                    <i data-lucide="gauge" aria-hidden="true"></i>
+                    <span id="chip-speed-text">-- tok/s</span>
+                </button>
+                <button class="status-chip chip-clickable" id="chip-ctx" title="上下文使用量，點擊開啟 Context Inspector" aria-label="上下文使用量">
+                    <i data-lucide="layers" aria-hidden="true"></i>
+                    <span id="chip-ctx-text">0 / 32k ctx</span>
+                </button>
+            </div>
+            <div class="top-bar-actions">
+                <button id="btn-theme-toggle" class="btn-settings-trigger" title="切換淺色/深色主題" aria-label="切換主題">
+                    <i data-lucide="moon" style="width: 16px; height: 16px;"></i>
+                </button>
+                <button id="btn-setup-wizard-trigger" class="btn-settings-trigger" title="環境檢查與設定精靈" aria-label="開啟環境檢查與設定精靈">
+                    <i data-lucide="sparkles" style="width: 16px; height: 16px;"></i>
+                </button>
+            </div>
+        </header>
+
+        <div class="workbench-body">
+
+            <!-- ================= 左側 Icon Rail ================= -->
+            <nav class="icon-rail" role="navigation" aria-label="主功能導覽">
+                <button class="rail-btn active" id="rail-chat" title="對話" aria-label="對話與歷史紀錄">
+                    <i data-lucide="message-square"></i><span class="rail-label">對話</span>
+                </button>
+                <button class="rail-btn" id="rail-output" title="輸出內容" aria-label="開啟輸出內容">
+                    <i data-lucide="panel-right"></i><span class="rail-label">輸出</span>
+                </button>
+                <button class="rail-btn" id="rail-knowledge" title="知識庫" aria-label="知識庫管理">
+                    <i data-lucide="book-open"></i><span class="rail-label">知識庫</span>
+                </button>
+                <button class="rail-btn" id="rail-runs" title="執行紀錄" aria-label="Agent 執行紀錄">
+                    <i data-lucide="list-checks"></i><span class="rail-label">紀錄</span>
+                </button>
+                <button class="rail-btn" id="rail-agents" title="Agent 協作" aria-label="開啟 Agent 協作面板">
+                    <i data-lucide="messages-square"></i><span class="rail-label">協作</span>
+                </button>
+                <button class="rail-btn" id="rail-artifacts" title="Artifacts 工作區" aria-label="Artifacts 工作區">
+                    <i data-lucide="code-xml"></i><span class="rail-label">產物</span>
+                </button>
+                <button class="rail-btn" id="rail-models" title="模型管理" aria-label="模型管理">
+                    <i data-lucide="box"></i><span class="rail-label">模型</span>
+                </button>
+                <button class="rail-btn" id="rail-cloud-llm" title="雲端 LLM" aria-label="管理雲端 LLM API">
+                    <i data-lucide="cloud-cog"></i><span class="rail-label">雲端</span>
+                </button>
+                <button class="rail-btn" id="rail-extensions" title="擴充中心" aria-label="擴充中心">
+                    <i data-lucide="puzzle"></i><span class="rail-label">擴充</span>
+                </button>
+                <button class="rail-btn" id="rail-settings" title="設定" aria-label="設定中心">
+                    <i data-lucide="settings"></i><span class="rail-label">設定</span>
+                </button>
+            </nav>
+
+            <!-- ================= Chat Drawer（會話清單） ================= -->
+            <aside class="side-drawer" id="chat-drawer" aria-label="對話清單">
+                <div class="drawer-head">
+                    <span class="drawer-title">工作區</span>
+                    <button class="drawer-close" id="chat-drawer-close" aria-label="收合對話清單"><i data-lucide="panel-left-close"></i></button>
+                </div>
+                <div class="project-switcher">
+                    <button class="project-switcher-btn" id="project-switcher-btn" type="button" aria-haspopup="true" aria-expanded="false">
+                        <i data-lucide="folder"></i>
+                        <span id="project-switcher-label">不在專案中工作</span>
+                        <i data-lucide="chevrons-up-down"></i>
+                    </button>
+                    <div class="project-switcher-popover" id="project-switcher-popover" hidden>
+                        <div class="project-switcher-search">
+                            <i data-lucide="search"></i>
+                            <input id="project-switcher-search" type="search" placeholder="搜尋專案" aria-label="搜尋專案">
+                        </div>
+                        <div class="project-switcher-list" id="project-switcher-list"></div>
+                        <div class="project-switcher-actions">
+                            <button type="button" id="project-switcher-new"><i data-lucide="folder-plus"></i><span>新增專案</span></button>
+                            <button type="button" id="project-switcher-independent"><i data-lucide="x"></i><span>不在專案中工作</span></button>
+                        </div>
+                    </div>
+                </div>
+                <div class="new-chat-container">
+                    <button class="btn btn-primary btn-new-chat" id="new-chat-btn">
+                        <i data-lucide="plus"></i>
+                        <span>新增任務</span>
+                    </button>
+                    <button class="sidebar-icon-btn" id="new-project-btn" title="新增專案" aria-label="新增專案"><i data-lucide="folder-plus"></i></button>
+                </div>
+                <div class="sidebar-section history-section">
+                    <div class="search-sessions-container">
+                        <i data-lucide="search" class="search-icon"></i>
+                        <input type="text" id="search-sessions-input" placeholder="搜尋專案與任務..." aria-label="搜尋專案與任務">
+                    </div>
+                    <div class="session-list" id="session-list">
+                        <div class="empty-sessions">尚無任務</div>
+                    </div>
+                </div>
+                <div class="sidebar-footer">
+                    <button class="btn btn-secondary" id="manage-kb-btn" style="width: 100%;">
+                        <i data-lucide="folder-open"></i>
+                        <span>管理本地知識庫</span>
+                    </button>
+                    <div id="kb-status-line" class="kb-status-line">檢測知識庫狀態中...</div>
+                </div>
+                <div class="sidebar-context-menu" id="sidebar-context-menu" hidden></div>
+                <dialog class="sidebar-dialog" id="sidebar-dialog">
+                    <form method="dialog" id="sidebar-dialog-form">
+                        <div class="sidebar-dialog-head">
+                            <h3 id="sidebar-dialog-title">編輯</h3>
+                            <button type="button" class="sidebar-icon-btn" id="sidebar-dialog-close" aria-label="關閉"><i data-lucide="x"></i></button>
+                        </div>
+                        <label class="sidebar-dialog-label" id="sidebar-dialog-label" for="sidebar-dialog-input">名稱</label>
+                        <input id="sidebar-dialog-input" class="sidebar-dialog-control" autocomplete="off">
+                        <select id="sidebar-dialog-select" class="sidebar-dialog-control" hidden></select>
+                        <div id="project-dialog-fields" class="project-dialog-fields" hidden>
+                            <label class="sidebar-dialog-label" for="project-root-path">專案資料夾</label>
+                            <div class="project-path-control">
+                                <input id="project-root-path" class="sidebar-dialog-control" autocomplete="off" placeholder="請輸入或選擇既有資料夾" required>
+                                <button type="button" class="project-browse-button" id="project-browse-button" title="瀏覽資料夾" aria-label="瀏覽資料夾">
+                                    <i data-lucide="folder-open"></i>
+                                </button>
+                            </div>
+                            <div class="project-path-hint">請先建立專案資料夾，再由此處選取；Workbench 不會搬移或刪除其中的檔案。</div>
+                        </div>
+                        <div class="sidebar-dialog-actions">
+                            <button type="button" class="btn btn-secondary" id="sidebar-dialog-cancel">取消</button>
+                            <button type="submit" class="btn btn-primary" id="sidebar-dialog-confirm">確認</button>
+                        </div>
+                    </form>
+                </dialog>
+                <dialog class="sidebar-dialog folder-browser-dialog" id="folder-browser-dialog" aria-labelledby="folder-browser-title">
+                    <div class="folder-browser-shell">
+                        <div class="sidebar-dialog-head">
+                            <h3 id="folder-browser-title">選擇專案資料夾</h3>
+                            <button type="button" class="sidebar-icon-btn" id="folder-browser-close" aria-label="關閉資料夾瀏覽器"><i data-lucide="x"></i></button>
+                        </div>
+                        <div class="folder-browser-location">
+                            <button type="button" class="project-browse-button" id="folder-browser-up" title="上一層" aria-label="上一層"><i data-lucide="arrow-up"></i></button>
+                            <input class="sidebar-dialog-control" id="folder-browser-path" aria-label="目前資料夾" readonly>
+                        </div>
+                        <div class="folder-browser-list" id="folder-browser-list" role="listbox" aria-label="資料夾清單"></div>
+                        <div class="folder-browser-status" id="folder-browser-status" aria-live="polite"></div>
+                        <div class="sidebar-dialog-actions">
+                            <button type="button" class="btn btn-secondary" id="folder-browser-cancel">取消</button>
+                            <button type="button" class="btn btn-primary" id="folder-browser-select">選擇此資料夾</button>
+                        </div>
+                    </div>
+                </dialog>
+            </aside>
+
+            <!-- 隱藏的相容性控制項：既有邏輯依賴的 select 與 toggle（由新 UI 同步驅動） -->
+            <div class="compat-controls" hidden>
+                <select id="model-select" aria-hidden="true"><option value="">載入模型中...</option></select>
+                <input type="checkbox" id="rag-toggle" checked aria-hidden="true">
+                <button id="btn-settings-trigger" type="button" aria-hidden="true"></button>
+            </div>
+
+            <!-- ================= 中央 Main Workspace ================= -->
+            <main class="chat-container" role="main">
+                <!-- 拖放檔案提示遮罩 -->
+                <div id="drag-overlay-mask" class="drag-overlay-mask">
+                    <div class="drag-overlay-content">
+                        <i data-lucide="file-up" style="width: 48px; height: 48px; color: var(--primary-color);"></i>
+                        <span class="drag-overlay-text">拖放到此處</span>
+                        <span class="drag-overlay-subtext">將作為此會話的臨時參考文件，不寫入全局庫</span>
+                    </div>
+                </div>
+
+                <!-- Agent 執行流程狀態列 -->
+                <div id="thought-chain-visualizer" class="thought-chain-visualizer">
+                    <div class="thought-spinner"></div>
+                    <span class="thought-text">Agent 執行流程</span>
+                    <span id="thought-detail" class="thought-detail">正在處理...</span>
+                </div>
+
+                <!-- 訊息展示區 -->
+                <div class="chat-messages" id="chat-messages">
+                    <!-- 相容既有 Session 流程；不顯示啟動畫面。 -->
+                    <div id="welcome-card" hidden></div>
+                </div>
+
+                <!-- ================= Composer ================= -->
+                <footer class="chat-input-area">
+                    <!-- 模式由後台依問題內容自動判斷；僅保留生成狀態，不提供重複的手動切換。 -->
+                    <div class="composer-status-line" aria-live="polite">
+                        <span class="composer-genstate" id="composer-genstate"></span>
+                    </div>
+
+                    <!-- 貼上與上傳圖片的預覽縮圖容器 -->
+                    <div class="image-preview-container" id="image-preview-container" style="display: none;"></div>
+
+                    <!-- 臨時 Context 檔案提示列 -->
+                    <div id="temp-context-bar" class="temp-context-bar">
+                        <div class="temp-context-file-info">
+                            <i data-lucide="file-text" style="color: var(--primary-color); width: 14px; height: 14px;"></i>
+                            <span id="temp-context-filename">檔名.pdf</span>
+                            <span style="color: var(--text-muted); font-size: 11px;">(此對話臨時參考，已成功解析)</span>
+                        </div>
+                        <button type="button" id="btn-remove-temp-context" class="btn-remove-temp-context" title="移除此臨時參考" aria-label="移除臨時參考文件">
+                            <i data-lucide="x" style="width: 14px; height: 14px;"></i>
+                        </button>
+                    </div>
+
+                    <!-- 磨砂玻璃斜線指令懸浮選單 -->
+                    <div id="slash-commands-menu" class="slash-commands-menu">
+                        <div class="slash-command-item" data-command="/web">
+                            <span class="slash-command-name">/web [搜尋內容]</span>
+                            <span class="slash-command-desc">強制作為 Web Search 網路搜尋執行</span>
+                        </div>
+                        <div class="slash-command-item" data-command="/code">
+                            <span class="slash-command-name">/code [任務說明]</span>
+                            <span class="slash-command-desc">指示模型僅輸出純程式碼，不進行任何多餘文字解釋</span>
+                        </div>
+                        <div class="slash-command-item" data-command="/clean">
+                            <span class="slash-command-name">/clean</span>
+                            <span class="slash-command-desc">一鍵清空目前對話</span>
+                        </div>
+                    </div>
+
+                    <form id="chat-form" class="chat-form">
+                        <button type="button" id="skills-button" class="input-action-btn" title="選擇 Agent Skill" aria-label="選擇 Agent Skill">
+                            <i data-lucide="sparkles"></i>
+                        </button>
+                        <button type="button" id="img-upload-btn" class="input-action-btn" title="上傳圖片" aria-label="上傳圖片">
+                            <i data-lucide="image"></i>
+                        </button>
+                        <input type="file" id="img-file-input" accept="image/*" multiple style="display: none;">
+                        <button type="button" id="voice-input-btn" class="voice-input-btn" title="語音輸入" aria-label="語音輸入">
+                            <i data-lucide="mic"></i>
+                        </button>
+                        <textarea
+                            id="user-input"
+                            placeholder="詢問文件內容，或輸入一般問題...（輸入 / 喚起指令）"
+                            rows="1"
+                            aria-label="訊息輸入框"
+                            required
+                        ></textarea>
+                        <button type="submit" id="send-btn" class="btn btn-primary" disabled aria-label="送出訊息">
+                            <i data-lucide="send"></i>
+                        </button>
+                    </form>
+                    <div id="active-skills-bar" class="active-skills-bar" aria-live="polite" hidden></div>
+                    <div class="composer-hint">支援拖放 PDF / Markdown / TXT · Enter 送出 · Shift+Enter 換行</div>
+                </footer>
+            </main>
+
+            <!-- ================= Agent 協作側欄 ================= -->
+            <aside class="agent-collaboration-panel" id="agent-collaboration-panel" aria-label="Agent 協作" hidden>
+                <div class="agent-collaboration-resizer" id="agent-collaboration-resizer" role="separator" aria-label="拖曳調整 Agent 協作面板寬度" aria-orientation="vertical" tabindex="0">
+                    <span aria-hidden="true">⋮</span>
+                    <span class="agent-resizer-tip">拖曳調整寬度</span>
+                </div>
+                <div class="agent-collaboration-head">
+                    <div class="agent-collaboration-title">
+                        <i data-lucide="messages-square" aria-hidden="true"></i>
+                        <strong>Agent 協作</strong>
+                        <span class="agent-active-count"><span class="agent-active-dot"></span><span id="agent-active-count">0 位工作中</span></span>
+                    </div>
+                    <div class="agent-collaboration-actions">
+                        <button type="button" id="agent-collaboration-stop" title="停止目前 Agent 工作" aria-label="停止目前 Agent 工作" disabled><i data-lucide="square"></i></button>
+                        <button type="button" id="agent-collaboration-close" title="收合 Agent 協作面板" aria-label="收合 Agent 協作面板"><i data-lucide="panel-right-close"></i></button>
+                    </div>
+                </div>
+                <div class="agent-roster" id="agent-roster" aria-label="Agent 狀態"></div>
+                <div class="agent-graph-summary" id="agent-graph-summary" aria-live="polite">
+                    <span id="agent-parallel-state">尚未建立 Agent graph</span>
+                    <span id="agent-convergence-state">等待收斂判定</span>
+                </div>
+                <div class="agent-handoff-list" id="agent-handoff-list" aria-label="Agent 交接產物" hidden></div>
+                <div class="agent-resource-monitor" id="agent-resource-monitor">
+                    <button type="button" class="agent-resource-summary" id="agent-resource-summary" aria-expanded="false" aria-controls="agent-resource-details">
+                        <span class="agent-resource-dot" aria-hidden="true"></span>
+                        <strong id="agent-resource-label">資源待命</strong>
+                        <span id="agent-resource-ram">RAM --</span>
+                        <span class="agent-resource-separator" aria-hidden="true">·</span>
+                        <span id="agent-resource-vram">VRAM --</span>
+                        <span class="agent-resource-margin" id="agent-resource-margin">餘裕 --</span>
+                        <span class="agent-resource-state" id="agent-resource-state">待命</span>
+                        <i data-lucide="chevron-down" aria-hidden="true"></i>
+                    </button>
+                    <div class="agent-resource-details" id="agent-resource-details" hidden>
+                        <div><span>預估峰值</span><strong id="agent-resource-estimated">--</strong></div>
+                        <div><span>實測峰值</span><strong id="agent-resource-actual">--</strong></div>
+                        <div><span>歷史校正</span><strong id="agent-resource-calibration">尚未啟用</strong></div>
+                        <div><span>本輪 Token</span><strong id="agent-resource-tokens">--</strong></div>
+                    </div>
+                    <button type="button" class="agent-external-model-indicator" id="agent-external-model-indicator" hidden aria-expanded="false" aria-controls="agent-external-model-details" title="查看外部模型占用">
+                        <i data-lucide="circle-alert" aria-hidden="true"></i><span>外部模型占用</span>
+                    </button>
+                    <div class="agent-external-model-details" id="agent-external-model-details" hidden></div>
+                </div>
+                <div class="agent-collaboration-body">
+                    <div class="agent-section-title">協作聊天室</div>
+                    <div class="agent-conversation" id="agent-conversation" aria-live="polite">
+                        <div class="agent-collaboration-empty">開始執行任務後，這裡會顯示派工、發現、質疑、修正與驗證事件。</div>
+                    </div>
+                </div>
+                <div class="agent-dispute-card" id="agent-dispute-card" hidden>
+                    <div>
+                        <strong id="agent-dispute-title">待解決爭議</strong>
+                        <p id="agent-dispute-detail"></p>
+                    </div>
+                    <span id="agent-dispute-state">等待裁決</span>
+                </div>
+            </aside>
+
+            <!-- ================= 右側 Inspector Panel ================= -->
+            <aside class="artifacts-sandbox-panel inspector-panel" id="artifacts-sandbox-panel" aria-label="Inspector 面板">
+                <div class="sandbox-resizer-main" id="sandbox-resizer-main"></div>
+
+                <!-- Inspector 分頁列 -->
+                <div class="inspector-tabs" role="tablist" aria-label="Inspector 分頁">
+                    <button class="inspector-tab" id="inspector-tab-context" data-itab="context" role="tab" aria-controls="inspector-pane-context" aria-selected="false" tabindex="-1">Context</button>
+                    <button class="inspector-tab" id="inspector-tab-output" data-itab="output" role="tab" aria-controls="inspector-pane-output" aria-selected="false" tabindex="-1">Output</button>
+                    <button class="inspector-tab" id="inspector-tab-run" data-itab="run" role="tab" aria-controls="inspector-pane-run" aria-selected="false" tabindex="-1">Run</button>
+                    <button class="inspector-tab active" id="inspector-tab-artifact" data-itab="artifact" role="tab" aria-controls="inspector-pane-artifact" aria-selected="true" tabindex="0">Artifact</button>
+                    <button class="inspector-tab" id="inspector-tab-models" data-itab="models" role="tab" aria-controls="inspector-pane-models" aria-selected="false" tabindex="-1">Models</button>
+                    <button class="inspector-tab" id="inspector-tab-logs" data-itab="logs" role="tab" aria-controls="inspector-pane-logs" aria-selected="false" tabindex="-1">Logs</button>
+                    <button class="btn-sandbox-close" id="btn-sandbox-close" title="關閉面板" aria-label="關閉 Inspector 面板">
+                        <i data-lucide="x" style="width: 16px; height: 16px;"></i>
+                    </button>
+                </div>
+
+                <!-- Context Tab -->
+                <div class="inspector-pane" id="inspector-pane-context" role="tabpanel" aria-labelledby="inspector-tab-context" hidden>
+                    <div class="ip-section"><div class="ip-title">RAG Sources</div><div id="ip-context-sources" class="ip-body">本輪尚無檢索來源。</div></div>
+                    <div class="ip-section"><div class="ip-title">Temporary Context</div><div id="ip-context-temp" class="ip-body">無臨時文件。</div></div>
+                    <div class="ip-section"><div class="ip-title">Conversation Context</div><div id="ip-context-conv" class="ip-body">0 則訊息</div></div>
+                    <div class="ip-section"><div class="ip-title">Context Usage</div><div id="ip-context-usage" class="ip-body">0 / 32k（估算）</div></div>
+                </div>
+
+                <!-- Run Tab -->
+                <div class="inspector-pane" id="inspector-pane-run" role="tabpanel" aria-labelledby="inspector-tab-run" hidden>
+                    <div class="ip-section"><div class="ip-title">Run Timeline</div><div id="ip-run-timeline" class="ip-body">尚無執行紀錄。</div></div>
+                </div>
+
+                <!-- Output：先承載目前專案的 Project Skills，後續可再加入其他輸出區塊 -->
+                <div class="inspector-pane output-pane" id="inspector-pane-output" role="tabpanel" aria-labelledby="inspector-tab-output" hidden>
+                    <div class="output-panel-card">
+                        <div class="output-panel-head">
+                            <div class="output-panel-title-wrap">
+                                <strong class="output-panel-title">輸出內容</strong>
+                                <span class="output-panel-project" id="output-panel-project">尚未選擇專案</span>
+                            </div>
+                            <button type="button" class="output-panel-close" id="output-panel-close" title="收合輸出內容" aria-label="收合輸出內容">
+                                <i data-lucide="panel-right-close" aria-hidden="true"></i>
+                            </button>
+                        </div>
+                        <div class="output-skills-mount" id="output-skills-mount" aria-live="polite">
+                            <div class="output-panel-empty">請先選擇專案</div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Artifact Tab（沿用既有沙盒） -->
+                <div class="inspector-pane active" id="inspector-pane-artifact" role="tabpanel" aria-labelledby="inspector-tab-artifact">
+                    <div class="sandbox-header">
+                        <div class="sandbox-title-area">
+                            <i data-lucide="code-xml" style="color: var(--primary-color); width: 18px; height: 18px;"></i>
+                            <div>
+                                <span class="sandbox-title" id="sandbox-title">Artifacts 預覽</span>
+                                <div class="sandbox-subtitle" id="sandbox-subtitle">本地沙盒隔離運行環境</div>
+                            </div>
+                        </div>
+                        <div class="sandbox-actions">
+                            <button class="btn-sandbox" id="btn-sandbox-download" aria-label="下載 Artifact">
+                                <i data-lucide="download" style="width: 13px; height: 13px;"></i>下載
+                            </button>
+                        </div>
+                    </div>
+                    <div class="sandbox-tabs">
+                        <button class="sandbox-tab active" id="tab-sandbox-preview">
+                            <i data-lucide="play" style="width: 12px; height: 12px;"></i>預覽
+                        </button>
+                        <button class="sandbox-tab" id="tab-sandbox-workspace">
+                            <i data-lucide="folder" style="width: 12px; height: 12px;"></i>專案工作區
+                        </button>
+                    </div>
+                    <div class="sandbox-body">
+                        <iframe class="sandbox-iframe active" id="sandbox-iframe" sandbox="allow-scripts" title="Artifact 預覽"></iframe>
+                        <div class="sandbox-structure-view" id="sandbox-structure-view">
+                            <div class="sandbox-stash-sidebar" id="sandbox-stash-sidebar">
+                                <div class="stash-title"><i data-lucide="archive" style="width: 12px; height: 12px; margin-right: 4px;"></i>專案目錄管理器</div>
+                                <div class="stash-filter-container">
+                                    <i data-lucide="search" class="filter-search-icon" style="width: 12px; height: 12px; margin-left: 8px;"></i>
+                                    <input type="text" id="sandbox-file-filter" placeholder="篩選檔案..." spellcheck="false" aria-label="篩選專案檔案">
+                                </div>
+                                <div class="stash-list" id="sandbox-stash-list"></div>
+                            </div>
+                            <div class="sandbox-resizer-inner" id="sandbox-resizer-inner"></div>
+                            <textarea class="sandbox-code-editor active" id="sandbox-code-editor" spellcheck="false" aria-label="原始碼編輯器"></textarea>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Models Tab -->
+                <div class="inspector-pane" id="inspector-pane-models" role="tabpanel" aria-labelledby="inspector-tab-models" hidden>
+                    <div class="ip-section"><div class="ip-title">Active Model</div><div id="ip-models-active" class="ip-body">--</div></div>
+                    <div class="ip-section"><div class="ip-title">TTFT（首 token 時間）</div><div id="ip-models-ttft" class="ip-body">尚未量測</div></div>
+                    <div class="ip-section"><div class="ip-title">Tokens / sec</div><div id="ip-models-tokps" class="ip-body">尚未量測</div></div>
+                    <div class="ip-section"><div class="ip-title">Context Window</div><div id="ip-models-ctx" class="ip-body">32K（預設估算）</div></div>
+                    <div class="ip-section"><div class="ip-title">Hardware</div><div id="ip-models-hw" class="ip-body">檢測中...</div></div>
+                </div>
+
+                <!-- Logs Tab（進階） -->
+                <div class="inspector-pane" id="inspector-pane-logs" role="tabpanel" aria-labelledby="inspector-tab-logs" hidden>
+                    <div class="ip-section"><div class="ip-title">SSE Events（最近 200 筆）</div><pre id="ip-logs-body" class="ip-logs">尚無事件。</pre></div>
+                </div>
+            </aside>
+        </div>
+    </div>
+
+    <!-- ================= Toast 容器（P13 錯誤 UX） ================= -->
+    <div id="toast-container" class="toast-container" aria-live="polite"></div>
+
+    <!-- ================= First-run Setup Wizard ================= -->
+    <div class="modal-overlay" id="setup-wizard-modal" role="dialog" aria-modal="true" aria-label="初次使用設定">
+        <div class="modal wizard-modal">
+            <div class="modal-header">
+                <h3><i data-lucide="rocket" style="margin-right: 8px; color: var(--primary-color);"></i>開始使用 Local AI Workbench</h3>
+                <button class="modal-close" id="wizard-close" aria-label="關閉設定精靈"><i data-lucide="x"></i></button>
+            </div>
+            <div class="modal-body">
+                <p class="wizard-sub">系統正在檢查你的本機 AI 環境。</p>
+                <div class="wizard-checks" id="wizard-checks">
+                    <div class="wizard-check" id="wz-backend"><span class="wz-mark">○</span><span>後端服務：檢測中...</span></div>
+                    <div class="wizard-check" id="wz-ollama"><span class="wz-mark">○</span><span>Ollama：檢測中...</span></div>
+                    <div class="wizard-check" id="wz-models"><span class="wz-mark">○</span><span>模型：檢測中...</span></div>
+                    <div class="wizard-check" id="wz-kb"><span class="wz-mark">○</span><span>知識庫：檢測中...</span></div>
+                </div>
+                <div class="wizard-hint" id="wizard-hint"></div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-primary" id="wizard-install-model">安裝推薦模型</button>
+                <button class="btn btn-secondary" id="wizard-open-settings">連接既有 Ollama</button>
+                <button class="btn btn-secondary" id="wizard-recheck">重新檢查</button>
+                <button class="btn btn-secondary" id="wizard-later">稍後設定</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ================= Model Manager ================= -->
+    <div class="modal-overlay" id="model-manager-modal" role="dialog" aria-modal="true" aria-label="模型管理">
+        <div class="modal mm-modal">
+            <div class="modal-header">
+                <h3><i data-lucide="box" style="margin-right: 8px; color: var(--primary-color);"></i>Model Manager</h3>
+                <button class="modal-close" id="mm-close" aria-label="關閉模型管理"><i data-lucide="x"></i></button>
+            </div>
+            <div class="mm-tabs" role="tablist">
+                <button class="mm-tab active" data-mmtab="installed" role="tab">Installed</button>
+                <button class="mm-tab" data-mmtab="recommended" role="tab">Recommended</button>
+                <button class="mm-tab" data-mmtab="available" role="tab">Available</button>
+                <button class="mm-tab" data-mmtab="benchmark" role="tab">Benchmark</button>
+            </div>
+            <div class="modal-body mm-body">
+                <div class="mm-pane active" id="mm-pane-installed"><div class="mm-list" id="mm-installed-list">載入中...</div></div>
+                <div class="mm-pane" id="mm-pane-recommended">
+                    <div class="mm-hw-card" id="mm-hw-card">正在讀取硬體資訊...</div>
+                    <div class="mm-list" id="mm-recommended-list"></div>
+                    <div class="mm-note">安裝會顯示即時進度；下載期間可隨時按「停止安裝」。</div>
+                </div>
+                <div class="mm-pane" id="mm-pane-available">
+                    <input type="text" id="mm-search" class="settings-input" placeholder="搜尋模型..." aria-label="搜尋可安裝模型">
+                    <div class="mm-list" id="mm-available-list"></div>
+                </div>
+                <div class="mm-pane" id="mm-pane-benchmark">
+                    <div class="mm-note">對目前選用模型執行一次短提示測速（實際呼叫本機模型）。</div>
+                    <button class="btn btn-primary" id="mm-run-benchmark" style="width:auto; margin: 10px 0;">執行測速</button>
+                    <div class="mm-list" id="mm-benchmark-result">尚無測速結果。</div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" id="mm-refresh">重新整理</button>
+                <button class="btn btn-secondary" id="mm-close-btn">關閉</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ================= 模型切換確認 ================= -->
+    <div class="modal-overlay" id="model-switch-modal" role="dialog" aria-modal="true" aria-label="切換模型確認">
+        <div class="modal">
+            <div class="modal-header">
+                <h3>切換模型</h3>
+                <button class="modal-close" id="ms-close" aria-label="取消切換"><i data-lucide="x"></i></button>
+            </div>
+            <div class="modal-body">
+                <p id="ms-desc">目前對話使用：--<br>即將切換至：--</p>
+                <p class="mm-note">切換可能影響回答風格、速度與上下文容量。</p>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-primary" id="ms-apply-session">套用目前對話</button>
+                <button class="btn btn-secondary" id="ms-apply-default">設為預設</button>
+                <button class="btn btn-secondary" id="ms-cancel">取消</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ================= Command Palette ================= -->
+    <div class="palette-overlay" id="command-palette" role="dialog" aria-modal="true" aria-label="指令面板">
+        <div class="palette-box">
+            <input type="text" id="palette-input" placeholder="輸入指令...（Esc 關閉）" aria-label="指令搜尋">
+            <div class="palette-list" id="palette-list"></div>
+        </div>
+    </div>
+
+    <!-- ================= 📚 知識庫管理 Modal（Knowledge Center） ================= -->
+    <div class="modal-overlay" id="kb-manager-modal" role="dialog" aria-modal="true" aria-label="知識庫管理">
+        <div class="modal kb-modal">
+            <div class="modal-header">
+                <h3>📚 Knowledge Center</h3>
+                <button class="modal-close" id="kb-modal-close" aria-label="關閉知識庫管理"><i data-lucide="x"></i></button>
+            </div>
+            <div class="mm-tabs kb-tabs" role="tablist">
+                <button class="mm-tab active" data-kbtab="documents" role="tab">Documents</button>
+                <button class="mm-tab" data-kbtab="retrieval" role="tab">Retrieval Test</button>
+                <button class="mm-tab" data-kbtab="index" role="tab">Index Settings</button>
+            </div>
+            <div class="modal-body">
+                <!-- Documents Tab -->
+                <div class="kb-pane active" id="kb-pane-documents">
+                    <div class="kb-upload-section">
+                        <h4>上傳新文檔進行本地向量化</h4>
+                        <div class="upload-dropzone" id="upload-zone">
+                            <i data-lucide="upload-cloud"></i>
+                            <p>拖曳檔案至此或<span>瀏覽檔案</span></p>
+                            <span class="file-hint">支援 PDF, TXT, MD, PY, JS, HTML, CSS, JSON</span>
+                            <input type="file" id="file-input" multiple accept=".pdf,.txt,.md,.py,.js,.html,.css,.json" style="display: none;">
+                        </div>
+                        <div class="upload-progress-container" id="progress-container" style="display: none;">
+                            <div class="progress-info">
+                                <span class="progress-filename">正在處理檔案...</span>
+                                <span class="progress-percent">0%</span>
+                            </div>
+                            <div class="progress-bar">
+                                <div class="progress-fill" id="progress-fill"></div>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="kb-files-section">
+                        <h4>已匯入的知識庫文件</h4>
+                        <div class="kb-file-list" id="kb-file-list"></div>
+                    </div>
+                    <div class="kb-chunks-preview-section" id="chunks-preview-section" style="display: none;">
+                        <div class="chunks-preview-header">
+                            <h4 id="chunks-preview-title">📄 文件 Chunks 預覽</h4>
+                            <button class="btn btn-secondary btn-xs" id="close-chunks-btn" style="width: auto; padding: 4px 10px; font-size: 11px;">關閉預覽</button>
+                        </div>
+                        <div class="chunks-list" id="chunks-list"></div>
+                    </div>
+                </div>
+                <!-- Retrieval Test Tab -->
+                <div class="kb-pane" id="kb-pane-retrieval">
+                    <h4>檢索測試</h4>
+                    <p class="mm-note">輸入測試問題，檢查知識庫會召回哪些片段（不觸發生成）。</p>
+                    <div style="display:flex; gap:8px; margin: 10px 0;">
+                        <input type="text" id="kb-test-query" class="settings-input" placeholder="例如：這份文件如何說明 RNN？" style="flex:1;" aria-label="檢索測試問題">
+                        <button class="btn btn-primary" id="kb-test-run" style="width:auto;">測試檢索</button>
+                    </div>
+                    <div id="kb-test-results" class="mm-list"></div>
+                </div>
+                <!-- Index Settings Tab -->
+                <div class="kb-pane" id="kb-pane-index">
+                    <h4>目前索引設定</h4>
+                    <div class="mm-list" id="kb-index-settings">載入中...</div>
+                    <div class="mm-note">如需修改 chunk size / overlap / top K / 重排閾值，請至「設定中心 → RAG 檢索」。</div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-danger" id="clear-all-kb-btn" style="width: auto;">清空整個知識庫</button>
+                <button class="btn btn-secondary" id="kb-modal-close-btn" style="width: auto;">關閉</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 彈出確認 Modal (清空整個知識庫時使用) -->
+    <div class="modal-overlay" id="confirm-modal" role="dialog" aria-modal="true">
+        <div class="modal">
+            <div class="modal-header">
+                <h3>確認清空整個知識庫？</h3>
+                <button class="modal-close" id="modal-close" aria-label="關閉"><i data-lucide="x"></i></button>
+            </div>
+            <div class="modal-body">
+                <p>此動作將永久清除 Chroma 向量資料庫中的所有索引數據，並刪除上傳的本地暫存檔案。此動作無法還原。</p>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" id="modal-cancel">取消</button>
+                <button class="btn btn-danger" id="modal-confirm">確認清空</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 系統設定中心 Modal (Settings Modal) -->
+    <div class="modal-overlay" id="settings-modal" role="dialog" aria-modal="true" aria-label="系統設定中心">
+        <div class="modal settings-modal-box">
+            <div class="modal-header">
+                <h3><i data-lucide="sliders" style="margin-right: 8px; color: var(--primary-color);"></i>系統設定中心</h3>
+                <button class="modal-close" id="btn-settings-close" aria-label="關閉設定"><i data-lucide="x"></i></button>
+            </div>
+
+            <div class="settings-modal-body">
+                <div class="settings-tabs">
+                    <button class="settings-tab-btn active" data-target="tab-settings-general">
+                        <i data-lucide="cog"></i>一般設定
+                    </button>
+                    <button class="settings-tab-btn" data-target="tab-settings-rag">
+                        <i data-lucide="database"></i>RAG 檢索
+                    </button>
+                    <button class="settings-tab-btn" data-target="tab-settings-agent">
+                        <i data-lucide="bot"></i>Agent 執行
+                    </button>
+                    <button class="settings-tab-btn" data-target="tab-settings-preferences">
+                        <i data-lucide="volume-2"></i>語音與維護
+                    </button>
+                    <button class="settings-tab-btn" data-target="tab-settings-integrations">
+                        <i data-lucide="workflow"></i>整合服務
+                    </button>
+                    <button class="settings-tab-btn" data-target="tab-settings-hermes">
+                        <i data-lucide="network"></i>Hermes
+                    </button>
+                    <button class="settings-tab-btn" data-target="tab-settings-runtime">
+                        <i data-lucide="hard-drive"></i>Runtime 管理
+                    </button>
+                </div>
+
+                <div class="settings-panes">
+                    <div class="settings-pane active" id="tab-settings-general">
+                        <div class="settings-group">
+                            <label class="settings-label" for="setting-ui-language">介面語言</label>
+                            <select id="setting-ui-language" class="settings-input">
+                                <option value="zh-TW">繁體中文</option>
+                                <option value="en-US">English</option>
+                            </select>
+                            <span class="settings-tip">目前已完整支援繁體中文介面；切換語言後會儲存至後端設定。</span>
+                        </div>
+                        <div class="settings-group">
+                            <label class="settings-label" for="setting-ollama-url">Ollama 服務端點（API URL）</label>
+                            <input type="text" id="setting-ollama-url" class="settings-input" placeholder="http://127.0.0.1:11434">
+                            <span class="settings-tip">若是將模型運行於遠端 GPU 伺服器，請在此輸入其 IP 埠位。</span>
+                        </div>
+                        <div class="settings-group">
+                            <div class="cloud-llm-settings-entry">
+                                <div>
+                                    <span class="settings-label">雲端 LLM API</span>
+                                    <span class="settings-tip">API 導入已移至獨立管理中心；可管理多筆連線，並搜尋、篩選、分類或刪除。</span>
+                                </div>
+                                <button type="button" class="btn btn-secondary compact" id="btn-open-cloud-llm-settings">
+                                    <i data-lucide="external-link"></i>開啟雲端 LLM
+                                </button>
+                            </div>
+                        </div>
+                        <div class="settings-group legacy-provider-cost-fields" hidden>
+                            <div style="flex:1;">
+                                <label class="settings-label" for="setting-model-input-cost">輸入／百萬 Token</label>
+                                <input type="number" id="setting-model-input-cost" class="settings-input" min="0" step="0.0001" value="0">
+                            </div>
+                            <div style="flex:1;">
+                                <label class="settings-label" for="setting-model-output-cost">輸出／百萬 Token</label>
+                                <input type="number" id="setting-model-output-cost" class="settings-input" min="0" step="0.0001" value="0">
+                            </div>
+                            <div style="width:92px;">
+                                <label class="settings-label" for="setting-model-cost-currency">幣別</label>
+                                <input type="text" id="setting-model-cost-currency" class="settings-input" maxlength="8" value="USD">
+                            </div>
+                        </div>
+                        <div class="settings-group">
+                            <label class="settings-label" for="setting-chat-model">預設對話模型（Chat Model）</label>
+                            <input type="text" id="setting-chat-model" class="settings-input" placeholder="gemma4-hermes:latest">
+                        </div>
+                        <div class="settings-group">
+                            <label class="settings-label" for="setting-vision-model">預設多模態視覺模型（Vision Model）</label>
+                            <input type="text" id="setting-vision-model" class="settings-input" placeholder="gemma4-hermes:latest">
+                        </div>
+                    </div>
+
+                    <div class="settings-pane" id="tab-settings-rag">
+                        <div class="settings-group">
+                            <div style="display: flex; justify-content: space-between;">
+                                <label class="settings-label">混合檢索召回數量 (rag_k)</label>
+                                <span id="val-rag-k" class="settings-slider-value">4</span>
+                            </div>
+                            <input type="range" id="setting-rag-k" class="settings-slider" min="1" max="15" step="1" value="4">
+                            <span class="settings-tip">每次 RAG 檢索時，送給大模型參考的 Context 片段數量。</span>
+                        </div>
+                        <div class="settings-group">
+                            <div style="display: flex; justify-content: space-between;">
+                                <label class="settings-label">重排過濾閾值（Rerank Threshold）</label>
+                                <span id="val-rag-threshold" class="settings-slider-value">0.2</span>
+                            </div>
+                            <input type="range" id="setting-rag-threshold" class="settings-slider" min="0.0" max="1.0" step="0.05" value="0.2">
+                            <span class="settings-tip">CrossEncoder 重排相似度低於此閾值的片段將被過濾，防止幻覺。</span>
+                        </div>
+                        <div class="settings-group" style="display: flex; gap: 20px;">
+                            <div style="flex: 1;">
+                                <label class="settings-label" for="setting-chunk-size">片段大小（Chunk Size）</label>
+                                <input type="number" id="setting-chunk-size" class="settings-input" min="100" max="3000" step="50" value="600">
+                            </div>
+                            <div style="flex: 1;">
+                                <label class="settings-label" for="setting-chunk-overlap">重疊長度（Overlap）</label>
+                                <input type="number" id="setting-chunk-overlap" class="settings-input" min="10" max="1000" step="10" value="120">
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="settings-pane" id="tab-settings-agent">
+                        <div class="settings-group toggle-group" style="display:flex; justify-content:space-between; align-items:center;">
+                            <div>
+                                <label class="settings-label">啟用 Agent Skills</label>
+                                <span class="settings-tip">關閉後保留已安裝資料，但停止快捷選用、Prompt 載入與狀態變更，作為安全回滾。</span>
+                            </div>
+                            <div class="switch">
+                                <input type="checkbox" id="setting-skills-enabled" checked>
+                                <span class="slider round"></span>
+                            </div>
+                        </div>
+                        <div class="settings-group toggle-group" style="display:flex; justify-content:space-between; align-items:center;">
+                            <div>
+                                <label class="settings-label">顯示詳細執行進度</label>
+                                <span class="settings-tip">在聊天中逐條顯示規劃、工具執行、驗證及修正狀態，不包含模型的隱藏思考。</span>
+                            </div>
+                            <div class="switch">
+                                <input type="checkbox" id="setting-agent-detailed-progress" checked>
+                                <span class="slider round"></span>
+                            </div>
+                        </div>
+                        <div class="settings-group" style="display:flex; gap:20px; margin-top:16px;">
+                            <div style="flex:1;">
+                                <label class="settings-label" for="setting-agent-max-tool-calls">單次最多工具次數</label>
+                                <input type="number" id="setting-agent-max-tool-calls" class="settings-input" min="1" max="20" value="8">
+                            </div>
+                            <div style="flex:1;">
+                                <label class="settings-label" for="setting-agent-max-repair-rounds">最多自動修正輪數</label>
+                                <input type="number" id="setting-agent-max-repair-rounds" class="settings-input" min="0" max="3" value="3">
+                            </div>
+                        </div>
+                        <div class="settings-group toggle-group" style="display:flex; justify-content:space-between; align-items:center; margin-top:16px;">
+                            <div>
+                                <label class="settings-label">完成前自動驗證</label>
+                                <span class="settings-tip">正式回覆前檢查回答、工具結果與專案來源；失敗時依上限自動修正。</span>
+                            </div>
+                            <div class="switch">
+                                <input type="checkbox" id="setting-agent-auto-validate" checked>
+                                <span class="slider round"></span>
+                            </div>
+                        </div>
+                        <div class="settings-group toggle-group" style="display:flex; justify-content:space-between; align-items:center; margin-top:12px;">
+                            <div>
+                                <label class="settings-label">允許 Agent 寫入專案工作區</label>
+                                <span class="settings-tip">關閉時，自動工作區模式會降為需批准，避免未經確認寫入檔案。</span>
+                            </div>
+                            <div class="switch">
+                                <input type="checkbox" id="setting-agent-allow-workspace-write" checked>
+                                <span class="slider round"></span>
+                            </div>
+                        </div>
+                        <div class="settings-group" style="margin-top:16px;">
+                            <label class="settings-label" for="setting-agent-final-report-detail">最終報告詳細度</label>
+                            <select id="setting-agent-final-report-detail" class="settings-input">
+                                <option value="concise">精簡</option>
+                                <option value="standard" selected>標準</option>
+                                <option value="detailed">詳細</option>
+                            </select>
+                        </div>
+                        <section class="subagent-settings-card" aria-labelledby="subagent-settings-title">
+                            <div class="settings-group toggle-group subagent-settings-head">
+                                <div>
+                                    <label class="settings-label" id="subagent-settings-title">啟用 Subagent Runtime</label>
+                                    <span class="settings-tip">Planner 會派發獨立上下文給各角色，草稿仍須通過 Verifier。</span>
+                                </div>
+                                <div class="switch">
+                                    <input type="checkbox" id="setting-subagent-enabled" checked>
+                                    <span class="slider round"></span>
+                                </div>
+                            </div>
+                            <div class="subagent-model-grid">
+                                <div class="settings-group">
+                                    <label class="settings-label" for="setting-subagent-planner-model">Planner 模型</label>
+                                    <select id="setting-subagent-planner-model" class="settings-input subagent-model-select"></select>
+                                    <span class="settings-tip">理解要求、派工、仲裁與統合。</span>
+                                </div>
+                                <div class="settings-group">
+                                    <label class="settings-label" for="setting-subagent-explorer-model">Explorer 模型</label>
+                                    <select id="setting-subagent-explorer-model" class="settings-input subagent-model-select"></select>
+                                    <span class="settings-tip">調查現況與證據缺口。</span>
+                                </div>
+                                <div class="settings-group">
+                                    <label class="settings-label" for="setting-subagent-implementer-model">Implementer 模型</label>
+                                    <select id="setting-subagent-implementer-model" class="settings-input subagent-model-select"></select>
+                                    <span class="settings-tip">提出最小可行實作方案。</span>
+                                </div>
+                                <div class="settings-group">
+                                    <label class="settings-label" for="setting-subagent-critic-model">Critic 模型</label>
+                                    <select id="setting-subagent-critic-model" class="settings-input subagent-model-select"></select>
+                                    <span class="settings-tip">交叉審查衝突、遺漏與風險。</span>
+                                </div>
+                            </div>
+                            <div class="agent-display-name-settings" aria-labelledby="agent-display-name-settings-title">
+                                <div class="agent-display-name-settings-head">
+                                    <label class="settings-label" id="agent-display-name-settings-title">協作角色顯示名稱</label>
+                                    <span class="settings-tip">訊息會顯示「名稱 A／B」；原始技術 ID 保留在滑鼠提示中。</span>
+                                </div>
+                                <div class="agent-display-name-grid">
+                                    <label>Planner<input type="text" id="setting-agent-name-planner" class="settings-input" maxlength="24" value="Planner"></label>
+                                    <label>Explorer<input type="text" id="setting-agent-name-explorer" class="settings-input" maxlength="24" value="Explorer"></label>
+                                    <label>Implementer<input type="text" id="setting-agent-name-implementer" class="settings-input" maxlength="24" value="Implementer"></label>
+                                    <label>Critic<input type="text" id="setting-agent-name-critic" class="settings-input" maxlength="24" value="Critic"></label>
+                                    <label>Verifier<input type="text" id="setting-agent-name-verifier" class="settings-input" maxlength="24" value="Verifier"></label>
+                                </div>
+                            </div>
+                            <div class="settings-group toggle-group subagent-cloud-routing-setting">
+                                <div>
+                                    <label class="settings-label" for="setting-subagent-cloud-routing">允許智慧雲端改派</label>
+                                    <span class="settings-tip">開啟後，Planner 可把已允許的工作改派到已設定的雲端模型；金鑰仍只留在父程序。</span>
+                                </div>
+                                <div class="switch">
+                                    <input type="checkbox" id="setting-subagent-cloud-routing">
+                                    <span class="slider round"></span>
+                                </div>
+                            </div>
+                            <div class="settings-group subagent-parallel-setting">
+                                <label class="settings-label" for="setting-subagent-max-parallel">智慧並行上限</label>
+                                <select id="setting-subagent-max-parallel" class="settings-input">
+                                    <option value="1" selected>1（完全序列）</option>
+                                    <option value="2">2（智慧混合，建議）</option>
+                                    <option value="3">3（最多三個就緒工作）</option>
+                                </select>
+                                <span class="settings-tip subagent-resource-warning">本機 Ollama 永遠最多一個；無相依關係的遠端子代理可與它重疊執行。</span>
+                            </div>
+                            <div class="subagent-resource-plan is-loading" id="subagent-resource-plan" role="status" aria-live="polite">
+                                <div class="subagent-resource-plan-title">正在估算角色模型記憶體需求…</div>
+                            </div>
+                        </section>
+                    </div>
+
+                    <div class="settings-pane" id="tab-settings-preferences">
+                        <div class="settings-group toggle-group" style="display: flex; justify-content: space-between; align-items: center; background: var(--ink-03); padding: 12px; border-radius: 8px; border: 1px solid var(--ink-05);">
+                            <div>
+                                <label class="settings-label" style="margin-bottom: 2px;">Playwright 有頭模式（Headful Mode）</label>
+                                <span class="settings-tip" style="margin-top: 0;">啟用後，網頁操作時會彈出實體瀏覽器視窗。</span>
+                            </div>
+                            <div class="switch">
+                                <input type="checkbox" id="setting-browser-headful">
+                                <span class="slider round"></span>
+                            </div>
+                        </div>
+                        <div class="settings-group" style="margin-top: 16px;">
+                            <label class="settings-label" for="setting-network-proxy">網路代理伺服器（HTTP Proxy）</label>
+                            <input type="text" id="setting-network-proxy" class="settings-input" placeholder="http://127.0.0.1:7890">
+                            <span class="settings-tip">用於 web_search 的網路代理，留空則代表直連。</span>
+                        </div>
+                        <div class="settings-group" style="margin-top: 24px; border-top: 1px solid var(--ink-08); padding-top: 16px;">
+                            <label class="settings-label" style="color: var(--danger-color);"><i data-lucide="alert-triangle" style="width: 14px; height: 14px; display: inline-block; vertical-align: middle; margin-right: 4px;"></i>資料庫危險區域</label>
+                            <div style="display: flex; gap: 12px; margin-top: 8px;">
+                                <button type="button" class="btn btn-danger" id="btn-clear-rag-db" style="padding: 8px 16px; font-size: 13px;">
+                                    <i data-lucide="trash-2"></i>清空 RAG 向量數據庫
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="settings-pane" id="tab-settings-integrations">
+                        <section class="runtime-panel" aria-labelledby="n8n-integration-title">
+                            <div class="runtime-panel-head">
+                                <div>
+                                    <div class="settings-label" id="n8n-integration-title">n8n 工作流程</div>
+                                    <div class="runtime-health-state" id="n8n-status-state" role="status">尚未檢查</div>
+                                </div>
+                                <button type="button" class="btn btn-secondary runtime-action" id="btn-n8n-status">
+                                    <i data-lucide="refresh-cw"></i>重新檢查
+                                </button>
+                            </div>
+                            <div class="settings-group integration-url-field">
+                                <label class="settings-label" for="setting-n8n-url">n8n 服務端點</label>
+                                <input type="text" id="setting-n8n-url" class="settings-input" placeholder="http://127.0.0.1:5678">
+                                <span class="settings-tip">連接既有服務時修改此 URL；管理 API 金鑰請使用後端環境變數 N8N_API_KEY。</span>
+                            </div>
+                            <div class="runtime-metrics" id="n8n-status-metrics" aria-live="polite"></div>
+                            <div class="integration-options" id="n8n-install-options" aria-live="polite"></div>
+                        </section>
+                        <section class="runtime-panel" aria-labelledby="cursor-integration-title">
+                            <div class="runtime-panel-head">
+                                <div>
+                                    <div class="settings-label" id="cursor-integration-title">Cursor Agent CLI</div>
+                                    <div class="runtime-health-state" id="cursor-status-state" role="status">尚未檢查</div>
+                                </div>
+                                <button type="button" class="btn btn-secondary runtime-action" id="btn-cursor-status">
+                                    <i data-lucide="refresh-cw"></i>重新檢查
+                                </button>
+                            </div>
+                            <div class="runtime-metrics" id="cursor-status-metrics" aria-live="polite"></div>
+                            <div class="settings-tip integration-note">Cursor 預設以唯讀模式執行；寫入任務必須指定專案並通過批准閘門。</div>
+                        </section>
+                        <section class="runtime-panel" aria-labelledby="mcp-integration-title">
+                            <div class="runtime-panel-head">
+                                <div>
+                                    <div class="settings-label" id="mcp-integration-title">MCP Servers</div>
+                                    <div class="runtime-health-state" id="mcp-status-state" role="status">尚未檢查</div>
+                                </div>
+                                <button type="button" class="btn btn-secondary runtime-action" id="btn-mcp-status">
+                                    <i data-lucide="refresh-cw"></i>重新檢查
+                                </button>
+                            </div>
+                            <div class="settings-group integration-url-field">
+                                <label class="settings-label" for="setting-mcp-servers">伺服器設定（JSON）</label>
+                                <textarea id="setting-mcp-servers" class="settings-input" rows="6"
+                                    spellcheck="false" placeholder='[{"id":"files","command":["node","server.js"],"timeout_seconds":30}]'></textarea>
+                                <span class="settings-tip">此處只設定啟動命令與逾時；啟用、停用及專案範圍統一由「擴充中心」管理。舊版 enabled 值不在此顯示，手動輸入也不會改變擴充狀態。使用 argv 陣列，不經 shell；請勿在此填入 Token。</span>
+                            </div>
+                            <div class="runtime-metrics" id="mcp-status-metrics" aria-live="polite"></div>
+                        </section>
+                    </div>
+
+                    <div class="settings-pane" id="tab-settings-hermes">
+                        <div id="hermes-settings-container" aria-live="polite"></div>
+                    </div>
+
+                    <div class="settings-pane" id="tab-settings-runtime">
+                        <section class="runtime-panel" aria-labelledby="runtime-usage-title">
+                            <div class="runtime-panel-head">
+                                <div>
+                                    <div class="settings-label" id="runtime-usage-title">近 30 天模型用量</div>
+                                    <div class="runtime-health-state" id="runtime-usage-state" role="status">尚未載入</div>
+                                </div>
+                            </div>
+                            <div class="runtime-metrics" id="runtime-usage-metrics" aria-live="polite"></div>
+                        </section>
+                        <section class="runtime-panel" aria-labelledby="runtime-health-title">
+                            <div class="runtime-panel-head">
+                                <div>
+                                    <div class="settings-label" id="runtime-health-title">Runtime 健康狀態</div>
+                                    <div class="runtime-health-state" id="runtime-health-state" role="status">尚未檢查</div>
+                                </div>
+                                <button type="button" class="btn btn-secondary runtime-action" id="btn-runtime-health">
+                                    <i data-lucide="activity"></i>立即檢查
+                                </button>
+                            </div>
+                            <div class="runtime-metrics" id="runtime-health-metrics" aria-live="polite"></div>
+                        </section>
+
+                        <section class="runtime-panel" aria-labelledby="runtime-export-title">
+                            <div class="runtime-panel-head">
+                                <div>
+                                    <div class="settings-label" id="runtime-export-title">目前對話</div>
+                                    <div class="settings-tip" id="runtime-export-session">尚未選擇對話</div>
+                                </div>
+                                <button type="button" class="btn btn-secondary runtime-action" id="btn-runtime-export">
+                                    <i data-lucide="download"></i>匯出 ZIP
+                                </button>
+                            </div>
+                        </section>
+
+                        <section class="runtime-panel runtime-rebuild" aria-labelledby="runtime-rebuild-title">
+                            <div class="runtime-panel-head">
+                                <div class="settings-label" id="runtime-rebuild-title">由資料夾重建索引</div>
+                                <button type="button" class="btn btn-secondary runtime-action" id="btn-runtime-rebuild-preview">
+                                    <i data-lucide="scan-search"></i>產生預覽
+                                </button>
+                            </div>
+                            <div class="runtime-rebuild-report" id="runtime-rebuild-report" aria-live="polite">尚未產生預覽</div>
+                            <div class="runtime-confirm-row">
+                                <label class="settings-label" for="runtime-rebuild-confirm">確認文字</label>
+                                <input type="text" class="settings-input" id="runtime-rebuild-confirm" autocomplete="off" placeholder="REBUILD">
+                                <button type="button" class="btn btn-danger runtime-action" id="btn-runtime-rebuild-apply" disabled>
+                                    <i data-lucide="database-backup"></i>套用重建
+                                </button>
+                            </div>
+                        </section>
+                    </div>
+                </div>
+            </div>
+
+            <div class="modal-footer">
+                <button class="btn btn-secondary" id="btn-settings-cancel">取消</button>
+                <button class="btn btn-primary" id="btn-settings-save">儲存設定</button>
+            </div>
+            <button type="button" class="settings-resize-handle" id="settings-resize-handle"
+                aria-label="拖曳調整設定中心大小" title="拖曳調整設定中心大小"></button>
+        </div>
+    </div>
+
+    <!-- 專案設定只影響單一專案；與上方系統設定分開。 -->
+    <div class="modal-overlay" id="project-settings-modal" role="dialog" aria-modal="true"
+        aria-labelledby="project-settings-title">
+        <div class="modal project-settings-modal-box">
+            <div class="modal-header">
+                <h3 id="project-settings-title"><i data-lucide="folder-cog"></i>專案設定</h3>
+                <button type="button" class="modal-close" id="project-settings-close" aria-label="關閉專案設定">
+                    <i data-lucide="x"></i>
+                </button>
+            </div>
+            <div class="project-settings-body">
+                <div class="project-settings-tabs" role="tablist" aria-label="專案設定分類">
+                    <button type="button" class="project-settings-tab active" role="tab" aria-selected="true"
+                        aria-controls="project-settings-pane-basic" data-project-settings-tab="basic">
+                        <i data-lucide="folder"></i>基本資料
+                    </button>
+                    <button type="button" class="project-settings-tab" role="tab" aria-selected="false"
+                        aria-controls="project-settings-pane-permissions" data-project-settings-tab="permissions">
+                        <i data-lucide="shield-check"></i>權限
+                    </button>
+                    <button type="button" class="project-settings-tab" role="tab" aria-selected="false"
+                        aria-controls="project-settings-pane-extensions" data-project-settings-tab="extensions">
+                        <i data-lucide="puzzle"></i>專案擴充
+                    </button>
+                </div>
+                <div class="project-settings-panes">
+                    <section class="project-settings-pane active" id="project-settings-pane-basic" role="tabpanel"
+                        data-project-settings-pane="basic">
+                        <div class="settings-group">
+                            <label class="settings-label" for="project-settings-name">專案名稱</label>
+                            <input id="project-settings-name" class="settings-input" maxlength="80" autocomplete="off">
+                        </div>
+                        <div class="settings-group">
+                            <label class="settings-label" for="project-settings-root-path">專案資料夾</label>
+                            <div class="project-path-control">
+                                <input id="project-settings-root-path" class="settings-input" autocomplete="off">
+                                <button type="button" class="project-browse-button" id="project-settings-browse"
+                                    title="瀏覽資料夾" aria-label="瀏覽專案資料夾">
+                                    <i data-lucide="folder-open"></i>
+                                </button>
+                            </div>
+                            <span class="settings-tip">重新連結只會更新工作區位置，不會搬移或刪除資料夾內容。</span>
+                        </div>
+                    </section>
+                    <section class="project-settings-pane" id="project-settings-pane-permissions" role="tabpanel"
+                        data-project-settings-pane="permissions" hidden>
+                        <div class="settings-group">
+                            <label class="settings-label" for="project-settings-permission-mode">專案工作區權限</label>
+                            <select id="project-settings-permission-mode" class="settings-input">
+                                <option value="read_only">唯讀：不允許工具修改專案</option>
+                                <option value="confirm_write">確認寫入：每次寫入前要求批准</option>
+                                <option value="workspace_write">工作區寫入：允許已核准能力修改專案</option>
+                            </select>
+                            <span class="settings-tip">外部寫入、系統操作與不可復原能力仍必須通過各自的批准閘門。</span>
+                        </div>
+                    </section>
+                    <section class="project-settings-pane" id="project-settings-pane-extensions" role="tabpanel"
+                        data-project-settings-pane="extensions" hidden>
+                        <div class="project-settings-extension-head">
+                            <div>
+                                <div class="settings-label">此專案使用的擴充</div>
+                                <span class="settings-tip">可繼承全域設定，或只在此專案明確啟用／停用。</span>
+                            </div>
+                            <button type="button" class="btn btn-secondary compact" id="project-settings-open-extensions">
+                                <i data-lucide="external-link"></i>開啟擴充中心
+                            </button>
+                        </div>
+                        <div id="project-settings-extension-list" class="project-settings-extension-list"
+                            aria-live="polite">
+                            <div class="extension-state">載入專案擴充中…</div>
+                        </div>
+                    </section>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" id="project-settings-cancel">取消</button>
+                <button type="button" class="btn btn-primary" id="project-settings-save">儲存專案設定</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Project Skills 僅屬於單一專案；不連結舊的 global Skill Center。 -->
+    <div class="modal-overlay" id="project-skill-editor-modal" role="dialog" aria-modal="true"
+        aria-hidden="true" aria-labelledby="project-skill-editor-title" hidden inert>
+        <div class="modal project-skill-editor-box">
+            <form id="project-skill-editor-form">
+                <div class="modal-header">
+                    <h3 id="project-skill-editor-title"><i data-lucide="sparkles"></i>Project Skill</h3>
+                    <button type="button" class="modal-close" id="project-skill-editor-close"
+                        aria-label="關閉 Project Skill 編輯器">
+                        <i data-lucide="x"></i>
+                    </button>
+                </div>
+                <div class="project-skill-editor-body">
+                    <div class="project-skill-editor-main">
+                        <div class="project-skill-editor-grid">
+                            <div class="settings-group">
+                                <label class="settings-label" for="project-skill-name">名稱</label>
+                                <input id="project-skill-name" class="settings-input" maxlength="80"
+                                    autocomplete="off" required>
+                            </div>
+                            <div class="settings-group">
+                                <label class="settings-label" for="project-skill-slug">Slug</label>
+                                <input id="project-skill-slug" class="settings-input" maxlength="63"
+                                    pattern="[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?" autocomplete="off" required>
+                            </div>
+                            <div class="settings-group project-skill-description-field">
+                                <label class="settings-label" for="project-skill-description">說明</label>
+                                <input id="project-skill-description" class="settings-input" maxlength="500"
+                                    autocomplete="off">
+                            </div>
+                            <div class="settings-group">
+                                <label class="settings-label" for="project-skill-version">版本</label>
+                                <input id="project-skill-version" class="settings-input" maxlength="32"
+                                    value="1.0.0" autocomplete="off" required>
+                            </div>
+                            <div class="settings-group project-skill-enabled-field">
+                                <label class="project-skill-enabled-control" for="project-skill-enabled">
+                                    <input type="checkbox" id="project-skill-enabled" checked>
+                                    <span>在此專案啟用</span>
+                                </label>
+                            </div>
+                        </div>
+                        <div class="settings-group project-skill-instructions-field">
+                            <label class="settings-label" for="project-skill-instructions">Instructions</label>
+                            <textarea id="project-skill-instructions" class="settings-input project-skill-instructions"
+                                rows="14" maxlength="131072" required></textarea>
+                            <span class="settings-tip">只儲存指令與文字資料，不會授予或執行任何工具。</span>
+                        </div>
+                    </div>
+                    <aside class="project-skill-editor-aside" aria-label="Project Skill 資源">
+                        <section class="project-skill-resource-section" id="project-skill-reference-section"
+                            aria-labelledby="project-skill-reference-title">
+                            <div class="project-skill-resource-head">
+                                <div>
+                                    <h4 id="project-skill-reference-title">參考檔</h4>
+                                    <p>多選 UTF-8 文字檔；支援單檔 8 MiB、整包 32 MiB，聊天時只選取相關片段。</p>
+                                </div>
+                                <button type="button" class="btn btn-secondary compact project-skill-reference-picker"
+                                    id="project-skill-reference-add">
+                                    <i data-lucide="file-plus-2"></i>加入
+                                </button>
+                                <input type="file" id="project-skill-reference-input" multiple
+                                    accept="text/*,.css,.csv,.html,.js,.json,.jsx,.md,.py,.rst,.sql,.toml,.ts,.tsv,.tsx,.txt,.xml,.yaml,.yml" hidden>
+                            </div>
+                            <div id="project-skill-reference-list" class="project-skill-reference-list"
+                                aria-live="polite"></div>
+                        </section>
+                        <section class="project-skill-resource-section" id="project-skill-version-section"
+                            aria-labelledby="project-skill-version-title" hidden>
+                            <div class="project-skill-resource-head">
+                                <div>
+                                    <h4 id="project-skill-version-title">版本紀錄</h4>
+                                    <p>唯讀顯示已保存的 Skill 版本。</p>
+                                </div>
+                                <button type="button" class="btn btn-secondary compact"
+                                    id="project-skill-version-refresh">
+                                    <i data-lucide="refresh-cw"></i>重新整理
+                                </button>
+                            </div>
+                            <div id="project-skill-version-list" class="project-skill-version-list"
+                                aria-live="polite"></div>
+                            <div id="project-skill-version-preview" class="project-skill-version-preview"
+                                aria-live="polite" hidden></div>
+                        </section>
+                    </aside>
+                </div>
+                <div class="modal-footer project-skill-editor-footer">
+                    <span id="project-skill-editor-status" class="project-skill-editor-status"
+                        role="status" aria-live="polite"></span>
+                    <button type="button" class="btn btn-secondary" id="project-skill-editor-cancel">取消</button>
+                    <button type="submit" class="btn btn-primary" id="project-skill-editor-save">儲存 Skill</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- M14 擴充中心：第一版只接受內建與本機受信任 manifest。 -->
+    <div class="modal-overlay" id="extension-center-modal" role="dialog" aria-modal="true"
+        aria-labelledby="extensions-title">
+        <div class="modal extensions-modal-box">
+            <div class="modal-header">
+                <div>
+                    <h3 id="extensions-title"><i data-lucide="puzzle"></i>擴充中心</h3>
+                    <p class="extension-subtitle">管理內建整合與本機受信任擴充；不提供遠端市集安裝。</p>
+                </div>
+                <button type="button" class="modal-close" id="extensions-close" aria-label="關閉擴充中心">
+                    <i data-lucide="x"></i>
+                </button>
+            </div>
+            <div class="extension-toolbar">
+                <label class="extension-search">
+                    <i data-lucide="search"></i>
+                    <span class="sr-only">搜尋擴充</span>
+                    <input type="search" id="extension-search" placeholder="搜尋名稱、類型或來源">
+                </label>
+                <label class="extension-scope">
+                    <span>作用範圍</span>
+                    <select id="extension-scope-select" class="settings-input">
+                        <option value="global">所有專案（全域）</option>
+                    </select>
+                </label>
+                <button type="button" class="btn btn-secondary compact" id="extension-refresh">
+                    <i data-lucide="refresh-cw"></i>重新整理
+                </button>
+            </div>
+            <div class="extension-tabs" role="tablist" aria-label="擴充分類">
+                <button type="button" class="extension-tab-btn active" role="tab" aria-selected="true"
+                    aria-controls="extension-pane-installed" data-extension-tab="installed">已安裝</button>
+                <button type="button" class="extension-tab-btn" role="tab" aria-selected="false"
+                    aria-controls="extension-pane-available" data-extension-tab="available">可安裝</button>
+                <button type="button" class="extension-tab-btn" role="tab" aria-selected="false"
+                    aria-controls="extension-pane-local" data-extension-tab="local">本機</button>
+            </div>
+            <div class="extension-body">
+                <section class="extension-tab-panel active" id="extension-pane-installed" role="tabpanel"
+                    data-extension-panel="installed">
+                    <div class="extension-list" id="extension-installed-list" aria-live="polite">
+                        <div class="extension-state is-loading">載入已安裝擴充中…</div>
+                    </div>
+                </section>
+                <section class="extension-tab-panel" id="extension-pane-available" role="tabpanel"
+                    data-extension-panel="available" hidden>
+                    <div class="extension-list" id="extension-available-list" aria-live="polite">
+                        <div class="extension-state is-loading">載入可安裝擴充中…</div>
+                    </div>
+                </section>
+                <section class="extension-tab-panel" id="extension-pane-local" role="tabpanel"
+                    data-extension-panel="local" hidden>
+                    <div class="extension-local-picker">
+                        <div>
+                            <label class="settings-label" for="extension-local-path">本機 Extension Manifest</label>
+                            <span class="settings-tip">先將 JSON 放入 <code>runtime/extensions/local/</code>，再輸入檔名；不可使用路徑或網址。</span>
+                        </div>
+                        <div class="extension-local-controls">
+                            <input id="extension-local-path" class="settings-input" autocomplete="off"
+                                placeholder="example-extension.json">
+                            <button type="button" class="btn btn-primary compact" id="extension-local-inspect" disabled>
+                                <i data-lucide="shield-check"></i>檢查權限
+                            </button>
+                        </div>
+                    </div>
+                    <div class="extension-list" id="extension-local-list" aria-live="polite">
+                        <div class="extension-state">輸入 manifest 檔名後，系統會先驗證來源、格式與權限。</div>
+                    </div>
+                </section>
+            </div>
+            <aside class="extension-audit-panel" id="extension-audit-panel" hidden
+                aria-labelledby="extension-audit-title">
+                <div class="extension-audit-head">
+                    <div>
+                        <strong id="extension-audit-title">擴充稽核</strong>
+                        <span id="extension-audit-subtitle"></span>
+                    </div>
+                    <button type="button" class="modal-close" id="extension-audit-close" aria-label="關閉擴充稽核">
+                        <i data-lucide="x"></i>
+                    </button>
+                </div>
+                <div id="extension-audit-list" class="extension-audit-list" aria-live="polite"></div>
+            </aside>
+            <div class="modal-footer">
+                <span class="extension-safety-note"><i data-lucide="shield-check"></i>安裝與權限變更會留下 audit。</span>
+                <button type="button" class="btn btn-secondary" id="extensions-close-btn">關閉</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Skill 中心：Skill 是工作流程，不會授予或繞過工具權限。 -->
+    <div class="modal-overlay" id="skill-center-modal" role="dialog" aria-modal="true"
+        aria-labelledby="skills-center-title">
+        <div class="modal extensions-modal-box skill-center-box">
+            <div class="modal-header">
+                <div>
+                    <h3 id="skills-center-title"><i data-lucide="sparkles"></i>Skills</h3>
+                    <p class="extension-subtitle">管理 Agent 工作流程；Skill 內腳本不會自動執行，也不會取得工具權限。</p>
+                </div>
+                <button type="button" class="modal-close" id="skills-close" aria-label="關閉 Skills">
+                    <i data-lucide="x"></i>
+                </button>
+            </div>
+            <div class="extension-toolbar">
+                <label class="extension-search">
+                    <i data-lucide="search"></i>
+                    <span class="sr-only">搜尋 Skill</span>
+                    <input type="search" id="skill-search" placeholder="搜尋名稱、用途或發布者">
+                </label>
+                <button type="button" class="btn btn-secondary compact" id="skill-refresh">
+                    <i data-lucide="refresh-cw"></i>重新整理
+                </button>
+            </div>
+            <div class="extension-tabs" role="tablist" aria-label="Skill 分類">
+                <button type="button" class="skill-tab-btn active" role="tab" aria-selected="true" data-skill-tab="installed">已安裝</button>
+                <button type="button" class="skill-tab-btn" role="tab" aria-selected="false" data-skill-tab="available">可用</button>
+                <button type="button" class="skill-tab-btn" role="tab" aria-selected="false" data-skill-tab="local">本機匯入</button>
+                <button type="button" class="skill-tab-btn" role="tab" aria-selected="false" data-skill-tab="project_active">專案使用中</button>
+            </div>
+            <div class="extension-body skill-center-body">
+                <div class="extension-local-picker" id="skill-local-picker" hidden>
+                    <div>
+                        <label class="settings-label" for="skill-local-source">本機 Skill 資料夾或 ZIP</label>
+                        <span class="settings-tip">先放入 <code>runtime/skills/local/</code>，只輸入 basename；系統會先檢查，不會自動安裝或信任。</span>
+                    </div>
+                    <div class="extension-local-controls">
+                        <input id="skill-local-source" class="settings-input" autocomplete="off" placeholder="my-skill 或 my-skill.zip">
+                        <button type="button" class="btn btn-primary compact" id="skill-local-inspect" disabled>
+                            <i data-lucide="shield-check"></i>安全檢查
+                        </button>
+                    </div>
+                </div>
+                <div class="extension-list skill-list" id="skill-list" aria-live="polite">
+                    <div class="extension-state is-loading">載入 Skills 中…</div>
+                </div>
+            </div>
+            <div class="modal-footer skill-center-footer">
+                <span id="skill-center-status" class="settings-tip">Skill 只提供指令與資源；所有工具仍受原有權限閘門控制。</span>
+                <button type="button" class="btn btn-secondary" id="skills-done">完成</button>
+            </div>
+        </div>
+    </div>
+
+    <div class="modal-overlay" id="extension-permission-modal" role="dialog" aria-modal="true"
+        aria-labelledby="extension-permission-title">
+        <div class="modal extension-permission-modal-box">
+            <div class="modal-header">
+                <h3 id="extension-permission-title"><i data-lucide="shield-alert"></i>權限審查</h3>
+                <button type="button" class="modal-close" id="extension-permission-close" aria-label="關閉權限審查">
+                    <i data-lucide="x"></i>
+                </button>
+            </div>
+            <div class="modal-body">
+                <div id="extension-permission-summary" class="extension-permission-summary"></div>
+                <label class="extension-trust-confirm">
+                    <input type="checkbox" id="extension-trust-confirm">
+                    <span>我已確認來源路徑、manifest digest 與上述權限，並信任此本機擴充。</span>
+                </label>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" id="extension-permission-cancel">取消</button>
+                <button type="button" class="btn btn-primary" id="extension-permission-confirm" disabled>
+                    確認並繼續
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <div class="modal-overlay" id="cloud-llm-modal" role="dialog" aria-modal="true"
+        aria-labelledby="cloud-llm-title">
+        <div class="modal cloud-llm-modal-box">
+            <div class="modal-header cloud-llm-header">
+                <div>
+                    <h3 id="cloud-llm-title"><i data-lucide="cloud-cog"></i>雲端 LLM</h3>
+                    <p>集中管理已導入的 API 與模型；每筆連線及金鑰皆獨立保存。</p>
+                </div>
+                <button type="button" class="modal-close" id="cloud-llm-close" aria-label="關閉雲端 LLM">
+                    <i data-lucide="x"></i>
+                </button>
+            </div>
+            <section id="cloud-llm-library-view" class="cloud-llm-library-view">
+                <div class="cloud-llm-toolbar">
+                    <label class="cloud-llm-search">
+                        <i data-lucide="search"></i>
+                        <span class="sr-only">搜尋 API、模型或連線 ID</span>
+                        <input type="search" id="cloud-llm-search" placeholder="搜尋 API、模型或連線名稱">
+                    </label>
+                    <select id="cloud-llm-provider-filter" class="settings-input" aria-label="依供應商篩選">
+                        <option value="all">所有供應商</option>
+                        <option value="gemini">Google Gemini</option>
+                        <option value="nvidia">NVIDIA</option>
+                        <option value="openai">OpenAI</option>
+                        <option value="openai_compatible">相容 API</option>
+                    </select>
+                    <select id="cloud-llm-kind-filter" class="settings-input" aria-label="依模型用途分類">
+                        <option value="all">所有用途</option>
+                        <option value="chat">對話 / Agent</option>
+                        <option value="translation">翻譯</option>
+                        <option value="embedding">嵌入</option>
+                        <option value="rerank">重排序</option>
+                        <option value="vision">視覺</option>
+                        <option value="unknown">未分類</option>
+                    </select>
+                    <select id="cloud-llm-status-filter" class="settings-input" aria-label="依連線狀態篩選">
+                        <option value="all">所有狀態</option>
+                        <option value="enabled">已啟用</option>
+                        <option value="disabled">已停用</option>
+                        <option value="configured">已設定金鑰</option>
+                        <option value="missing-key">缺少金鑰</option>
+                    </select>
+                    <button type="button" class="btn btn-primary compact" id="btn-add-model-provider">
+                        <i data-lucide="plus"></i>新增 API
+                    </button>
+                </div>
+                <div class="cloud-llm-list-head">
+                    <strong>已導入的 API</strong>
+                    <span id="cloud-llm-count">0 / 0 筆</span>
+                </div>
+                <div id="cloud-llm-library-list" class="cloud-llm-library-list" aria-live="polite"></div>
+                <div class="modal-footer">
+                    <span class="cloud-llm-security-note"><i data-lucide="shield-check"></i>金鑰由 Windows DPAPI 加密，不會顯示完整內容。</span>
+                    <button type="button" class="btn btn-secondary" id="cloud-llm-close-btn">關閉</button>
+                </div>
+            </section>
+            <section id="cloud-llm-editor-view" class="cloud-llm-editor-view" hidden>
+                <div class="cloud-llm-editor-toolbar">
+                    <button type="button" class="btn btn-secondary compact" id="cloud-llm-back">
+                        <i data-lucide="arrow-left"></i>返回已導入 API
+                    </button>
+                    <div class="cloud-llm-editor-heading">
+                        <span class="cloud-llm-eyebrow">API CONNECTION</span>
+                        <strong id="cloud-llm-editor-title">API 連線設定</strong>
+                        <span>新增會建立獨立連線，不會覆蓋既有 API。</span>
+                    </div>
+                </div>
+                <div id="model-provider-list" class="model-provider-list cloud-llm-editor-list"></div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" id="cloud-llm-editor-cancel">取消</button>
+                    <button type="button" class="btn btn-primary" id="cloud-llm-save">儲存 API</button>
+                </div>
+            </section>
+        </div>
+    </div>
+
+    <!-- 相容性佔位：舊版沙盒切換鈕（新 UI 由 Rail 的 Artifacts 取代，保留 id 供既有邏輯） -->
+    <button id="btn-sandbox-toggle" class="btn-settings-trigger btn-sandbox-toggle" hidden aria-hidden="true"></button>
+
+    <section class="task-progress-center" id="task-progress-center" aria-label="執行進度" aria-live="polite" hidden>
+        <div class="task-progress-head">
+            <div class="task-progress-heading">
+                <i data-lucide="activity" aria-hidden="true"></i>
+                <span>執行進度</span>
+                <span class="task-progress-count" id="task-progress-count">0</span>
+            </div>
+            <button type="button" class="task-progress-toggle" id="task-progress-toggle" title="收合執行進度" aria-label="收合執行進度" aria-expanded="true">
+                <i data-lucide="chevron-down" aria-hidden="true"></i>
+            </button>
+        </div>
+        <div class="task-progress-list" id="task-progress-list"></div>
+    </section>
+
+    <script src="extension-center.js?v=1.2.3-cloud-editor-layout"></script>
+    <script src="skill-center.js?v=1.0.2-chat-reset"></script>
+    <script src="cloud-llm-center.js?v=1.0.1"></script>
+    <script src="agent-collaboration.js?v=1.1.0-model-trace"></script>
+    <script src="basic-chat-mode.js?v=1.0.2-sidebar-contract"></script>
+    <script src="project-skills-sidebar.js?v=1.1.0-output-surface"></script>
+    <script src="hermes-settings.js?v=1.0.0-sidecar-rollout"></script>
+    <script src="app.js?v=5.14.0-output-skills"></script>
+</body>
+</html>

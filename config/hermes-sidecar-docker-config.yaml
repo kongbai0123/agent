@@ -1,0 +1,60 @@
+# Hermes Agent v0.18.2 / v2026.7.7.2 fail-closed Docker-sidecar policy.
+# This file is copied verbatim to runtime/hermes/home/config.yaml.
+model:
+  default: "gemma4-hermes:latest"
+  provider: "custom"
+  base_url: "http://host.docker.internal:11434/v1"
+  context_length: 64000
+  max_tokens: 4096
+
+# Empty platform selection is intentional. The API server must start with no
+# LLM-callable tools until it is moved behind an OS isolation boundary.
+toolsets: []
+platform_toolsets:
+  api_server: []
+
+# Dynamic MCP and plugin discovery are also disabled at startup via
+# HERMES_SAFE_MODE=1. These empty maps/lists make the persisted policy explicit.
+mcp_servers: {}
+plugins:
+  enabled: []
+  disabled: []
+
+agent:
+  disabled_toolsets:
+    - web
+    - browser
+    - terminal
+    - file
+    - code_execution
+    - vision
+    - video
+    - image_gen
+    - video_gen
+    - x_search
+    - tts
+    - skills
+    - todo
+    - memory
+    - context_engine
+    - session_search
+    - clarify
+    - delegation
+    - cronjob
+    - homeassistant
+    - spotify
+    - discord
+    - discord_admin
+    - yuanbao
+    - computer_use
+  verify_on_stop: false
+
+approvals:
+  mode: manual
+
+# Pin the current migration version so the pinned Hermes release does not
+# rewrite this reviewed policy file on first startup.
+display:
+  tool_progress: all
+
+_config_version: 33

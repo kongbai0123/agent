@@ -1,0 +1,39 @@
+{
+  "ollama_url": "http://127.0.0.1:11434",
+  "ollama_num_ctx": 8192,
+  "model_provider": "ollama",
+  "openai_compatible_url": "http://127.0.0.1:1234/v1",
+  "openai_api_key_env": "OPENAI_API_KEY",
+  "model_providers": [
+    {
+      "id": "openrouter",
+      "label": "OpenRouter",
+      "base_url": "https://openrouter.ai/api/v1",
+      "enabled": false,
+      "supports_tools": false,
+      "input_cost_per_million": 0,
+      "output_cost_per_million": 0,
+      "currency": "USD"
+    }
+  ],
+  "model_input_cost_per_million": 0,
+  "model_output_cost_per_million": 0,
+  "model_cost_currency": "USD",
+  "default_chat_model": "",
+  "default_vision_model": "",
+  "ui_language": "zh-TW",
+  "hermes_enabled": false,
+  "hermes_base_url": "http://127.0.0.1:8642",
+  "hermes_api_key_env": "HERMES_API_SERVER_KEY",
+  "hermes_model": "gemma4-hermes:latest",
+  "hermes_transport": "runs",
+  "hermes_rollout_mode": "disabled",
+  "hermes_rollout_percentage": 0,
+  "hermes_canary_session_ids": [],
+  "hermes_tools_enabled": false,
+  "hermes_allowed_capabilities": [],
+  "hermes_readonly_project_id": "",
+  "hermes_fallback_enabled": true,
+  "settings_modal_width": 900,
+  "settings_modal_height": 650
+}
