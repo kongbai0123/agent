@@ -8,6 +8,7 @@ HERMES_SETTINGS_JS = (ROOT / "frontend" / "hermes-settings.js").read_text(
 )
 INDEX_HTML = (ROOT / "frontend" / "index.html").read_text(encoding="utf-8")
 APP_JS = (ROOT / "frontend" / "app.js").read_text(encoding="utf-8")
+STYLE_CSS = (ROOT / "frontend" / "style.css").read_text(encoding="utf-8")
 
 
 def test_module_is_independently_mountable_and_exposes_host_hooks():
@@ -63,6 +64,38 @@ def test_external_api_data_uses_safe_dom_rendering_only():
     assert ".textContent" in HERMES_SETTINGS_JS
     assert ".replaceChildren" in HERMES_SETTINGS_JS
     assert "statusEntries(state.status)" in HERMES_SETTINGS_JS
+
+
+def test_each_hermes_field_uses_an_accessible_bulleted_hover_help():
+    for contract in (
+        "function fieldTitle(id, labelText, helpContent = [])",
+        "hermes-field-title-row",
+        "hermes-field-help-disclosure",
+        "hermes-field-help-trigger",
+        "helpIcon.dataset.lucide = 'lightbulb'",
+        "toggle.setAttribute('aria-describedby', helpId)",
+        "help.setAttribute('role', 'tooltip')",
+        "element('ul', 'hermes-field-help-list')",
+        "list.appendChild(element('li', '', item))",
+    ):
+        assert contract in HERMES_SETTINGS_JS
+    assert "toggle.addEventListener('click'" not in HERMES_SETTINGS_JS
+    assert "help.hidden" not in HERMES_SETTINGS_JS
+    for selector in (
+        ".hermes-field-title-row",
+        ".hermes-field-help-disclosure",
+        ".hermes-field-help-trigger",
+        ".hermes-field-help",
+        ".hermes-field-help-list",
+    ):
+        assert selector in STYLE_CSS
+    assert ".hermes-field-help-disclosure:hover .hermes-field-help" in STYLE_CSS
+    assert ".hermes-field-help-disclosure:focus-within .hermes-field-help" in STYLE_CSS
+    assert ".hermes-settings-field:has(.hermes-field-help-trigger:hover)" in STYLE_CSS
+    assert "right: 0" in STYLE_CSS
+    assert "z-index: 130" in STYLE_CSS
+    assert "visibility: hidden" in STYLE_CSS
+    assert 'hermes-settings.js?v=1.1.2-hover-help-dom' in INDEX_HTML
 
 
 def test_secret_is_never_collected_or_persisted_by_the_panel():
@@ -138,9 +171,19 @@ class FakeElement {
         if (this._id) elements.set(this._id, this);
     }
     get id() { return this._id || ''; }
-    append(...nodes) { this.children.push(...nodes); }
-    appendChild(node) { this.children.push(node); return node; }
-    replaceChildren(...nodes) { this.children = [...nodes]; }
+    append(...nodes) {
+        nodes.forEach(node => { node.parentElement = this; });
+        this.children.push(...nodes);
+    }
+    appendChild(node) {
+        node.parentElement = this;
+        this.children.push(node);
+        return node;
+    }
+    replaceChildren(...nodes) {
+        nodes.forEach(node => { node.parentElement = this; });
+        this.children = [...nodes];
+    }
     setAttribute(name, value) { this.attributes[name] = String(value); }
     addEventListener(name, listener) { this.listeners[name] = listener; }
 }
@@ -227,9 +270,28 @@ const invalidStatuses = [
     const toggle = elements.get('hermes-setting-tools-enabled');
     const rolloutMode = elements.get('hermes-setting-rollout-mode');
     const rolloutPercentage = elements.get('hermes-setting-rollout-percentage');
+    const rolloutHelpTrigger = elements.get('hermes-setting-rollout-mode-help-trigger');
+    const rolloutHelp = elements.get('hermes-setting-rollout-mode-help');
     const optionFor = (control, value) => control.children.find(
         option => option.value === String(value),
     );
+    if (!rolloutHelpTrigger || !rolloutHelp) {
+        throw new Error('rollout hover help must exist beside its title');
+    }
+    const rolloutHelpList = rolloutHelp.children[0];
+    if (rolloutHelpList?.tagName !== 'UL' || rolloutHelpList.children.length !== 3
+        || !rolloutHelpList.children.every(item => item.tagName === 'LI')) {
+        throw new Error('rollout help must use a three-item bulleted list');
+    }
+    if (rolloutHelp.attributes.role !== 'tooltip'
+        || rolloutHelpTrigger.attributes['aria-describedby'] !== rolloutHelp.id
+        || rolloutHelpTrigger.listeners.click) {
+        throw new Error('rollout help must be hover/focus driven without click state');
+    }
+    if (rolloutHelp.parentElement !== rolloutHelpTrigger.parentElement
+        || rolloutHelp.parentElement?.className !== 'hermes-field-help-disclosure') {
+        throw new Error('rollout help must remain inside its hovered disclosure');
+    }
     if (!toggle || toggle.disabled) throw new Error('verified toggle must be enabled');
     if (JSON.stringify(rolloutPercentage.children.map(option => option.value))
         !== JSON.stringify(['5', '25', '50'])) {

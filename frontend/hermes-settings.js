@@ -65,24 +65,57 @@
         return node;
     }
 
-    function labeledField(id, labelText, control, tipText = '') {
-        const group = element('div', 'settings-group hermes-settings-field');
+    function helpItems(value) {
+        const items = Array.isArray(value) ? value : value ? [value] : [];
+        return items.map(item => String(item || '').trim()).filter(Boolean);
+    }
+
+    function fieldTitle(id, labelText, helpContent = []) {
+        const row = element('div', 'hermes-field-title-row');
         const label = element('label', 'settings-label', labelText);
         label.htmlFor = id;
-        group.append(label, control);
-        if (tipText) group.appendChild(element('span', 'settings-tip', tipText));
+        row.appendChild(label);
+
+        const items = helpItems(helpContent);
+        if (!items.length) return { row, help: null };
+
+        const helpId = `${id}-help`;
+        const toggle = element('span', 'hermes-field-help-trigger');
+        toggle.id = `${id}-help-trigger`;
+        toggle.tabIndex = 0;
+        toggle.setAttribute('aria-label', `「${labelText}」說明`);
+        toggle.setAttribute('aria-describedby', helpId);
+        const helpIcon = element('i');
+        helpIcon.dataset.lucide = 'lightbulb';
+        helpIcon.setAttribute('aria-hidden', 'true');
+        toggle.appendChild(helpIcon);
+
+        const help = element('div', 'hermes-field-help');
+        help.id = helpId;
+        help.setAttribute('role', 'tooltip');
+        const list = element('ul', 'hermes-field-help-list');
+        items.forEach(item => list.appendChild(element('li', '', item)));
+        help.appendChild(list);
+        const disclosure = element('span', 'hermes-field-help-disclosure');
+        disclosure.append(toggle, help);
+        row.appendChild(disclosure);
+        return { row, help };
+    }
+
+    function labeledField(id, labelText, control, helpContent = []) {
+        const group = element('div', 'settings-group hermes-settings-field');
+        const title = fieldTitle(id, labelText, helpContent);
+        group.append(title.row, control);
         return group;
     }
 
-    function toggleField(id, labelText, tipText = '') {
+    function toggleField(id, labelText, helpContent = []) {
         const control = input(id, 'checkbox');
         control.className = 'hermes-settings-toggle';
         const group = element('div', 'settings-group toggle-group hermes-settings-field');
         const copy = element('div', 'hermes-settings-toggle-copy');
-        const label = element('label', 'settings-label', labelText);
-        label.htmlFor = id;
-        copy.appendChild(label);
-        if (tipText) copy.appendChild(element('span', 'settings-tip', tipText));
+        const title = fieldTitle(id, labelText, helpContent);
+        copy.appendChild(title.row);
         group.append(copy, control);
         return { group, control };
     }
@@ -930,7 +963,10 @@
         const enabledField = toggleField(
             'hermes-setting-enabled',
             '啟用 Hermes 路由',
-            '關閉時所有聊天維持 Workbench 原路徑。',
+            [
+                '關閉時，所有聊天維持 Workbench 原本的 Basic Chat 路徑。',
+                '啟用後，仍會依 Rollout 規則決定哪些 Session 進入 Hermes。',
+            ],
         );
         const baseUrl = input('hermes-setting-base-url', 'url');
         baseUrl.placeholder = DEFAULTS.baseUrl;
@@ -939,7 +975,11 @@
             baseUrl.id,
             'Loopback URL',
             baseUrl,
-            '只接受 localhost、127.0.0.0/8 或 ::1；不可包含帳密與額外路徑。',
+            [
+                '只接受 localhost、127.0.0.0/8 或 ::1。',
+                '不可包含帳號、密碼或 API Key。',
+                '不可加入額外路徑、查詢參數或 fragment。',
+            ],
         );
 
         const apiKeyEnv = input('hermes-setting-api-key-env');
@@ -950,7 +990,11 @@
             apiKeyEnv.id,
             'API Key 環境變數名稱',
             apiKeyEnv,
-            '此處只儲存環境變數名稱；不顯示、不接收也不儲存 secret。',
+            [
+                '此處只儲存環境變數名稱。',
+                '介面不顯示、不接收也不儲存 secret。',
+                '實際金鑰由 Hermes 隔離服務的執行環境提供。',
+            ],
         );
 
         const rolloutMode = document.createElement('select');
@@ -973,7 +1017,11 @@
             rolloutMode.id,
             'Rollout 模式',
             rolloutMode,
-            '建議先由 Canary 驗證，再逐步提高比例。',
+            [
+                '先使用 Canary 指定少量 Session 驗證。',
+                '驗證通過後依序擴大為 5%、25%、50%。',
+                '最後才切換為全部啟用；需要時可立即降級。',
+            ],
         );
 
         const rolloutPercentage = document.createElement('select');
@@ -991,7 +1039,11 @@
             rolloutPercentage.id,
             '啟用比例（%）',
             rolloutPercentage,
-            '固定依序使用 5%、25%、50%；升級不可跳級，可立即降級。',
+            [
+                '固定使用 5%、25%、50% 三個階段。',
+                '升級時不可跳過中間階段。',
+                '降級不受階段限制，可立即降低比例。',
+            ],
         );
         const rolloutStageNotice = element('div', 'hermes-rollout-stage-notice');
         rolloutStageNotice.dataset.hermesRolloutGuidance = 'true';
@@ -1007,13 +1059,21 @@
             canarySessionIds.id,
             'Canary Session IDs',
             canarySessionIds,
-            '只會讓列出的對話進入 Hermes；每行一個 ID。',
+            [
+                '只有列出的 Session 會進入 Hermes。',
+                '每行填寫一個完整的 Workbench Session ID。',
+                '未列出的 Session 仍使用原本的 Basic Chat 路徑。',
+            ],
         );
 
         const toolsField = toggleField(
             'hermes-setting-tools-enabled',
             '允許 Hermes 工具流程',
-            '預設關閉。工具核准與 allowlist 不是安全邊界；啟用前必須使用 OS 層級隔離。',
+            [
+                '此功能預設關閉。',
+                '工具核准與 allowlist 本身不是安全隔離邊界。',
+                '啟用前必須通過 Docker 與 OS 層級隔離驗證。',
+            ],
         );
         toolsField.control.disabled = true;
         toolsField.control.checked = false;
