@@ -23,6 +23,8 @@ def test_project_skills_module_is_loaded_before_app_and_not_mounted_in_sidebar()
     assert "project-skills" not in project_block
     assert "Skills" not in project_block
     assert "const matching = sessions.filter(session => session.project_id === project.id" in project_block
+    assert 'project-skills-sidebar.js?v=1.2.1-add-menu-a11y' in INDEX_HTML
+    assert 'style.css?v=5.16.1-skills-add-menu' in INDEX_HTML
 
 
 def test_project_skills_use_only_project_and_session_scoped_apis():
@@ -66,6 +68,85 @@ def test_project_section_supports_fixed_expansion_and_cached_auto_load():
     assert "if (options?.autoLoad === true) void loadProject(project.id);" in create_block
     assert "force" not in create_block
     assert "/api/" not in create_block
+
+
+def test_project_skill_add_button_opens_an_accessible_single_menu():
+    render_start = PROJECT_SKILLS_JS.index("function renderProjectSection")
+    create_start = PROJECT_SKILLS_JS.index("function createProjectSection")
+    render_block = PROJECT_SKILLS_JS[render_start:create_start]
+    menu_start = PROJECT_SKILLS_JS.index("function createAddMenu(")
+    empty_start = PROJECT_SKILLS_JS.index("function createEmptySkillsState")
+    menu_block = PROJECT_SKILLS_JS[menu_start:empty_start]
+
+    assert "project-skills-add-wrap" in render_block
+    assert "project-skills-add-menu-${++addMenuSequence}" in menu_block
+    assert "button.setAttribute('aria-haspopup', 'menu')" in menu_block
+    assert "button.setAttribute('aria-expanded', 'false')" in menu_block
+    assert "button.setAttribute('aria-controls', menu.id)" in menu_block
+    assert "menu.setAttribute('role', 'menu')" in menu_block
+    assert "option.setAttribute('role', 'menuitem')" in PROJECT_SKILLS_JS
+    assert "if (state.addMenu.menu && state.addMenu.menu !== menu) closeAddMenu();" in PROJECT_SKILLS_JS
+    assert "if (state.addMenu.section === section) closeAddMenu();" in render_block
+
+
+def test_project_skill_add_menu_preserves_create_and_truthfully_disables_future_actions():
+    menu_start = PROJECT_SKILLS_JS.index("function createAddMenu(")
+    empty_start = PROJECT_SKILLS_JS.index("function createEmptySkillsState")
+    menu_block = PROJECT_SKILLS_JS[menu_start:empty_start]
+
+    assert "title: '建立空白 Skill'" in menu_block
+    assert "closeAddMenu({ restoreFocus: true });\n                    openCreateEditor(project);" in menu_block
+    for label in ("從本機資料夾匯入", "從 GitHub 匯入", "了解 Skill 格式"):
+        assert f"title: '{label}'" in menu_block
+    assert menu_block.count("comingSoon: true") == 2
+    assert "option.disabled = true" not in PROJECT_SKILLS_JS
+    assert "option.setAttribute('aria-disabled', 'true')" in PROJECT_SKILLS_JS
+    assert "project-skills-add-option-badge', '即將提供'" in PROJECT_SKILLS_JS
+    assert "onSelect: () => showSkillFormatGuide(menu)" in menu_block
+    assert "Skill 資料夾格式" in PROJECT_SKILLS_JS
+    assert "my-skill/\\n├─ SKILL.md" in PROJECT_SKILLS_JS
+
+    # The menu is presentation-only for unsupported imports and must not add fake APIs.
+    assert "/import" not in menu_block
+    assert "apiFetch" not in menu_block
+
+
+def test_project_skill_add_menu_supports_keyboard_outside_click_and_focus_restore():
+    menu_start = PROJECT_SKILLS_JS.index("function createAddMenu(")
+    empty_start = PROJECT_SKILLS_JS.index("function createEmptySkillsState")
+    menu_block = PROJECT_SKILLS_JS[menu_start:empty_start]
+    init_start = PROJECT_SKILLS_JS.index("function initAddMenuDom")
+    init_end = PROJECT_SKILLS_JS.index("function init(options)", init_start)
+    init_block = PROJECT_SKILLS_JS[init_start:init_end]
+
+    for key in ("ArrowDown", "ArrowUp", "Home", "End", "Escape", "Tab", "Enter"):
+        assert f"event.key === '{key}'" in menu_block or f"'{key}'" in menu_block
+    assert "items[currentIndex].click()" in menu_block
+    assert "closeAddMenu({ restoreFocus: true })" in menu_block
+    assert "button?.isConnected" in PROJECT_SKILLS_JS
+    assert "button.focus()" in PROJECT_SKILLS_JS
+    assert "document.addEventListener('click'" in init_block
+    assert "menu.contains(event.target)" in init_block
+    assert "state.addMenu.button?.contains(event.target)" in init_block
+    assert "document.addEventListener('keydown'" in init_block
+    assert "event.key !== 'Escape'" in init_block
+    assert "event.stopImmediatePropagation()" in init_block
+    assert "}, true);" in init_block
+    assert "state.addMenu.menu?.contains(event.target)" in init_block
+    assert "initAddMenuDom();" in PROJECT_SKILLS_JS
+
+
+def test_empty_project_skill_state_has_a_real_create_cta_only():
+    empty_start = PROJECT_SKILLS_JS.index("function createEmptySkillsState")
+    render_start = PROJECT_SKILLS_JS.index("function renderProjectSection")
+    empty_block = PROJECT_SKILLS_JS[empty_start:render_start]
+
+    assert "project-skills-empty" in empty_block
+    assert "建立第一個 Skill" in empty_block
+    assert "openCreateEditor(project)" in empty_block
+    assert "從資料夾匯入 · 即將提供" in empty_block
+    assert "secondary.disabled = true" in empty_block
+    assert "secondary.setAttribute('aria-disabled', 'true')" in empty_block
 
 
 def test_api_data_is_rendered_without_html_injection_sinks():
@@ -133,6 +214,8 @@ def test_output_skills_and_editor_styles_cover_focus_disabled_error_and_mobile_s
     assert ":disabled" in STYLE_CSS
     assert "text-overflow: ellipsis" in STYLE_CSS
     assert "@media (max-width: 760px)" in STYLE_CSS
+    assert ".project-skill-resource-head .btn {" in STYLE_CSS
+    assert "width: auto" in STYLE_CSS
 
 
 def test_basic_mode_keeps_global_center_hidden_but_not_project_skills():

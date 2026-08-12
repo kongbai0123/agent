@@ -50,10 +50,17 @@
             slugDirty: false,
             restoreFocus: null,
         },
+        addMenu: {
+            section: null,
+            button: null,
+            menu: null,
+            anchor: null,
+        },
         busy: new Set(),
     };
 
     let deps = null;
+    let addMenuSequence = 0;
 
     const byId = id => document.getElementById(id);
     const encoded = value => encodeURIComponent(String(value || ''));
@@ -453,7 +460,309 @@
         return row;
     }
 
+    function closeAddMenu({ restoreFocus = false } = {}) {
+        const button = state.addMenu.button;
+        const menu = state.addMenu.menu;
+        if (!menu) return;
+        menu.hidden = true;
+        menu.dataset.view = 'actions';
+        menu.setAttribute('role', 'menu');
+        menu.removeAttribute('aria-modal');
+        menu.removeAttribute('aria-labelledby');
+        menu.setAttribute('aria-label', menu.dataset.menuLabel || 'Skill 新增選單');
+        if (menu._projectSkillsActions) menu._projectSkillsActions.hidden = false;
+        if (menu._projectSkillsGuide) menu._projectSkillsGuide.hidden = true;
+        menu.style.left = '';
+        menu.style.top = '';
+        menu.style.width = '';
+        button?.setAttribute('aria-expanded', 'false');
+        if (state.addMenu.anchor?.isConnected) state.addMenu.anchor.appendChild(menu);
+        state.addMenu.section = null;
+        state.addMenu.button = null;
+        state.addMenu.menu = null;
+        state.addMenu.anchor = null;
+        if (restoreFocus && button?.isConnected && !button.disabled) button.focus();
+    }
+
+    function addMenuItems(menu) {
+        return [...menu.querySelectorAll('[role="menuitem"]')];
+    }
+
+    function focusAddMenuItem(menu, position = 'first') {
+        const items = addMenuItems(menu);
+        const item = position === 'last' ? items.at(-1) : items[0];
+        item?.focus();
+    }
+
+    function positionAddMenu(button, menu) {
+        if (!document.body || typeof button.getBoundingClientRect !== 'function') return;
+        document.body.appendChild(menu);
+        const viewportWidth = Math.max(0, Number(window.innerWidth) || 0);
+        const viewportHeight = Math.max(0, Number(window.innerHeight) || 0);
+        const buttonRect = button.getBoundingClientRect();
+        const width = Math.min(320, Math.max(0, viewportWidth - 24));
+        menu.style.width = `${width}px`;
+        const menuRect = menu.getBoundingClientRect();
+        const left = Math.max(12, Math.min(
+            buttonRect.right - menuRect.width,
+            viewportWidth - menuRect.width - 12
+        ));
+        let top = buttonRect.bottom + 8;
+        if (top + menuRect.height > viewportHeight - 12) {
+            top = Math.max(12, buttonRect.top - menuRect.height - 8);
+        }
+        menu.style.left = `${left}px`;
+        menu.style.top = `${top}px`;
+    }
+
+    function openAddMenu(section, button, menu, { focus = 'first' } = {}) {
+        if (button.disabled) return;
+        if (state.addMenu.menu && state.addMenu.menu !== menu) closeAddMenu();
+        state.addMenu.section = section;
+        state.addMenu.button = button;
+        state.addMenu.menu = menu;
+        state.addMenu.anchor = button.parentElement;
+        menu.dataset.view = 'actions';
+        menu.hidden = false;
+        button.setAttribute('aria-expanded', 'true');
+        positionAddMenu(button, menu);
+        focusAddMenuItem(menu, focus);
+    }
+
+    function createAddMenuOption({ iconName, title, description, comingSoon = false, onSelect }) {
+        const option = element(
+            'button',
+            `project-skills-add-option ${comingSoon ? 'is-coming-soon' : ''}`.trim()
+        );
+        option.type = 'button';
+        option.tabIndex = -1;
+        option.setAttribute('role', 'menuitem');
+        option.appendChild(element('span', 'project-skills-add-option-icon'));
+        option.firstChild.appendChild(icon(iconName));
+        const copy = element('span', 'project-skills-add-option-copy');
+        copy.append(
+            element('span', 'project-skills-add-option-title', title),
+            element('span', 'project-skills-add-option-description', description)
+        );
+        option.appendChild(copy);
+        if (comingSoon) {
+            option.setAttribute('aria-disabled', 'true');
+            option.title = `${title}（即將提供）`;
+            option.appendChild(element('span', 'project-skills-add-option-badge', '即將提供'));
+            option.addEventListener('click', event => {
+                event.preventDefault();
+                event.stopPropagation();
+                deps?.showToast?.(`${title}功能即將提供。`, 'info');
+            });
+        } else {
+            option.addEventListener('click', event => {
+                event.stopPropagation();
+                onSelect?.();
+            });
+        }
+        return option;
+    }
+
+    function showSkillFormatGuide(menu) {
+        if (!menu?._projectSkillsActions || !menu._projectSkillsGuide) return;
+        menu._projectSkillsActions.hidden = true;
+        menu._projectSkillsGuide.hidden = false;
+        menu.dataset.view = 'guide';
+        menu.setAttribute('role', 'dialog');
+        menu.setAttribute('aria-modal', 'false');
+        menu.removeAttribute('aria-label');
+        menu.setAttribute('aria-labelledby', menu._projectSkillsGuideTitle.id);
+        positionAddMenu(state.addMenu.button, menu);
+        menu._projectSkillsGuideBack?.focus();
+    }
+
+    function showAddMenuActions(menu, { focusFormat = false } = {}) {
+        if (!menu?._projectSkillsActions || !menu._projectSkillsGuide) return;
+        menu._projectSkillsGuide.hidden = true;
+        menu._projectSkillsActions.hidden = false;
+        menu.dataset.view = 'actions';
+        menu.setAttribute('role', 'menu');
+        menu.removeAttribute('aria-modal');
+        menu.removeAttribute('aria-labelledby');
+        menu.setAttribute('aria-label', menu.dataset.menuLabel || 'Skill 新增選單');
+        positionAddMenu(state.addMenu.button, menu);
+        if (focusFormat) menu._projectSkillsFormatOption?.focus();
+    }
+
+    function createSkillFormatGuide(menu) {
+        const guide = element('div', 'project-skills-format-guide');
+        guide.id = `${menu.id}-format-guide`;
+        guide.hidden = true;
+        guide.setAttribute('role', 'document');
+        const head = element('div', 'project-skills-format-guide-head');
+        const back = iconButton('arrow-left', '返回新增 Skill 選單', 'project-skills-format-guide-back');
+        const title = element('strong', 'project-skills-format-guide-title', 'Skill 資料夾格式');
+        title.id = `${menu.id}-format-title`;
+        const close = iconButton('x', '關閉 Skill 格式說明', 'project-skills-format-guide-close');
+        head.append(back, title, close);
+        const tree = element(
+            'pre',
+            'project-skills-format-tree',
+            'my-skill/\n├─ SKILL.md\n├─ references/\n├─ scripts/\n└─ assets/'
+        );
+        const notes = element('ul', 'project-skills-format-notes');
+        [
+            'SKILL.md 為必要檔案，說明用途、觸發條件與操作規則。',
+            'references、scripts 與 assets 均為選用資料夾。',
+            '匯入只會先檢查內容，不會自動執行 scripts。',
+        ].forEach(note => notes.appendChild(element('li', '', note)));
+        guide.append(
+            head,
+            element('p', 'project-skills-format-guide-intro', '建議使用以下結構，方便驗證、版本管理與後續匯入。'),
+            tree,
+            notes
+        );
+        back.addEventListener('click', event => {
+            event.stopPropagation();
+            showAddMenuActions(menu, { focusFormat: true });
+        });
+        close.addEventListener('click', event => {
+            event.stopPropagation();
+            closeAddMenu({ restoreFocus: true });
+        });
+        menu._projectSkillsGuide = guide;
+        menu._projectSkillsGuideTitle = title;
+        menu._projectSkillsGuideBack = back;
+        return guide;
+    }
+
+    function createAddMenu(section, project, button) {
+        const menu = element('div', 'project-skills-add-menu');
+        menu.id = `project-skills-add-menu-${++addMenuSequence}`;
+        menu.hidden = true;
+        menu.setAttribute('role', 'menu');
+        menu.dataset.menuLabel = `${project.name || '目前專案'} 的 Skill 新增選單`;
+        menu.setAttribute('aria-label', menu.dataset.menuLabel);
+        const actions = element('div', 'project-skills-add-actions');
+        actions.setAttribute('role', 'none');
+        const formatOption = createAddMenuOption({
+            iconName: 'circle-help',
+            title: '了解 Skill 格式',
+            description: '查看標準資料夾結構與必要欄位',
+            onSelect: () => showSkillFormatGuide(menu),
+        });
+        formatOption.setAttribute('aria-haspopup', 'dialog');
+        actions.append(
+            createAddMenuOption({
+                iconName: 'file-plus-2',
+                title: '建立空白 Skill',
+                description: '從零開始編輯名稱、指令與參考檔',
+                onSelect: () => {
+                    closeAddMenu({ restoreFocus: true });
+                    openCreateEditor(project);
+                },
+            }),
+            createAddMenuOption({
+                iconName: 'folder-input',
+                title: '從本機資料夾匯入',
+                description: '選擇包含 SKILL.md 的本機資料夾',
+                comingSoon: true,
+            }),
+            createAddMenuOption({
+                iconName: 'download',
+                title: '從 GitHub 匯入',
+                description: '貼上 Repository 或 Skill 子資料夾網址',
+                comingSoon: true,
+            }),
+            formatOption
+        );
+        menu._projectSkillsActions = actions;
+        menu._projectSkillsFormatOption = formatOption;
+        const guide = createSkillFormatGuide(menu);
+        formatOption.setAttribute('aria-controls', guide.id);
+        menu.append(actions, guide);
+        button.setAttribute('aria-haspopup', 'menu');
+        button.setAttribute('aria-expanded', 'false');
+        button.setAttribute('aria-controls', menu.id);
+        button.addEventListener('click', event => {
+            event.stopPropagation();
+            if (state.addMenu.menu === menu && !menu.hidden) {
+                closeAddMenu({ restoreFocus: true });
+                return;
+            }
+            openAddMenu(section, button, menu);
+        });
+        button.addEventListener('keydown', event => {
+            if (!['ArrowDown', 'ArrowUp'].includes(event.key)) return;
+            event.preventDefault();
+            event.stopPropagation();
+            openAddMenu(section, button, menu, {
+                focus: event.key === 'ArrowUp' ? 'last' : 'first',
+            });
+        });
+        menu.addEventListener('click', event => event.stopPropagation());
+        menu.addEventListener('keydown', event => {
+            if (menu.dataset.view === 'guide') return;
+            const items = addMenuItems(menu);
+            const currentIndex = items.indexOf(document.activeElement);
+            let target = null;
+            if (event.key === 'ArrowDown' && items.length) {
+                target = items[(currentIndex + 1 + items.length) % items.length];
+            } else if (event.key === 'ArrowUp' && items.length) {
+                target = items[(currentIndex - 1 + items.length) % items.length];
+            } else if (event.key === 'Home') {
+                target = items[0];
+            } else if (event.key === 'End') {
+                target = items.at(-1);
+            } else if (event.key === 'Escape') {
+                event.preventDefault();
+                event.stopPropagation();
+                closeAddMenu({ restoreFocus: true });
+                return;
+            } else if (event.key === 'Tab') {
+                closeAddMenu();
+                return;
+            } else if (['Enter', ' '].includes(event.key) && currentIndex >= 0) {
+                event.preventDefault();
+                event.stopPropagation();
+                items[currentIndex].click();
+                return;
+            } else {
+                return;
+            }
+            event.preventDefault();
+            event.stopPropagation();
+            target?.focus();
+        });
+        return menu;
+    }
+
+    function createEmptySkillsState(project) {
+        const empty = element('div', 'project-skills-empty');
+        const emptyIcon = element('div', 'project-skills-empty-icon');
+        emptyIcon.appendChild(icon('sparkles'));
+        const primary = element('button', 'project-skills-empty-primary', '建立第一個 Skill');
+        primary.type = 'button';
+        primary.addEventListener('click', event => {
+            event.stopPropagation();
+            openCreateEditor(project);
+        });
+        const secondary = element(
+            'button',
+            'project-skills-empty-secondary',
+            '從資料夾匯入 · 即將提供'
+        );
+        secondary.type = 'button';
+        secondary.disabled = true;
+        secondary.setAttribute('aria-disabled', 'true');
+        secondary.title = '從本機資料夾匯入功能即將提供';
+        empty.append(
+            emptyIcon,
+            element('strong', 'project-skills-empty-title', '此專案尚未加入 Skill'),
+            element('span', 'project-skills-empty-description', '建立專案專用指令，讓目前對話依需求使用。'),
+            primary,
+            secondary
+        );
+        return empty;
+    }
+
     function renderProjectSection(section, project, options = {}) {
+        if (state.addMenu.section === section) closeAddMenu();
         section.replaceChildren();
         const record = projectRecord(project.id);
         const alwaysExpanded = options?.alwaysExpanded === true;
@@ -491,13 +800,16 @@
         }
         header.appendChild(toggle);
 
-        const add = iconButton('plus', `新增 ${project.name} 的 Project Skill`, 'project-skills-add');
-        add.disabled = Boolean(project.archived);
-        add.addEventListener('click', event => {
-            event.stopPropagation();
-            openCreateEditor(project);
-        });
-        header.appendChild(add);
+        const addDisabledReason = !project?.id
+            ? '請先選擇專案後再新增 Skill'
+            : project.archived ? '封存專案無法新增 Skill' : '';
+        const addLabel = addDisabledReason || `新增或匯入 ${project.name} 的 Project Skill`;
+        const addWrap = element('div', 'project-skills-add-wrap');
+        const add = iconButton('plus', addLabel, 'project-skills-add');
+        add.disabled = Boolean(addDisabledReason);
+        const addMenu = createAddMenu(section, project, add);
+        addWrap.append(add, addMenu);
+        header.appendChild(addWrap);
         section.appendChild(header);
 
         if (!expanded) return;
@@ -516,7 +828,11 @@
             failure.appendChild(retry);
             list.appendChild(failure);
         } else if (!record.items.length) {
-            list.appendChild(inlineState(project.archived ? '此專案沒有 Skills。' : '尚未建立 Project Skill。'));
+            list.appendChild(
+                project.archived
+                    ? inlineState('此專案沒有 Skills。')
+                    : createEmptySkillsState(project)
+            );
         } else {
             record.items.forEach(skill => list.appendChild(createSkillRow(project, skill)));
         }
@@ -1139,6 +1455,29 @@
         }, true);
     }
 
+    function initAddMenuDom() {
+        document.addEventListener('click', event => {
+            const menu = state.addMenu.menu;
+            if (
+                !menu || menu.hidden
+                || menu.contains(event.target)
+                || state.addMenu.button?.contains(event.target)
+            ) return;
+            closeAddMenu();
+        });
+        document.addEventListener('keydown', event => {
+            if (event.key !== 'Escape' || !state.addMenu.menu || state.addMenu.menu.hidden) return;
+            event.preventDefault();
+            event.stopImmediatePropagation();
+            closeAddMenu({ restoreFocus: true });
+        }, true);
+        window.addEventListener('resize', () => closeAddMenu());
+        document.addEventListener('scroll', event => {
+            if (state.addMenu.menu?.contains(event.target)) return;
+            closeAddMenu();
+        }, true);
+    }
+
     function init(options) {
         if (state.initialized) return;
         deps = {
@@ -1153,6 +1492,7 @@
         }
         state.initialized = true;
         initEditorDom();
+        initAddMenuDom();
     }
 
     window.workbenchProjectSkills = {
