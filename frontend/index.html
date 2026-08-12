@@ -17,7 +17,7 @@
     <link rel="stylesheet" href="katex.min.css">
     <script src="katex.min.js"></script>
     <script src="auto-render.min.js"></script>
-    <link rel="stylesheet" href="style.css?v=5.14.0-output-skills">
+    <link rel="stylesheet" href="style.css?v=5.15.0-typography">
 </head>
 <body class="basic-chat-mode">
     <div class="app-container workbench-shell">
@@ -71,9 +71,6 @@
             <nav class="icon-rail" role="navigation" aria-label="主功能導覽">
                 <button class="rail-btn active" id="rail-chat" title="對話" aria-label="對話與歷史紀錄">
                     <i data-lucide="message-square"></i><span class="rail-label">對話</span>
-                </button>
-                <button class="rail-btn" id="rail-output" title="輸出內容" aria-label="開啟輸出內容">
-                    <i data-lucide="panel-right"></i><span class="rail-label">輸出</span>
                 </button>
                 <button class="rail-btn" id="rail-knowledge" title="知識庫" aria-label="知識庫管理">
                     <i data-lucide="book-open"></i><span class="rail-label">知識庫</span>
@@ -240,7 +237,7 @@
                         <div class="temp-context-file-info">
                             <i data-lucide="file-text" style="color: var(--primary-color); width: 14px; height: 14px;"></i>
                             <span id="temp-context-filename">檔名.pdf</span>
-                            <span style="color: var(--text-muted); font-size: 11px;">(此對話臨時參考，已成功解析)</span>
+                            <span style="color: var(--text-muted); font-size: 12px;">(此對話臨時參考，已成功解析)</span>
                         </div>
                         <button type="button" id="btn-remove-temp-context" class="btn-remove-temp-context" title="移除此臨時參考" aria-label="移除臨時參考文件">
                             <i data-lucide="x" style="width: 14px; height: 14px;"></i>
@@ -357,7 +354,6 @@
                 <!-- Inspector 分頁列 -->
                 <div class="inspector-tabs" role="tablist" aria-label="Inspector 分頁">
                     <button class="inspector-tab" id="inspector-tab-context" data-itab="context" role="tab" aria-controls="inspector-pane-context" aria-selected="false" tabindex="-1">Context</button>
-                    <button class="inspector-tab" id="inspector-tab-output" data-itab="output" role="tab" aria-controls="inspector-pane-output" aria-selected="false" tabindex="-1">Output</button>
                     <button class="inspector-tab" id="inspector-tab-run" data-itab="run" role="tab" aria-controls="inspector-pane-run" aria-selected="false" tabindex="-1">Run</button>
                     <button class="inspector-tab active" id="inspector-tab-artifact" data-itab="artifact" role="tab" aria-controls="inspector-pane-artifact" aria-selected="true" tabindex="0">Artifact</button>
                     <button class="inspector-tab" id="inspector-tab-models" data-itab="models" role="tab" aria-controls="inspector-pane-models" aria-selected="false" tabindex="-1">Models</button>
@@ -378,24 +374,6 @@
                 <!-- Run Tab -->
                 <div class="inspector-pane" id="inspector-pane-run" role="tabpanel" aria-labelledby="inspector-tab-run" hidden>
                     <div class="ip-section"><div class="ip-title">Run Timeline</div><div id="ip-run-timeline" class="ip-body">尚無執行紀錄。</div></div>
-                </div>
-
-                <!-- Output：先承載目前專案的 Project Skills，後續可再加入其他輸出區塊 -->
-                <div class="inspector-pane output-pane" id="inspector-pane-output" role="tabpanel" aria-labelledby="inspector-tab-output" hidden>
-                    <div class="output-panel-card">
-                        <div class="output-panel-head">
-                            <div class="output-panel-title-wrap">
-                                <strong class="output-panel-title">輸出內容</strong>
-                                <span class="output-panel-project" id="output-panel-project">尚未選擇專案</span>
-                            </div>
-                            <button type="button" class="output-panel-close" id="output-panel-close" title="收合輸出內容" aria-label="收合輸出內容">
-                                <i data-lucide="panel-right-close" aria-hidden="true"></i>
-                            </button>
-                        </div>
-                        <div class="output-skills-mount" id="output-skills-mount" aria-live="polite">
-                            <div class="output-panel-empty">請先選擇專案</div>
-                        </div>
-                    </div>
                 </div>
 
                 <!-- Artifact Tab（沿用既有沙盒） -->
@@ -453,6 +431,30 @@
                     <div class="ip-section"><div class="ip-title">SSE Events（最近 200 筆）</div><pre id="ip-logs-body" class="ip-logs">尚無事件。</pre></div>
                 </div>
             </aside>
+        </div>
+    </div>
+
+    <!-- 右上角浮動工作框：垂直 Tablist 常駐，面板可展開或隱藏。 -->
+    <div class="output-floating-workspace" id="output-floating-workspace">
+        <aside class="output-floating-panel" id="output-floating-panel" role="tabpanel" aria-labelledby="output-floating-tab">
+            <div class="output-panel-card">
+                <div class="output-panel-head">
+                    <div class="output-panel-title-wrap">
+                        <strong class="output-panel-title">輸出內容</strong>
+                        <span class="output-panel-project" id="output-panel-project">尚未選擇專案</span>
+                    </div>
+                </div>
+                <div class="output-skills-mount" id="output-skills-mount" aria-live="polite">
+                    <div class="output-panel-empty">請先選擇專案</div>
+                </div>
+            </div>
+        </aside>
+        <div class="output-floating-tabs" role="tablist" aria-label="工作框功能" aria-orientation="vertical">
+            <button type="button" class="output-floating-tab active" id="output-floating-tab" role="tab"
+                aria-controls="output-floating-panel" aria-selected="true" aria-expanded="true" title="顯示或隱藏輸出內容">
+                <i data-lucide="panel-right" aria-hidden="true"></i>
+                <span>輸出</span>
+            </button>
         </div>
     </div>
 
@@ -589,7 +591,7 @@
                     <div class="kb-chunks-preview-section" id="chunks-preview-section" style="display: none;">
                         <div class="chunks-preview-header">
                             <h4 id="chunks-preview-title">📄 文件 Chunks 預覽</h4>
-                            <button class="btn btn-secondary btn-xs" id="close-chunks-btn" style="width: auto; padding: 4px 10px; font-size: 11px;">關閉預覽</button>
+                            <button class="btn btn-secondary btn-xs" id="close-chunks-btn" style="width: auto; padding: 4px 10px; font-size: 12px;">關閉預覽</button>
                         </div>
                         <div class="chunks-list" id="chunks-list"></div>
                     </div>
@@ -1468,6 +1470,6 @@
     <script src="basic-chat-mode.js?v=1.0.2-sidebar-contract"></script>
     <script src="project-skills-sidebar.js?v=1.1.0-output-surface"></script>
     <script src="hermes-settings.js?v=1.0.0-sidecar-rollout"></script>
-    <script src="app.js?v=5.14.0-output-skills"></script>
+    <script src="app.js?v=5.14.7-typography"></script>
 </body>
 </html>

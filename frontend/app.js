@@ -279,7 +279,8 @@ const sandboxTitle = document.getElementById('sandbox-title');
 const sandboxSubtitle = document.getElementById('sandbox-subtitle');
 const btnSandboxDownload = document.getElementById('btn-sandbox-download');
 const btnSandboxClose = document.getElementById('btn-sandbox-close');
-const outputPanelClose = document.getElementById('output-panel-close');
+const outputFloatingPanel = document.getElementById('output-floating-panel');
+const outputFloatingTab = document.getElementById('output-floating-tab');
 const outputPanelProject = document.getElementById('output-panel-project');
 const outputSkillsMount = document.getElementById('output-skills-mount');
 const tabSandboxPreview = document.getElementById('tab-sandbox-preview');
@@ -1374,6 +1375,11 @@ function initThemeToggle() {
 
 // 監聽器設定
 function setupEventListeners() {
+    // 浮動工作框屬於頁面骨架，開關不應等待後端、模型或 Session 初始化。
+    outputFloatingTab.addEventListener('click', () => {
+        setOutputFloatingPanelOpen(outputFloatingPanel.hidden);
+    });
+
     // 輸入框高度自動調整與 Enter 送出
     userInput.addEventListener('input', () => {
         userInput.style.height = 'auto';
@@ -1835,6 +1841,14 @@ function clearOutputSkillsContext(message = '正在切換專案…') {
     renderOutputSkillsPane(null, message);
 }
 
+function setOutputFloatingPanelOpen(open) {
+    const expanded = open === true;
+    outputFloatingPanel.hidden = !expanded;
+    outputFloatingTab.classList.toggle('active', expanded);
+    outputFloatingTab.setAttribute('aria-selected', expanded ? 'true' : 'false');
+    outputFloatingTab.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+}
+
 async function loadSessions(searchVal = '') {
     try {
         sidebarSearch = searchVal.toLocaleLowerCase();
@@ -1988,10 +2002,6 @@ function createProjectBlock(project, sessions) {
     block.appendChild(row);
 
     if (project.expanded || sidebarSearch) {
-        const projectSkills = window.workbenchProjectSkills?.createProjectSection(project, {
-            searching: Boolean(sidebarSearch)
-        });
-        if (projectSkills) block.appendChild(projectSkills);
         const matching = sessions.filter(session => session.project_id === project.id && matchesSidebarSearch(session));
         const visible = (expandedTaskLists.has(project.id) || sidebarSearch) ? matching : matching.slice(0, 5);
         const taskList = document.createElement('div');
@@ -2562,7 +2572,7 @@ async function createNewSession(projectId = null) {
         if (btnSandboxToggle) {
             btnSandboxToggle.classList.remove('active');
         }
-        if (!artifactsSandboxPanel.classList.contains('output-mode')) closeInspectorPanel();
+        closeInspectorPanel();
         activeArtifactCode = '';
         
         await loadSessions(searchSessionsInput.value.trim());
@@ -2581,7 +2591,7 @@ async function changeSession(sessionId) {
     if (btnSandboxToggle) {
         btnSandboxToggle.classList.remove('active');
     }
-    if (!artifactsSandboxPanel.classList.contains('output-mode')) closeInspectorPanel();
+    closeInspectorPanel();
     activeArtifactCode = '';
     
     // 更新側邊欄 Active 狀態
@@ -4473,7 +4483,6 @@ function renderVirtualFileTree(filterQuery = "") {
 
 function initArtifactsControls() {
     btnSandboxClose.addEventListener('click', closeInspectorPanel);
-    outputPanelClose?.addEventListener('click', closeInspectorPanel);
 
     if (btnSandboxToggle) {
         btnSandboxToggle.addEventListener('click', () => {
@@ -4499,7 +4508,7 @@ function initArtifactsControls() {
                             body {
                                 background: ${emptyBg};
                                 color: ${emptyMuted};
-                                font-family: 'IBM Plex Sans', 'Noto Sans TC', system-ui, -apple-system, sans-serif;
+                                font-family: 'Times New Roman', 'Microsoft JhengHei UI', 'Microsoft JhengHei', serif;
                                 display: flex;
                                 flex-direction: column;
                                 align-items: center;
@@ -5580,9 +5589,8 @@ function regenerateLastAnswer() {
 
 // ---- Inspector Panel（P10）----
 function closeInspectorPanel() {
-    artifactsSandboxPanel.classList.remove('active', 'output-mode');
+    artifactsSandboxPanel.classList.remove('active');
     artifactsSandboxPanel.setAttribute('aria-label', 'Inspector 面板');
-    document.getElementById('rail-output')?.classList.remove('active');
     if (btnSandboxToggle) btnSandboxToggle.classList.remove('active');
 }
 
@@ -5591,9 +5599,7 @@ function openInspector(tab) {
     if (!pane) return;
     closeAgentCollaboration(false);
     artifactsSandboxPanel.classList.add('active');
-    artifactsSandboxPanel.classList.toggle('output-mode', tab === 'output');
-    artifactsSandboxPanel.setAttribute('aria-label', tab === 'output' ? '輸出內容' : 'Inspector 面板');
-    document.getElementById('rail-output')?.classList.toggle('active', tab === 'output');
+    artifactsSandboxPanel.setAttribute('aria-label', 'Inspector 面板');
     document.querySelectorAll('.inspector-tab').forEach(inspectorTab => {
         const selected = inspectorTab.dataset.itab === tab;
         inspectorTab.classList.toggle('active', selected);
@@ -5647,7 +5653,7 @@ function renderRunPane() {
         return `<div style="border:1px solid var(--panel-border); border-radius:9px; padding:10px 12px; margin-bottom:8px; background:var(--surface-subtle);">
             <div style="font-weight:600; margin-bottom:4px;">${r.time} · ${escapeHtml(r.model || '')}</div>
             ${evts || '<div style="color:var(--text-muted);">（無工具步驟）</div>'}
-            <div style="color:var(--text-muted); margin-top:6px; font-size:11px;">${m.elapsed ? `用時 ${m.elapsed.toFixed(1)}s` : ''}${m.tokps ? ` · ${m.tokps} tok/s` : ''}${r.sources && r.sources.length ? ` · ${r.sources.length} 來源` : ''}</div>
+            <div style="color:var(--text-muted); margin-top:6px; font-size:12px;">${m.elapsed ? `用時 ${m.elapsed.toFixed(1)}s` : ''}${m.tokps ? ` · ${m.tokps} tok/s` : ''}${r.sources && r.sources.length ? ` · ${r.sources.length} 來源` : ''}</div>
         </div>`;
     }).join('');
 }
@@ -6450,12 +6456,6 @@ function initWorkbench(status) {
         document.getElementById('rail-chat').classList.add('active');
     });
     document.getElementById('rail-knowledge').addEventListener('click', () => openKnowledgeCenter('documents'));
-    document.getElementById('rail-output').addEventListener('click', () => {
-        const outputOpen = artifactsSandboxPanel.classList.contains('active')
-            && document.getElementById('inspector-pane-output').classList.contains('active');
-        if (outputOpen) closeInspectorPanel();
-        else openInspector('output');
-    });
     document.getElementById('rail-runs').addEventListener('click', () => openInspector('run'));
     document.getElementById('rail-artifacts').addEventListener('click', () => {
         if (artifactsSandboxPanel.classList.contains('active') && document.getElementById('inspector-pane-artifact').classList.contains('active')) {

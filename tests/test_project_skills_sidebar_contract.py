@@ -11,20 +11,18 @@ PROJECT_SKILLS_JS = (FRONTEND / "project-skills-sidebar.js").read_text(encoding=
 STYLE_CSS = (FRONTEND / "style.css").read_text(encoding="utf-8")
 
 
-def test_project_skills_module_is_loaded_before_app_and_wired_into_sidebar():
+def test_project_skills_module_is_loaded_before_app_and_not_mounted_in_sidebar():
     module_tag = '<script src="project-skills-sidebar.js'
     app_tag = '<script src="app.js'
     assert module_tag in INDEX_HTML
     assert INDEX_HTML.index(module_tag) < INDEX_HTML.index(app_tag)
     assert "window.workbenchProjectSkills?.init({" in APP_JS
     assert "window.workbenchProjectSkills?.setSessionContext({" in APP_JS
-    assert "window.workbenchProjectSkills?.createProjectSection(project" in APP_JS
-
-    row_anchor = "block.appendChild(row);"
-    skills_anchor = "window.workbenchProjectSkills?.createProjectSection(project"
-    tasks_anchor = "const matching = sessions.filter(session => session.project_id === project.id"
     project_block = APP_JS[APP_JS.index("function createProjectBlock"):APP_JS.index("function createSessionRow")]
-    assert project_block.index(row_anchor) < project_block.index(skills_anchor) < project_block.index(tasks_anchor)
+    assert "workbenchProjectSkills" not in project_block
+    assert "project-skills" not in project_block
+    assert "Skills" not in project_block
+    assert "const matching = sessions.filter(session => session.project_id === project.id" in project_block
 
 
 def test_project_skills_use_only_project_and_session_scoped_apis():
@@ -115,7 +113,7 @@ def test_editor_dom_has_labeled_fields_references_versions_and_status():
     assert 'multiple' in INDEX_HTML[INDEX_HTML.index('id="project-skill-reference-input"') - 60:INDEX_HTML.index('id="project-skill-reference-input"') + 160]
 
 
-def test_sidebar_and_editor_styles_cover_focus_disabled_error_and_mobile_states():
+def test_output_skills_and_editor_styles_cover_focus_disabled_error_and_mobile_states():
     required_selectors = (
         ".project-skills-section",
         ".project-skills-header",
