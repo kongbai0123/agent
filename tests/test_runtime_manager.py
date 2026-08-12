@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -89,6 +90,106 @@ class RuntimeManagerTests(unittest.TestCase):
         pairing = json.loads((turn_dir / "pairing.json").read_text(encoding="utf-8"))
         self.assertTrue(pairing["complete"])
         self.assertEqual((turn_dir / "response.md").read_text(encoding="utf-8").strip(), "回答")
+
+    def test_restore_skips_linked_attachment_and_artifact_files(self):
+        session_dir = self.root / "restore-session"
+        attachment_root = session_dir / "attachments"
+        attachment_root.mkdir(parents=True)
+        normal_attachment = attachment_root / "normal.bin"
+        normal_attachment.write_bytes(b"normal")
+        outside = self.root / "outside-private.txt"
+        outside.write_text("outside-private", encoding="utf-8")
+        linked_attachment = attachment_root / "linked.bin"
+        linked_artifact = (
+            session_dir / "artifacts" / "artifact-restore" / "files" / "linked.txt"
+        )
+        links_available = True
+        try:
+            linked_attachment.symlink_to(outside)
+            linked_artifact.parent.mkdir(parents=True)
+            linked_artifact.symlink_to(outside)
+        except (NotImplementedError, OSError):
+            links_available = False
+
+        (attachment_root / "manifest.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "id": "attachment-normal",
+                        "session_id": "sess_runtime",
+                        "filename": "normal.bin",
+                        "mime_type": "application/octet-stream",
+                        "storage_path": "attachments/normal.bin",
+                        "size_bytes": 6,
+                        "created_at": "2026-01-01",
+                    },
+                    *(
+                        [
+                            {
+                                "id": "attachment-linked",
+                                "session_id": "sess_runtime",
+                                "filename": "linked.bin",
+                                "mime_type": "application/octet-stream",
+                                "storage_path": "attachments/linked.bin",
+                                "size_bytes": 15,
+                                "created_at": "2026-01-01",
+                            }
+                        ]
+                        if links_available
+                        else []
+                    ),
+                ]
+            ),
+            encoding="utf-8",
+        )
+        artifact_dir = session_dir / "artifacts" / "artifact-restore"
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        (artifact_dir / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "id": "artifact-restore",
+                    "session_id": "sess_runtime",
+                    "turn_id": "turn_runtime",
+                    "title": "Restored",
+                    "type": "text",
+                    "created_at": "2026-01-01",
+                    "updated_at": "2026-01-01",
+                }
+            ),
+            encoding="utf-8",
+        )
+        normal_artifact = artifact_dir / "files" / "normal.txt"
+        normal_artifact.parent.mkdir(parents=True, exist_ok=True)
+        normal_artifact.write_text("normal artifact", encoding="utf-8")
+
+        connection = sqlite3.connect(self.db_path)
+        try:
+            restored_attachments = runtime_manager._restore_attachments(
+                connection, session_dir
+            )
+            restored_artifacts = runtime_manager._restore_artifacts(
+                connection, session_dir
+            )
+            attachment_ids = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT id FROM attachments WHERE id LIKE 'attachment-%'"
+                )
+            }
+            artifact_paths = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT path FROM artifact_files WHERE artifact_id = 'artifact-restore'"
+                )
+            }
+            connection.commit()
+        finally:
+            connection.close()
+
+        self.assertEqual(restored_attachments, 1)
+        self.assertEqual(attachment_ids, {"attachment-normal"})
+        self.assertEqual(restored_artifacts, 1)
+        self.assertEqual(artifact_paths, {"normal.txt"})
 
 
 if __name__ == "__main__":

@@ -209,11 +209,50 @@ def build_project_skills_router(
     @router.get("/api/runs/{run_id}/skills")
     def load_run_skill_provenance(run_id: str):
         try:
+            run = runtime.database.get_run(run_id)
+            if not run:
+                raise HTTPException(
+                    status_code=404,
+                    detail=error_payload(
+                        "RUN_NOT_FOUND", "Run not found.", recoverable=False
+                    ),
+                )
+            session_id = str(run.get("session_id") or "")
+            project_id = run.get("project_id")
+            session = runtime.database.get_session(session_id)
+            if not session or session.get("project_id") != project_id:
+                raise HTTPException(
+                    status_code=409,
+                    detail=error_payload(
+                        "RUN_SKILL_SCOPE_MISMATCH",
+                        "Run Skill provenance no longer matches its session scope.",
+                        recoverable=False,
+                    ),
+                )
+            skills = runtime.run_provenance(run_id)
+            if any(
+                item.get("run_id") != run_id
+                or item.get("session_id") != session_id
+                or item.get("project_id") != project_id
+                for item in skills
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail=error_payload(
+                        "RUN_SKILL_SCOPE_MISMATCH",
+                        "Run Skill provenance contains a mismatched scope.",
+                        recoverable=False,
+                    ),
+                )
             return {
                 "success": True,
                 "run_id": run_id,
-                "skills": runtime.run_provenance(run_id),
+                "session_id": session_id,
+                "project_id": project_id,
+                "skills": skills,
             }
+        except HTTPException:
+            raise
         except ProjectSkillError as exc:
             raise _failure(exc, error_payload) from exc
 

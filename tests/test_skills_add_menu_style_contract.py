@@ -10,7 +10,7 @@ def test_skills_add_menu_is_anchored_and_panel_sized():
         ".project-skills-add-wrap",
         ".project-skills-add-menu",
         "position: fixed",
-        "z-index: 520",
+        "z-index: 540",
         "width: min(320px, calc(100vw - 24px))",
         "min-width: min(280px, calc(100vw - 24px))",
         "max-width: calc(100vw - 24px)",
@@ -61,6 +61,14 @@ def test_skill_format_guide_and_editor_layer_are_readable_above_the_output_panel
         "#project-skill-editor-modal { z-index: 900; }",
     ):
         assert selector in STYLE_CSS
+
+
+def test_floating_popover_modal_and_toast_layers_are_ordered():
+    assert ".output-floating-workspace {" in STYLE_CSS
+    assert "z-index: 230" in STYLE_CSS
+    assert "z-index: 540" in STYLE_CSS
+    assert "#project-skill-editor-modal { z-index: 900; }" in STYLE_CSS
+    assert "z-index: 1500" in STYLE_CSS
 
 
 def test_empty_skills_state_exposes_primary_and_secondary_actions():

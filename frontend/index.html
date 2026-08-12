@@ -17,7 +17,7 @@
     <link rel="stylesheet" href="katex.min.css">
     <script src="katex.min.js"></script>
     <script src="auto-render.min.js"></script>
-    <link rel="stylesheet" href="style.css?v=5.16.1-skills-add-menu">
+    <link rel="stylesheet" href="style.css?v=5.17.0-run-inspector">
 </head>
 <body class="basic-chat-mode">
     <div class="app-container workbench-shell">
@@ -434,26 +434,63 @@
         </div>
     </div>
 
-    <!-- 右上角浮動工作框：垂直 Tablist 常駐，面板可展開或隱藏。 -->
+    <!-- 右上角浮動檢查器：垂直 Tablist 常駐，內容面板可展開或隱藏。 -->
     <div class="output-floating-workspace" id="output-floating-workspace">
-        <aside class="output-floating-panel" id="output-floating-panel" role="tabpanel" aria-labelledby="output-floating-tab">
+        <aside class="output-floating-panel" id="output-floating-panel" aria-label="執行檢查器">
             <div class="output-panel-card">
                 <div class="output-panel-head">
                     <div class="output-panel-title-wrap">
-                        <strong class="output-panel-title">輸出內容</strong>
+                        <strong class="output-panel-title" id="output-panel-title">Skills</strong>
                         <span class="output-panel-project" id="output-panel-project">尚未選擇專案</span>
                     </div>
                 </div>
-                <div class="output-skills-mount" id="output-skills-mount" aria-live="polite">
-                    <div class="output-panel-empty">請先選擇專案</div>
-                </div>
+                <section class="output-panel-pane active" id="output-pane-skills" role="tabpanel"
+                    aria-labelledby="output-tab-skills" tabindex="0">
+                    <div class="run-inspector-section run-skills-used-section">
+                        <div class="run-inspector-section-head">
+                            <strong>本輪實際使用</strong>
+                            <span class="run-inspector-section-count" id="run-skills-used-count">–</span>
+                        </div>
+                        <div class="run-inspector-content" id="run-skills-used" aria-live="polite">
+                            <div class="output-panel-empty">尚無執行紀錄</div>
+                        </div>
+                    </div>
+                    <div class="output-skills-mount" id="output-skills-mount" aria-live="polite">
+                        <div class="output-panel-empty">請先選擇專案</div>
+                    </div>
+                </section>
+                <section class="output-panel-pane" id="output-pane-execution" role="tabpanel"
+                    aria-labelledby="output-tab-execution" tabindex="0" hidden>
+                    <div class="run-inspector-content" id="run-execution-content" aria-live="polite">
+                        <div class="output-panel-empty">尚無執行紀錄</div>
+                    </div>
+                </section>
+                <section class="output-panel-pane" id="output-pane-results" role="tabpanel"
+                    aria-labelledby="output-tab-results" tabindex="0" hidden>
+                    <div class="run-inspector-content" id="run-results-content" aria-live="polite">
+                        <div class="output-panel-empty">尚無結果</div>
+                    </div>
+                </section>
             </div>
         </aside>
         <div class="output-floating-tabs" role="tablist" aria-label="工作框功能" aria-orientation="vertical">
-            <button type="button" class="output-floating-tab active" id="output-floating-tab" role="tab"
-                aria-controls="output-floating-panel" aria-selected="true" aria-expanded="true" title="顯示或隱藏輸出內容">
-                <i data-lucide="panel-right" aria-hidden="true"></i>
-                <span>輸出</span>
+            <button type="button" class="output-floating-tab active" id="output-tab-skills" role="tab"
+                aria-controls="output-pane-skills" aria-selected="true" aria-expanded="true" tabindex="0" title="顯示或隱藏 Skills">
+                <i data-lucide="sparkles" aria-hidden="true"></i>
+                <span>Skills</span>
+                <span class="output-tab-badge" id="output-tab-skills-badge" hidden>0</span>
+            </button>
+            <button type="button" class="output-floating-tab" id="output-tab-execution" role="tab"
+                aria-controls="output-pane-execution" aria-selected="false" aria-expanded="false" tabindex="-1" title="顯示或隱藏執行狀態">
+                <i data-lucide="activity" aria-hidden="true"></i>
+                <span>執行</span>
+                <span class="output-tab-badge" id="output-tab-execution-badge" hidden>0</span>
+            </button>
+            <button type="button" class="output-floating-tab" id="output-tab-results" role="tab"
+                aria-controls="output-pane-results" aria-selected="false" aria-expanded="false" tabindex="-1" title="顯示或隱藏結果與變更">
+                <i data-lucide="file-check-2" aria-hidden="true"></i>
+                <span>結果</span>
+                <span class="output-tab-badge" id="output-tab-results-badge" hidden>0</span>
             </button>
         </div>
     </div>
@@ -1469,7 +1506,8 @@
     <script src="agent-collaboration.js?v=1.1.0-model-trace"></script>
     <script src="basic-chat-mode.js?v=1.0.2-sidebar-contract"></script>
     <script src="project-skills-sidebar.js?v=1.2.1-add-menu-a11y"></script>
+    <script src="run-inspector.js?v=1.0.0"></script>
     <script src="hermes-settings.js?v=1.1.2-hover-help-dom"></script>
-    <script src="app.js?v=5.14.7-typography"></script>
+    <script src="app.js?v=5.15.0-run-inspector"></script>
 </body>
 </html>

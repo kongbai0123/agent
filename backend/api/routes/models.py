@@ -570,7 +570,34 @@ def build_models_router(
         run = database.get_run(run_id)
         if not run:
             raise HTTPException(status_code=404, detail=error_payload("RUN_NOT_FOUND", "Run not found.", recoverable=False))
-        return run
+        session = database.get_session(str(run.get("session_id") or ""))
+        if not session or session.get("project_id") != run.get("project_id"):
+            raise HTTPException(
+                status_code=409,
+                detail=error_payload(
+                    "RUN_SCOPE_CHANGED",
+                    "The run no longer belongs to the session's active project scope.",
+                    recoverable=False,
+                ),
+            )
+        # This legacy endpoint is intentionally metadata-only.  Execution,
+        # Results and Project Skills each have a separately scoped public
+        # projection; returning the database row here would expose historical
+        # raw events, provider diagnostics and source contents.
+        return {
+            "run_id": run_id,
+            "session_id": run.get("session_id"),
+            "turn_id": run.get("turn_id"),
+            "project_id": run.get("project_id"),
+            "retry_of_run_id": run.get("retry_of_run_id"),
+            "model": run.get("model"),
+            "mode": run.get("mode"),
+            "status": run.get("status"),
+            "execution_revision": int(run.get("execution_revision") or 0),
+            "created_at": run.get("created_at"),
+            "completed_at": run.get("completed_at"),
+            "input_manifest": run.get("input_manifest") or {},
+        }
 
 
     router.model_install_worker = _model_install_worker

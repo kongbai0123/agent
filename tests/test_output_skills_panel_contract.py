@@ -8,6 +8,7 @@ APP_JS = (FRONTEND / "app.js").read_text(encoding="utf-8")
 BASIC_MODE_JS = (FRONTEND / "basic-chat-mode.js").read_text(encoding="utf-8")
 INDEX_HTML = (FRONTEND / "index.html").read_text(encoding="utf-8")
 PROJECT_SKILLS_JS = (FRONTEND / "project-skills-sidebar.js").read_text(encoding="utf-8")
+RUN_INSPECTOR_JS = (FRONTEND / "run-inspector.js").read_text(encoding="utf-8")
 STYLE_CSS = (FRONTEND / "style.css").read_text(encoding="utf-8")
 
 
@@ -21,13 +22,15 @@ def test_output_is_a_standalone_floating_panel_not_an_inspector_or_rail_item():
     assert 'id="output-floating-panel"' in INDEX_HTML
     assert 'class="output-floating-panel"' in INDEX_HTML
     assert 'role="tabpanel"' in INDEX_HTML
-    assert 'aria-labelledby="output-floating-tab"' in INDEX_HTML
     assert 'class="output-floating-tabs"' in INDEX_HTML
     assert 'role="tablist"' in INDEX_HTML
     assert 'aria-orientation="vertical"' in INDEX_HTML
-    assert 'id="output-floating-tab"' in INDEX_HTML
-    assert 'role="tab"' in INDEX_HTML
-    assert 'aria-controls="output-floating-panel"' in INDEX_HTML
+    for name in ("skills", "execution", "results"):
+        assert f'id="output-tab-{name}"' in INDEX_HTML
+        assert f'id="output-pane-{name}"' in INDEX_HTML
+        assert f'aria-controls="output-pane-{name}"' in INDEX_HTML
+        assert f'aria-labelledby="output-tab-{name}"' in INDEX_HTML
+    assert INDEX_HTML.count('role="tab"') >= 3
     assert 'id="rail-output"' not in INDEX_HTML
     assert 'id="inspector-tab-output"' not in INDEX_HTML
     assert 'id="inspector-pane-output"' not in INDEX_HTML
@@ -46,14 +49,14 @@ def test_floating_output_uses_its_own_vertical_tab_toggle():
     assert "rail-output" not in APP_JS
     assert "output-mode" not in APP_JS
     assert "outputPanelClose" not in APP_JS
-    toggle = _function_slice(APP_JS, "function setOutputFloatingPanelOpen", "async function loadSessions")
-    assert "outputFloatingPanel.hidden = !expanded" in toggle
-    assert "outputFloatingTab.classList.toggle('active', expanded)" in toggle
-    assert "outputFloatingTab.setAttribute('aria-selected'" in toggle
-    assert "outputFloatingTab.setAttribute('aria-expanded'" in toggle
-    assert "outputFloatingTab.addEventListener('click'" in APP_JS
-    assert "setOutputFloatingPanelOpen(outputFloatingPanel.hidden)" in APP_JS
-    assert "app.js?v=5.14.7-typography" in INDEX_HTML
+    assert "const TAB_ORDER = ['skills', 'execution', 'results']" in RUN_INSPECTOR_JS
+    assert "aria-orientation=\"vertical\"" in INDEX_HTML
+    assert "state.activeTab === name && state.expanded" in RUN_INSPECTOR_JS
+    assert "if (toggle && state.activeTab === name && state.expanded)" in RUN_INSPECTOR_JS
+    for key in ("ArrowDown", "ArrowUp", "Home", "End", "Enter"):
+        assert key in RUN_INSPECTOR_JS
+    assert "app.js?v=5.15.0-run-inspector" in INDEX_HTML
+    assert "run-inspector.js?v=1.0.0" in INDEX_HTML
 
 
 def test_output_skills_own_the_project_scoped_renderer_and_cache():
@@ -86,6 +89,57 @@ def test_project_switch_clears_old_skills_before_loading_the_next_context():
     load_sessions = _function_slice(APP_JS, "async function loadSessions", "function matchesSidebarSearch")
     assert "projectId: currentSession?.project_id || null" in load_sessions
     assert "renderOutputSkillsPane(currentSession?.project_id || null)" in load_sessions
+    assert "syncRunInspectorContext(currentSession?.project_id || null" in load_sessions
+
+
+def test_run_inspector_hydrates_authoritative_run_scoped_data_fail_closed():
+    assert "/api/sessions/${encoded(sessionId)}/runs?limit=1" in RUN_INSPECTOR_JS
+    assert "/api/runs/${encoded(runId)}/execution" in RUN_INSPECTOR_JS
+    assert "/api/runs/${encoded(runId)}/results" in RUN_INSPECTOR_JS
+    assert "/api/runs/${encoded(runId)}/skills" in RUN_INSPECTOR_JS
+    assert "String(latest.session_id || '') !== String(state.context.sessionId || '')" in RUN_INSPECTOR_JS
+    assert "String(latest.project_id || '') !== expectedProject" in RUN_INSPECTOR_JS
+    assert "Skill 紀錄不屬於目前的 Project／Session／Run" in RUN_INSPECTOR_JS
+    assert "requestId !== state.runRequestId" in RUN_INSPECTOR_JS
+    latest = _function_slice(RUN_INSPECTOR_JS, "async function hydrateLatestRun", "async function hydrateWorkspaceVcs")
+    assert "const expectedRunRequestId = state.runRequestId" in latest
+    assert "expectedRunRequestId !== state.runRequestId" in latest
+    assert "|| state.run" in latest
+    assert "void hydrateSkills(state.run.runId)" in RUN_INSPECTOR_JS
+    begin_run = _function_slice(RUN_INSPECTOR_JS, "function beginRun", "function normalizeEvent")
+    assert "usedSkills = { status: 'loading'" in begin_run
+
+
+def test_run_inspector_integrates_sse_approval_and_retry_without_raw_tool_arguments():
+    assert "workbenchRunInspector?.handleEvent(eventType, eventData, streamIdentity)" in APP_JS
+    assert "workbenchRunInspector.handleApproval(" in APP_JS
+    assert "retry_of_run_id: retryOfRunId" in APP_JS
+    assert "if (!retryOfRunId) {\n            addLLMMessage('user', sendQuestion" in APP_JS
+    assert "args" not in _function_slice(RUN_INSPECTOR_JS, "function normalizeEvent", "function upsertAgent")
+    assert "/api/chat/runs/${encoded(runId)}/approval" in RUN_INSPECTOR_JS
+    assert "state.execution.retry?.allowed === true" in RUN_INSPECTOR_JS
+    assert "cancelPendingApprovals" in APP_JS
+    submit = _function_slice(APP_JS, "async function handleChatSubmit", "function appendMessage")
+    assert "let userMessageAddedToConversation = false" in submit
+    assert "userMessageAddedToConversation = true" in submit
+    assert "userMessageAddedToConversation\n                && conversationState.length" in submit
+
+
+def test_chat_stream_is_bound_to_the_session_project_and_run_that_started_it():
+    assert "function streamEventMatches(identity, data = {})" in APP_JS
+    assert "if (!streamEventMatches(streamIdentity, eventData)) continue;" in APP_JS
+    assert "currentSessionId = eventData.session_id" not in APP_JS
+    assert "if (isGenerating) await cancelActiveChatRun();" in _function_slice(
+        APP_JS, "async function changeSession", "async function deleteSession"
+    )
+
+
+def test_shared_skill_menus_portal_above_floating_panel_and_are_mutually_exclusive():
+    context_menu = _function_slice(APP_JS, "function openContextMenu", "function closeContextMenu")
+    assert "document.body.appendChild(sidebarContextMenu)" in context_menu
+    assert "workbenchProjectSkills?.closeMenus()" in context_menu
+    assert "deps?.closeContextMenu?.()" in PROJECT_SKILLS_JS
+    assert "document.body.appendChild(menu)" in PROJECT_SKILLS_JS
 
 
 def test_basic_chat_keeps_output_visible_while_legacy_skill_controls_stay_hidden():
@@ -123,6 +177,9 @@ def test_output_panel_has_compact_and_responsive_layout_contracts():
         ".output-panel-head",
         ".output-skills-mount .project-skills-section",
         ".output-panel-empty",
+        ".output-panel-pane",
+        ".run-inspector-section",
+        ".output-tab-badge",
     ):
         assert selector in STYLE_CSS
     assert "overscroll-behavior: contain" in STYLE_CSS
@@ -130,7 +187,7 @@ def test_output_panel_has_compact_and_responsive_layout_contracts():
     assert "position: fixed" in floating
     assert "top: 86px" in floating
     assert "right: 0" in floating
-    assert "z-index: 190" in floating
+    assert "z-index: 230" in floating
     tabs = STYLE_CSS[STYLE_CSS.index(".output-floating-tabs {"):STYLE_CSS.index(".output-floating-tab {")]
     assert "flex-direction: column" in tabs
     assert "@media (max-width: 900px)" in STYLE_CSS
@@ -139,3 +196,12 @@ def test_output_panel_has_compact_and_responsive_layout_contracts():
     assert "@media (max-width: 640px)" in STYLE_CSS
     assert ".output-floating-workspace { top: 64px; }" in STYLE_CSS
     assert ".output-floating-panel { width: calc(100vw - 54px);" in STYLE_CSS
+    assert "html.run-inspector-open .task-progress-center" in STYLE_CSS
+    assert "html.run-inspector-open .output-floating-panel" in STYLE_CSS
+    assert "beforeOpen: prepareRunInspectorOpen" in APP_JS
+    assert "setOutputFloatingPanelOpen(false);" in _function_slice(
+        APP_JS, "function openAgentCollaboration", "function closeAgentCollaboration"
+    )
+    assert "setOutputFloatingPanelOpen(false);" in _function_slice(
+        APP_JS, "function openInspector", "function renderContextPane"
+    )

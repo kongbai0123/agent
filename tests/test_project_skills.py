@@ -820,6 +820,15 @@ class ProjectSkillApiTests(unittest.TestCase):
             )
             self.assertEqual(enabled_item["trigger_mode"], "turn")
 
+            workbench_app.database.upsert_run(
+                "run_session_skill_provenance",
+                "api_session",
+                "turn_session_skill_provenance",
+                "test-model",
+                "chat",
+                "running",
+                project_id="api_one",
+            )
             built = workbench_app.project_skill_runtime.build_prompt_context(
                 "api_session",
                 "Check release authorization",

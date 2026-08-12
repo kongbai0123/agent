@@ -10,7 +10,12 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 
 import database
-from conversation_store import export_session
+from conversation_store import (
+    _safe_existing_regular_file,
+    _safe_regular_files,
+    _safe_relative_path,
+    export_session,
+)
 from paths import CONVERSATIONS_DIR, DB_DIR, DB_PATH, PROJECT_RUNTIME_DIR, REPO_ROOT, RUNTIME_ROOT, ensure_runtime_dirs
 
 
@@ -65,11 +70,44 @@ def export_session_zip(session_id: str) -> Optional[bytes]:
     session_dir = export_session(session_id)
     if not session_dir:
         return None
+    allowed_attachments: set[str] = set()
+    attachment_root = session_dir / "attachments"
+    attachment_manifest = _safe_existing_regular_file(
+        attachment_root / "manifest.json",
+        attachment_root,
+        direct_child=True,
+    )
+    if attachment_manifest is not None:
+        try:
+            manifest_items = _read_json(attachment_manifest)
+        except (OSError, ValueError, json.JSONDecodeError):
+            manifest_items = []
+        if isinstance(manifest_items, list):
+            for item in manifest_items:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    relative = _safe_relative_path(item.get("storage_path"))
+                except ValueError:
+                    continue
+                if len(relative.parts) == 2 and relative.parts[0] == "attachments":
+                    allowed_attachments.add(relative.as_posix())
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
-        for path in sorted(session_dir.rglob("*")):
-            if path.is_file():
-                archive.write(path, Path(session_id) / path.relative_to(session_dir))
+        resolved_session = session_dir.resolve(strict=True)
+        for path in sorted(_safe_regular_files(session_dir)):
+            try:
+                relative = _safe_relative_path(
+                    path.relative_to(resolved_session).as_posix()
+                )
+            except (ValueError, OSError):
+                continue
+            relative_text = relative.as_posix()
+            if relative.parts[0] == "attachments" and relative_text != (
+                "attachments/manifest.json"
+            ) and relative_text not in allowed_attachments:
+                continue
+            archive.write(path, Path(session_id) / relative)
     return buffer.getvalue()
 
 
@@ -151,14 +189,35 @@ def _restore_turns(connection: sqlite3.Connection, session_dir: Path) -> int:
 
 
 def _restore_attachments(connection: sqlite3.Connection, session_dir: Path) -> int:
-    manifest_path = session_dir / "attachments" / "manifest.json"
-    if not manifest_path.exists():
+    attachment_root = session_dir / "attachments"
+    manifest_path = _safe_existing_regular_file(
+        attachment_root / "manifest.json",
+        attachment_root,
+        direct_child=True,
+    )
+    if manifest_path is None:
         return 0
     restored = 0
-    for attachment in _read_json(manifest_path):
-        local_file = session_dir / "attachments" / Path(attachment.get("storage_path") or attachment.get("filename") or "").name
-        if local_file.exists():
-            attachment["storage_path"] = str(local_file)
+    items = _read_json(manifest_path)
+    if not isinstance(items, list):
+        return 0
+    for attachment in items:
+        if not isinstance(attachment, dict):
+            continue
+        try:
+            archived_path = _safe_relative_path(attachment.get("storage_path"))
+        except ValueError:
+            continue
+        if len(archived_path.parts) != 2 or archived_path.parts[0] != "attachments":
+            continue
+        local_file = _safe_existing_regular_file(
+            attachment_root / archived_path.parts[1],
+            attachment_root,
+            direct_child=True,
+        )
+        if local_file is None:
+            continue
+        attachment["storage_path"] = str(local_file)
         _insert_row(connection, "attachments", attachment)
         restored += 1
     return restored
@@ -169,17 +228,37 @@ def _restore_artifacts(connection: sqlite3.Connection, session_dir: Path) -> int
     if not artifacts_dir.exists():
         return 0
     restored = 0
-    for artifact_dir in sorted(path for path in artifacts_dir.iterdir() if path.is_dir()):
-        manifest_path = artifact_dir / "manifest.json"
-        if not manifest_path.exists():
+    for artifact_dir in sorted(artifacts_dir.iterdir()):
+        manifest_path = _safe_existing_regular_file(
+            artifact_dir / "manifest.json",
+            artifact_dir,
+            direct_child=True,
+        )
+        if manifest_path is None:
             continue
         artifact = _read_json(manifest_path)
+        if not isinstance(artifact, dict):
+            continue
+        try:
+            artifact_component = _safe_relative_path(artifact.get("id"))
+        except ValueError:
+            continue
+        if (
+            len(artifact_component.parts) != 1
+            or artifact_component.name != artifact_dir.name
+        ):
+            continue
         _insert_row(connection, "artifacts", artifact)
         files_dir = artifact_dir / "files"
-        if files_dir.exists():
-            for file_path in sorted(path for path in files_dir.rglob("*") if path.is_file()):
-                relative_path = file_path.relative_to(files_dir).as_posix()
-                _insert_row(connection, "artifact_files", {"id": f"{artifact['id']}:{relative_path}", "artifact_id": artifact["id"], "path": relative_path, "content": file_path.read_text(encoding="utf-8"), "language": file_path.suffix.lstrip(".") or None})
+        for file_path in sorted(_safe_regular_files(files_dir)):
+            try:
+                relative_path = _safe_relative_path(
+                    file_path.relative_to(files_dir.resolve(strict=True)).as_posix()
+                ).as_posix()
+                content = file_path.read_text(encoding="utf-8")
+            except (OSError, UnicodeError, ValueError):
+                continue
+            _insert_row(connection, "artifact_files", {"id": f"{artifact['id']}:{relative_path}", "artifact_id": artifact["id"], "path": relative_path, "content": content, "language": file_path.suffix.lstrip(".") or None})
         restored += 1
     return restored
 

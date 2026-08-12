@@ -92,6 +92,148 @@ class ConversationStoreTests(unittest.TestCase):
         self.assertEqual(message["visible_content"], "visible validation failure")
         self.assertEqual(message["llm_content"], "")
 
+    def test_export_excludes_private_retry_input_manifest(self):
+        connection = sqlite3.connect(self.database)
+        try:
+            connection.execute(
+                "ALTER TABLE runs ADD COLUMN input_manifest_json TEXT"
+            )
+            connection.execute(
+                "UPDATE runs SET input_manifest_json = ? WHERE id = 'run_test'",
+                (
+                    json.dumps(
+                        {
+                            "version": 1,
+                            "temporary_context": "private temporary context",
+                            "project_skill_context": "private skill instructions",
+                            "project_skill_provenance": [
+                                {
+                                    "slug": "review",
+                                    "references": [
+                                        {
+                                            "path": "references/private.md",
+                                            "content": "private reference excerpt",
+                                        }
+                                    ],
+                                }
+                            ],
+                        }
+                    ),
+                ),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        session_dir = conversation_store.export_session("sess_test", self.database)
+        run_path = next((session_dir / "turns").glob("*_turn_test/run.json"))
+        exported = run_path.read_text(encoding="utf-8")
+
+        self.assertNotIn("input_manifest_json", exported)
+        self.assertNotIn("private temporary context", exported)
+        self.assertNotIn("private skill instructions", exported)
+        self.assertNotIn("private reference excerpt", exported)
+
+    def test_export_rejects_unsafe_artifact_and_attachment_paths(self):
+        session_dir = conversation_store.ensure_session_folder(
+            "sess_test",
+            project_id="project_test",
+        )
+        attachment_root = session_dir / "attachments"
+        attachment_root.mkdir(parents=True, exist_ok=True)
+        normal_attachment = attachment_root / "att_normal_image.png"
+        normal_attachment.write_bytes(b"normal-image")
+        outside_attachment = self.root / "outside-private.bin"
+        outside_attachment.write_bytes(b"outside-private")
+        linked_attachment = attachment_root / "att_linked_image.png"
+        link_created = True
+        try:
+            linked_attachment.symlink_to(outside_attachment)
+        except (NotImplementedError, OSError):
+            link_created = False
+
+        outside_artifact = self.root / "outside-artifact.txt"
+        outside_artifact.write_text("sentinel", encoding="utf-8")
+        connection = sqlite3.connect(self.database)
+        try:
+            rows = [
+                (
+                    "att_normal",
+                    "normal.png",
+                    str(normal_attachment),
+                ),
+                (
+                    "att_outside",
+                    "outside.bin",
+                    str(outside_attachment),
+                ),
+            ]
+            if link_created:
+                rows.append(("att_link", "linked.png", str(linked_attachment)))
+            for attachment_id, filename, storage_path in rows:
+                connection.execute(
+                    """
+                    INSERT INTO attachments(
+                        id, session_id, filename, mime_type, storage_path,
+                        size_bytes, created_at
+                    ) VALUES (?, 'sess_test', ?, 'application/octet-stream', ?, 1, '2026-01-01')
+                    """,
+                    (attachment_id, filename, storage_path),
+                )
+            connection.execute(
+                "INSERT INTO artifacts VALUES ('artifact-safe', 'sess_test', 'turn_test', 'Artifact', 'text', '2026-01-01', '2026-01-01')"
+            )
+            connection.execute(
+                "INSERT INTO artifact_files VALUES ('safe', 'artifact-safe', 'nested/report.txt', 'safe report', 'txt')"
+            )
+            connection.execute(
+                "INSERT INTO artifact_files VALUES ('unsafe', 'artifact-safe', ?, 'overwrite attempt', 'txt')",
+                (str(outside_artifact),),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        exported = conversation_store.export_session("sess_test", self.database)
+        attachment_manifest = json.loads(
+            (exported / "attachments" / "manifest.json").read_text(encoding="utf-8")
+        )
+
+        self.assertEqual([item["id"] for item in attachment_manifest], ["att_normal"])
+        self.assertEqual(
+            attachment_manifest[0]["storage_path"],
+            "attachments/att_normal_image.png",
+        )
+        self.assertNotIn(str(self.root), json.dumps(attachment_manifest))
+        self.assertEqual(outside_artifact.read_text(encoding="utf-8"), "sentinel")
+        self.assertEqual(
+            (
+                exported
+                / "artifacts"
+                / "artifact-safe"
+                / "files"
+                / "nested"
+                / "report.txt"
+            ).read_text(encoding="utf-8"),
+            "safe report",
+        )
+
+    def test_archive_relative_path_rejects_escape_and_drive_forms(self):
+        for value in (
+            "",
+            "/absolute.txt",
+            "C:/absolute.txt",
+            "//server/share.txt",
+            "../escape.txt",
+            "nested/../escape.txt",
+            "nested//file.txt",
+            "nested/./file.txt",
+            "bad:name.txt",
+            "line\nbreak.txt",
+        ):
+            with self.assertRaises(ValueError, msg=value):
+                conversation_store._safe_relative_path(value)
+
     def test_exact_turn_ids_prevent_consecutive_user_message_shift(self):
         connection = sqlite3.connect(self.database)
         try:

@@ -517,6 +517,7 @@
 
     function openAddMenu(section, button, menu, { focus = 'first' } = {}) {
         if (button.disabled) return;
+        deps?.closeContextMenu?.();
         if (state.addMenu.menu && state.addMenu.menu !== menu) closeAddMenu();
         state.addMenu.section = section;
         state.addMenu.button = button;
@@ -1486,6 +1487,7 @@
             showToast: options?.showToast,
             createIcons: options?.createIcons,
             openContextMenu: options?.openContextMenu,
+            closeContextMenu: options?.closeContextMenu,
         };
         if (typeof deps.apiFetch !== 'function') {
             throw new Error('Project Skills 需要 apiFetch。');
@@ -1501,5 +1503,6 @@
         setSessionContext,
         refreshProject: projectId => loadProject(projectId, { force: true }),
         refreshSession: () => loadSessionCatalog({ force: true }),
+        closeMenus: options => closeAddMenu(options),
     };
 })();

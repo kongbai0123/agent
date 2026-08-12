@@ -26,6 +26,7 @@ def build_sessions_router(
     move_session_storage: Callable[[str, Optional[str], Optional[str]], Any],
     archive_session: Callable[[str], Any],
     export_session_zip: Callable[[str], Optional[bytes]],
+    has_active_chat_run: Callable[[str], bool],
 ) -> APIRouter:
     router = APIRouter(tags=["sessions"])
     @router.post("/api/sessions")
@@ -72,6 +73,21 @@ def build_sessions_router(
                     recoverable=False,
                 ),
             )
+        for session_id in req.session_ids:
+            current = database.get_session(session_id)
+            if (
+                current
+                and current.get("project_id") != req.project_id
+                and has_active_chat_run(session_id)
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail=error_payload(
+                        "SESSION_RUN_ACTIVE",
+                        "A session cannot move projects while a run is active.",
+                        recoverable=True,
+                    ),
+                )
         if not database.reorder_sessions(req.session_ids, req.project_id):
             raise HTTPException(
                 status_code=400,
@@ -110,6 +126,19 @@ def build_sessions_router(
                     "PROJECT_NOT_FOUND",
                     "Project was not found.",
                     recoverable=False,
+                ),
+            )
+        if (
+            "project_id" in changes
+            and changes["project_id"] != existing.get("project_id")
+            and has_active_chat_run(session_id)
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail=error_payload(
+                    "SESSION_RUN_ACTIVE",
+                    "A session cannot move projects while a run is active.",
+                    recoverable=True,
                 ),
             )
         if not database.update_session_metadata(session_id, **changes):

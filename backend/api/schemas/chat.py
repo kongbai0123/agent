@@ -23,3 +23,7 @@ class ChatRequest(BaseModel):
         default=None,
         pattern=r"^run_[A-Za-z0-9_-]{8,80}$",
     )
+    retry_of_run_id: Optional[str] = Field(
+        default=None,
+        pattern=r"^run_[A-Za-z0-9_-]{8,80}$",
+    )

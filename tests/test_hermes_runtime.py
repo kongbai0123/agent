@@ -224,6 +224,96 @@ def test_pinned_v0182_events_fill_missing_authoritative_suffix_and_persist():
     assert manager.completed[-1][1] is True
 
 
+def test_hermes_terminal_event_failure_never_fails_or_falls_back_after_completion(
+    monkeypatch,
+):
+    original_append = database.append_run_event
+
+    def fail_terminal_evidence(run_id, event, payload):
+        if event in {"metrics", "done"}:
+            raise OSError("injected terminal evidence failure")
+        return original_append(run_id, event, payload)
+
+    monkeypatch.setattr(database, "append_run_event", fail_terminal_evidence)
+    fallback = [encode_sse("token", {"content": "must-not-be-emitted"})]
+    manager = FakeManager(
+        [
+            SSEEvent(
+                "message",
+                json.dumps(
+                    {
+                        "event": "run.completed",
+                        "output": "one durable Hermes answer",
+                        "usage": {},
+                    }
+                ),
+            )
+        ],
+        fallback_safe=True,
+    )
+
+    events, session_id, run_id = asyncio.run(
+        collect(manager, "terminal-evidence-failure", fallback)
+    )
+
+    assert [name for name, _ in events] == ["meta", "token", "metrics", "done"]
+    assert "must-not-be-emitted" not in json.dumps(events)
+    assert database.get_run(run_id)["status"] == "completed"
+    current_assistants = [
+        message
+        for message in database.get_messages_by_session(session_id)
+        if message["role"] == "assistant"
+        and message["turn_id"] == "turn-terminal-evidence-failure"
+    ]
+    assert [message["content"] for message in current_assistants] == [
+        "one durable Hermes answer"
+    ]
+    assert [success for _decision, success, _kind in manager.completed] == [True]
+    assert not hasattr(manager, "fallback_attachment")
+
+
+def test_hermes_completion_persists_generated_artifact_refs():
+    manager = FakeManager(
+        [
+            SSEEvent(
+                "message",
+                json.dumps(
+                    {
+                        "event": "run.completed",
+                        "output": "```svg\n<svg viewBox=\"0 0 1 1\"></svg>\n```",
+                        "usage": {},
+                    }
+                ),
+            )
+        ]
+    )
+
+    _events, session_id, run_id = asyncio.run(
+        collect(manager, "generated-artifact")
+    )
+
+    message = database.get_messages_by_session(session_id)[-1]
+    run = database.get_run(run_id)
+    assert len(message["artifacts"]) == 1
+    assert message["artifacts"] == run["artifacts"]
+    artifact_id = message["artifacts"][0]["artifact_id"]
+    artifact = database.get_artifact(artifact_id)
+    assert artifact["session_id"] == session_id
+    assert artifact["turn_id"] == "turn-generated-artifact"
+    assert artifact["files"] == [
+        {
+            "path": "generated-01.svg",
+            "content": '<svg viewBox="0 0 1 1"></svg>\n',
+            "language": "svg",
+        }
+    ]
+    assert any(
+        event["event"] == "artifact"
+        and event["payload"]["artifact_id"] == artifact_id
+        for event in run["events"]
+    )
+
+
 def test_approval_event_matches_existing_frontend_contract():
     manager = FakeManager(
         [

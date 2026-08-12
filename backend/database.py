@@ -1,11 +1,14 @@
 import json
+import math
 import sqlite3
 import threading
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from pathlib import PurePosixPath
+from typing import Any, Dict, List, Mapping, Optional
 
 from paths import DB_PATH as RUNTIME_DB_PATH, ensure_runtime_dirs
+from structured_log import redact as redact_structured
 
 DB_PATH = str(RUNTIME_DB_PATH)
 DB_LOCK = threading.RLock()
@@ -301,6 +304,8 @@ def init_db():
                 id TEXT PRIMARY KEY,
                 session_id TEXT NOT NULL,
                 turn_id TEXT NOT NULL,
+                project_id TEXT,
+                retry_of_run_id TEXT,
                 model TEXT,
                 mode TEXT NOT NULL,
                 status TEXT NOT NULL,
@@ -309,10 +314,30 @@ def init_db():
                 sources_json TEXT,
                 metrics_json TEXT,
                 artifacts_json TEXT,
+                input_manifest_json TEXT,
+                execution_revision INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
                 completed_at TEXT
             )
             """
+        )
+        _ensure_columns(
+            cursor,
+            "runs",
+            {
+                "project_id": "TEXT",
+                "retry_of_run_id": "TEXT",
+                "input_manifest_json": "TEXT",
+                "execution_revision": "INTEGER NOT NULL DEFAULT 0",
+            },
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_runs_session_created "
+            "ON runs(session_id, created_at DESC)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_runs_retry_of "
+            "ON runs(retry_of_run_id, created_at DESC)"
         )
 
         cursor.execute(
@@ -620,6 +645,41 @@ def get_messages_by_session(session_id: str) -> List[Dict[str, Any]]:
             item["content"] = item["visible_content"]
             messages.append(item)
         return messages
+
+
+def get_message(message_id: int) -> Optional[Dict[str, Any]]:
+    """Return one persisted message using the same public shape as session history."""
+
+    with get_db_conn() as conn:
+        row = conn.execute(
+            """
+            SELECT id, session_id, role, content, visible_content, llm_content,
+                   sources_json, process_events_json, artifacts_json, turn_id,
+                   parent_message_id, created_at
+            FROM messages WHERE id = ?
+            """,
+            (int(message_id),),
+        ).fetchone()
+    if not row:
+        return None
+    item = dict(row)
+    item["visible_content"] = (
+        item.get("content") or ""
+        if item.get("visible_content") is None
+        else item["visible_content"]
+    )
+    item["llm_content"] = (
+        item.get("content") or ""
+        if item.get("llm_content") is None
+        else item["llm_content"]
+    )
+    item["sources"] = _loads_json(item.pop("sources_json", None), [])
+    item["process_events"] = _loads_json(
+        item.pop("process_events_json", None), []
+    )
+    item["artifacts"] = _loads_json(item.pop("artifacts_json", None), [])
+    item["content"] = item["visible_content"]
+    return item
 
 
 def get_clean_history(session_id: str) -> List[Dict[str, str]]:
@@ -1010,37 +1070,96 @@ def upsert_run(
     metrics: Optional[Dict[str, Any]] = None,
     artifacts: Optional[List[Dict[str, Any]]] = None,
     completed_at: Optional[str] = None,
+    project_id: Optional[str] = None,
+    retry_of_run_id: Optional[str] = None,
+    input_manifest: Optional[Dict[str, Any]] = None,
 ) -> None:
     now = _now()
     with get_db_conn() as conn:
+        existing = conn.execute(
+            "SELECT * FROM runs WHERE id = ?", (run_id,)
+        ).fetchone()
+        if existing is not None:
+            if str(existing["session_id"]) != str(session_id):
+                raise ValueError("Run session binding cannot be changed.")
+            if str(existing["turn_id"]) != str(turn_id):
+                raise ValueError("Run turn binding cannot be changed.")
+            stored_project = existing["project_id"]
+            if project_id is not None and stored_project != project_id:
+                raise ValueError("Run project binding cannot be changed.")
+            stored_retry = existing["retry_of_run_id"]
+            if retry_of_run_id is not None and stored_retry != retry_of_run_id:
+                raise ValueError("Run retry lineage cannot be changed.")
+
+        def encoded(name: str, value: Any, default: Any) -> str:
+            if value is not None:
+                return json.dumps(value, ensure_ascii=False)
+            if existing is not None and existing[name] is not None:
+                return str(existing[name])
+            return json.dumps(default, ensure_ascii=False)
+
+        tasks_json = encoded("tasks_json", tasks, [])
+        # Public execution events are append-only once a run exists.  Runtime
+        # transitions (notably Hermes -> basic-chat fallback) must not erase
+        # events that were already accepted through append_run_event().
+        events_json = (
+            str(existing["events_json"])
+            if existing is not None and existing["events_json"] is not None
+            else encoded("events_json", events, [])
+        )
+        sources_json = encoded("sources_json", sources, [])
+        if existing is not None and not sources:
+            existing_sources = _loads_json(existing["sources_json"], [])
+            if isinstance(existing_sources, list) and existing_sources:
+                # Source provenance is evidence of what entered the run.  An
+                # empty fallback update is not authority to discard it.
+                sources_json = str(existing["sources_json"])
+        metrics_json = encoded("metrics_json", metrics, {})
+        artifacts_json = encoded("artifacts_json", artifacts, [])
+        input_manifest_json = encoded(
+            "input_manifest_json", input_manifest, {}
+        )
         conn.execute(
             """
             INSERT INTO runs (
-                id, session_id, turn_id, model, mode, status, tasks_json, events_json,
-                sources_json, metrics_json, artifacts_json, created_at, completed_at
+                id, session_id, turn_id, project_id, retry_of_run_id, model,
+                mode, status, tasks_json, events_json, sources_json, metrics_json,
+                artifacts_json, input_manifest_json, execution_revision,
+                created_at, completed_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
+                model=excluded.model,
+                mode=excluded.mode,
                 status=excluded.status,
                 tasks_json=excluded.tasks_json,
                 events_json=excluded.events_json,
                 sources_json=excluded.sources_json,
                 metrics_json=excluded.metrics_json,
                 artifacts_json=excluded.artifacts_json,
+                input_manifest_json=excluded.input_manifest_json,
                 completed_at=excluded.completed_at
             """,
             (
                 run_id,
                 session_id,
                 turn_id,
+                project_id if existing is None else existing["project_id"],
+                (
+                    retry_of_run_id
+                    if existing is None
+                    else existing["retry_of_run_id"]
+                ),
                 model,
                 mode,
                 status,
-                json.dumps(tasks or [], ensure_ascii=False),
-                json.dumps(events or [], ensure_ascii=False),
-                json.dumps(sources or [], ensure_ascii=False),
-                json.dumps(metrics or {}, ensure_ascii=False),
-                json.dumps(artifacts or [], ensure_ascii=False),
+                tasks_json,
+                events_json,
+                sources_json,
+                metrics_json,
+                artifacts_json,
+                input_manifest_json,
+                int(existing["execution_revision"] or 0) if existing else 0,
                 now,
                 completed_at,
             ),
@@ -1059,7 +1178,414 @@ def get_run(run_id: str) -> Optional[Dict[str, Any]]:
         item["sources"] = _loads_json(item.pop("sources_json", None), [])
         item["metrics"] = _loads_json(item.pop("metrics_json", None), {})
         item["artifacts"] = _loads_json(item.pop("artifacts_json", None), [])
+        manifest = _loads_json(item.pop("input_manifest_json", None), {})
+        item["input_manifest"] = public_run_input_manifest(manifest)
         return item
+
+
+def public_run_input_manifest(manifest: Any) -> Dict[str, Any]:
+    """Return reproducibility metadata without prompt/context/image contents."""
+
+    raw = manifest if isinstance(manifest, dict) else {}
+    attachment_ids = [
+        str(value)
+        for value in raw.get("attachment_ids") or []
+        if isinstance(value, str) and value
+    ][:100]
+    return {
+        "version": int(raw.get("version") or 0),
+        "reproducible": bool(raw.get("reproducible")),
+        "reason": str(raw.get("reason") or "")[:128] or None,
+        "attachment_ids": attachment_ids,
+        "attachment_count": len(attachment_ids),
+        "temporary_context_id": (
+            str(raw.get("temporary_context_id"))[:256]
+            if raw.get("temporary_context_id")
+            else None
+        ),
+        "has_temporary_context": bool(
+            raw.get("temporary_context_id") or raw.get("temporary_context")
+        ),
+        "inline_image_count": max(
+            0, min(int(raw.get("inline_image_count") or 0), 100)
+        ),
+    }
+
+
+def get_run_input_manifest(run_id: str) -> Dict[str, Any]:
+    """Return the private retry manifest to trusted in-process callers only."""
+
+    with get_db_conn() as conn:
+        row = conn.execute(
+            "SELECT input_manifest_json FROM runs WHERE id = ?", (run_id,)
+        ).fetchone()
+    return _loads_json(row["input_manifest_json"], {}) if row else {}
+
+
+def list_session_runs(
+    session_id: str,
+    *,
+    project_id: Optional[str],
+    limit: int = 1,
+) -> List[Dict[str, Any]]:
+    """List only runs still bound to the session's current project scope."""
+
+    safe_limit = max(1, min(int(limit), 100))
+    with get_db_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, session_id, project_id, status, model, mode, created_at,
+                   completed_at, retry_of_run_id
+            FROM runs
+            WHERE session_id = ? AND project_id IS ?
+            ORDER BY created_at DESC, id DESC
+            LIMIT ?
+            """,
+            (session_id, project_id, safe_limit),
+        ).fetchall()
+    result = []
+    for row in rows:
+        item = dict(row)
+        item["run_id"] = item.pop("id")
+        result.append(item)
+    return result
+
+
+_RUN_EVENT_FIELDS: Dict[str, tuple[str, ...]] = {
+    "meta": (
+        "run_id", "session_id", "turn_id", "project_id", "model", "mode",
+        "runtime", "project_skill_count", "retry_of_run_id",
+    ),
+    "metrics": (
+        "runtime", "elapsed_ms", "first_token_ms", "token_chars",
+        "tokens_per_second",
+    ),
+    "done": ("run_id", "session_id", "turn_id"),
+    "error": ("code", "message", "recoverable"),
+    "cancelled": (
+        "run_id", "session_id", "turn_id", "message", "recoverable",
+        "deadline_exceeded",
+    ),
+    "tool_start": (
+        "tool", "tool_call_id", "run_id", "project_id", "args",
+    ),
+    "tool_end": (
+        "tool", "tool_call_id", "run_id", "project_id", "success",
+        "result", "details_redacted", "duration_ms",
+    ),
+    "approval_required": (
+        "approval_id", "capability", "message", "summary", "run_id", "risk",
+        "status", "choices", "updated_at", "rationale",
+    ),
+    "artifact": (
+        "artifact_id", "title", "artifact_type", "status", "relative_path",
+        "language", "size_bytes", "sha256",
+    ),
+    "artifact_update": (
+        "artifact_id", "title", "artifact_type", "status", "relative_path",
+        "language", "size_bytes", "sha256",
+    ),
+    "file_change": (
+        "change_id", "relative_path", "change_type", "status", "additions",
+        "deletions", "sha256",
+    ),
+    "file_changed": (
+        "change_id", "relative_path", "change_type", "status", "additions",
+        "deletions", "sha256",
+    ),
+    "file_written": (
+        "change_id", "relative_path", "change_type", "status", "additions",
+        "deletions", "sha256",
+    ),
+    "validation": (
+        "validation_id", "name", "status", "passed", "failed", "skipped",
+        "duration_ms", "summary",
+    ),
+    "test_result": (
+        "validation_id", "name", "status", "passed", "failed", "skipped",
+        "duration_ms", "summary",
+    ),
+    "git_commit": (
+        "commit_sha", "short_sha", "branch", "status", "success",
+    ),
+    "git_push": (
+        "commit_sha", "short_sha", "branch", "remote", "status", "success",
+    ),
+}
+_RUN_EVENT_KEY_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._:@/-"
+)
+_UNSET_RUN_BINDING = object()
+
+
+def _safe_relative_event_path(value: Any) -> str:
+    text = str(value or "")
+    parsed = PurePosixPath(text)
+    parts = text.split("/")
+    if (
+        not text
+        or len(text) > 240
+        or text != text.strip()
+        or "\\" in text
+        or ":" in text
+        or text.startswith("/")
+        or parsed.is_absolute()
+        or any(part in {"", ".", ".."} for part in parts)
+    ):
+        raise ValueError("Run event contains an unsafe relative path.")
+    return text
+
+
+def _validate_run_event_binding(
+    payload: Mapping[str, Any],
+    *,
+    run_id: Any = _UNSET_RUN_BINDING,
+    session_id: Any = _UNSET_RUN_BINDING,
+    project_id: Any = _UNSET_RUN_BINDING,
+) -> None:
+    for key, expected in (
+        ("run_id", run_id),
+        ("session_id", session_id),
+        ("project_id", project_id),
+    ):
+        if expected is _UNSET_RUN_BINDING or key not in payload:
+            continue
+        supplied = payload.get(key)
+        if supplied is None:
+            continue
+        if expected is None or str(supplied) != str(expected):
+            raise ValueError(f"Run event contains a mismatched {key} binding.")
+
+
+def _safe_public_event_text(value: Any, *, key: str, limit: int = 1000) -> str:
+    raw = "".join(
+        character for character in str(value or "")[:limit] if ord(character) >= 32
+    )
+    public = redact_structured(raw, key=key)
+    return str(public if isinstance(public, str) else "")[:limit]
+
+
+def _safe_run_event_payload(
+    event: str,
+    payload: Any,
+    *,
+    run_id: Any = _UNSET_RUN_BINDING,
+    session_id: Any = _UNSET_RUN_BINDING,
+    project_id: Any = _UNSET_RUN_BINDING,
+) -> Dict[str, Any]:
+    if event not in _RUN_EVENT_FIELDS or not isinstance(payload, Mapping):
+        raise ValueError("Run event is not part of the public execution contract.")
+    _validate_run_event_binding(
+        payload,
+        run_id=run_id,
+        session_id=session_id,
+        project_id=project_id,
+    )
+    result: Dict[str, Any] = {}
+    for key in (*_RUN_EVENT_FIELDS[event], "event_key"):
+        if key not in payload or payload[key] is None:
+            continue
+        value = payload[key]
+        if key == "relative_path":
+            result[key] = _safe_relative_event_path(value)
+        elif key == "args":
+            # Tool arguments are never persisted.  Only this fixed marker is
+            # accepted from the already-sanitized Hermes tool bridge.
+            result[key] = {
+                "scope": "active_project",
+                "access": "read_only",
+                "details_redacted": True,
+            }
+        elif isinstance(value, str):
+            raw_text = "".join(
+                char for char in value[:1000] if ord(char) >= 32
+            )
+            safe_text = _safe_public_event_text(value, key=key)
+            if key in {"commit_sha", "short_sha", "sha256"} and (
+                not raw_text
+                or any(
+                    char not in "0123456789abcdefABCDEF" for char in raw_text
+                )
+            ):
+                raise ValueError("Run event contains an invalid digest.")
+            if key in {"branch", "remote"} and (
+                not raw_text
+                or len(raw_text) > 128
+                or any(
+                    char
+                    not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._/-"
+                    for char in raw_text
+                )
+                or raw_text.startswith(("/", "-"))
+                or ".." in raw_text
+            ):
+                raise ValueError("Run event contains an invalid Git identifier.")
+            if key == "event_key" and (
+                not raw_text
+                or len(raw_text) > 128
+                or raw_text[0] not in _RUN_EVENT_KEY_CHARS
+                or any(char not in _RUN_EVENT_KEY_CHARS for char in raw_text)
+                or ".." in raw_text
+            ):
+                raise ValueError("Run event contains an invalid event key.")
+            # Strict identifiers are omitted if they happen to match a runtime
+            # registered secret.  Free-form labels retain the useful marker.
+            if safe_text != raw_text and key in {
+                "commit_sha",
+                "short_sha",
+                "sha256",
+                "branch",
+                "remote",
+                "event_key",
+            }:
+                continue
+            result[key] = safe_text
+        elif isinstance(value, bool):
+            result[key] = value
+        elif isinstance(value, (int, float)):
+            if isinstance(value, float) and not math.isfinite(value):
+                raise ValueError("Run event contains a non-finite number.")
+            result[key] = value
+        elif key == "choices" and isinstance(value, (list, tuple)):
+            result[key] = [
+                choice for choice in value if choice in {"once", "deny"}
+            ]
+    return result
+
+
+def public_run_events(
+    events: Any,
+    *,
+    run_id: str,
+    session_id: str,
+    project_id: Optional[str],
+) -> List[Dict[str, Any]]:
+    """Fail-closed projection for persisted and legacy execution events.
+
+    Older rows may predate append_run_event(), so every read is projected
+    through the current allowlist and binding checks before entering the UI.
+    Unknown event types, malformed records, and mismatched bindings are omitted.
+    """
+
+    if not isinstance(events, (list, tuple)):
+        return []
+    public: List[Dict[str, Any]] = []
+    seen_event_keys: set[str] = set()
+    last_sequence = 0
+    for raw in list(events)[-500:]:
+        if not isinstance(raw, Mapping):
+            continue
+        event_name = str(raw.get("event") or raw.get("type") or "").strip().casefold()
+        payload = raw.get("payload")
+        if not isinstance(payload, Mapping):
+            payload = raw
+        try:
+            _validate_run_event_binding(
+                raw,
+                run_id=run_id,
+                session_id=session_id,
+                project_id=project_id,
+            )
+            safe_payload = _safe_run_event_payload(
+                event_name,
+                payload,
+                run_id=run_id,
+                session_id=session_id,
+                project_id=project_id,
+            )
+        except (TypeError, ValueError):
+            continue
+        event_key = str(safe_payload.get("event_key") or "")
+        if event_key and event_key in seen_event_keys:
+            continue
+        if event_key:
+            seen_event_keys.add(event_key)
+        sequence = raw.get("sequence")
+        if (
+            not isinstance(sequence, int)
+            or isinstance(sequence, bool)
+            or sequence <= last_sequence
+        ):
+            sequence = last_sequence + 1
+        last_sequence = sequence
+        record: Dict[str, Any] = {
+            "event": event_name,
+            "sequence": sequence,
+            "payload": safe_payload,
+        }
+        if raw.get("created_at") is not None:
+            created_at = _safe_public_event_text(
+                raw.get("created_at"), key="created_at", limit=80
+            )
+            if created_at:
+                record["created_at"] = created_at
+        public.append(record)
+    return public
+
+
+def append_run_event(
+    run_id: str,
+    event: str,
+    payload: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Atomically append one bounded, allowlisted public execution event."""
+
+    event_name = str(event or "").strip().casefold()
+    with get_db_conn() as conn:
+        row = conn.execute(
+            """
+            SELECT session_id, project_id, events_json, execution_revision
+            FROM runs WHERE id = ?
+            """,
+            (run_id,),
+        ).fetchone()
+        if not row:
+            raise KeyError(run_id)
+        safe_payload = _safe_run_event_payload(
+            event_name,
+            payload,
+            run_id=run_id,
+            session_id=str(row["session_id"]),
+            project_id=row["project_id"],
+        )
+        events = _loads_json(row["events_json"], [])
+        if not isinstance(events, list):
+            events = []
+        event_key = str(safe_payload.get("event_key") or "")
+        if event_key:
+            for existing in events:
+                projected = public_run_events(
+                    [existing],
+                    run_id=run_id,
+                    session_id=str(row["session_id"]),
+                    project_id=row["project_id"],
+                )
+                if not projected:
+                    continue
+                current = projected[0]
+                if current["payload"].get("event_key") != event_key:
+                    continue
+                if current["event"] != event_name or current["payload"] != safe_payload:
+                    raise ValueError("Run event key was reused with different content.")
+                return current
+        sequence = int(row["execution_revision"] or 0) + 1
+        record = {
+            "event": event_name,
+            "sequence": sequence,
+            "created_at": _now(),
+            "payload": safe_payload,
+        }
+        events.append(record)
+        # A direct chat run has few events.  The bound prevents a hostile or
+        # broken sidecar from growing the Workbench database without limit.
+        events = events[-500:]
+        conn.execute(
+            """
+            UPDATE runs SET events_json = ?, execution_revision = ? WHERE id = ?
+            """,
+            (json.dumps(events, ensure_ascii=False), sequence, run_id),
+        )
+    return record
 
 
 def get_resource_calibration_ratios(signature: str, limit: int = 30) -> List[float]:

@@ -51,9 +51,15 @@ class FakeDatabase:
         ]
         self.runs = []
         self.title = None
+        self.artifacts = {}
+        self.public_events = []
 
     def get_messages_by_session(self, _session_id):
         return [dict(item) for item in self.messages]
+
+    def get_session(self, session_id):
+        project_id = self.runs[-1].get("project_id") if self.runs else None
+        return {"id": session_id, "project_id": project_id}
 
     def add_message(self, session_id, role, content, **kwargs):
         message_id = len(self.messages) + 1
@@ -66,6 +72,8 @@ class FakeDatabase:
             "turn_id": kwargs.get("turn_id"),
             "parent_message_id": kwargs.get("parent_message_id"),
             "process_events": kwargs.get("process_events"),
+            "sources": kwargs.get("sources"),
+            "artifacts": kwargs.get("artifacts"),
         })
         return message_id
 
@@ -78,8 +86,28 @@ class FakeDatabase:
             "run_id": args[0],
             "status": args[5],
             "metrics": kwargs.get("metrics") or {},
-            "events": kwargs.get("events") or [],
+            "events": kwargs.get("events"),
+            "sources": kwargs.get("sources"),
+            "artifacts": kwargs.get("artifacts"),
+            "project_id": kwargs.get("project_id"),
+            "provided": set(kwargs),
         })
+
+    def save_artifact(
+        self, artifact_id, session_id, turn_id, title, artifact_type, files
+    ):
+        self.artifacts[artifact_id] = {
+            "artifact_id": artifact_id,
+            "session_id": session_id,
+            "turn_id": turn_id,
+            "title": title,
+            "type": artifact_type,
+            "files": files,
+        }
+
+    def append_run_event(self, run_id, event, payload):
+        self.public_events.append((run_id, event, payload))
+        return {"sequence": len(self.public_events)}
 
 
 class FakeResponse:
@@ -196,6 +224,16 @@ def test_basic_stream_has_no_agent_events_or_tool_payload(monkeypatch):
         temporary_context="",
         images=[],
         run_control=control,
+        project_id="project-one",
+        project_skill_sources=[
+            {
+                "kind": "project_skill",
+                "project_id": "project-one",
+                "slug": "release-review",
+                "version": "1.2.3",
+                "trigger_mode": "session",
+            }
+        ],
         archive_sync=lambda session_id: archived.append(session_id) or True,
         post_chat=fake_post_chat,
     ))
@@ -221,8 +259,74 @@ def test_basic_stream_has_no_agent_events_or_tool_payload(monkeypatch):
     assert assistant["turn_id"] == "turn_current"
     assert assistant["parent_message_id"] == 3
     assert assistant["process_events"] == []
+    assert assistant["sources"] == [
+        {
+            "kind": "workbench_project_skill",
+            "project_id": "project-one",
+            "slug": "release-review",
+            "version": "1.2.3",
+            "trigger_mode": "session",
+        }
+    ]
     assert fake_db.runs[-1]["status"] == "completed"
-    assert fake_db.runs[-1]["events"] == []
+    assert all("events" not in item["provided"] for item in fake_db.runs)
+    assert all("artifacts" not in item["provided"] for item in fake_db.runs)
+    assert fake_db.runs[0]["sources"] == assistant["sources"]
+    assert fake_db.runs[-1]["sources"] == assistant["sources"]
+
+
+def test_basic_terminal_event_failure_does_not_reverse_durable_completion(
+    monkeypatch,
+):
+    fake_db = FakeDatabase()
+    original_append = fake_db.append_run_event
+
+    def fail_terminal_evidence(run_id, event, payload):
+        if event in {"metrics", "done"}:
+            raise OSError("injected terminal evidence failure")
+        return original_append(run_id, event, payload)
+
+    fake_db.append_run_event = fail_terminal_evidence
+    monkeypatch.setattr(chat_runtime, "database", fake_db)
+    response = FakeResponse([
+        encoded_chunk("one durable answer"),
+        encoded_chunk(done=True, eval_count=3, eval_duration=1_000_000_000),
+    ])
+    control = ChatRunControl(
+        "run_terminal_evidence",
+        "sess_basic",
+        "turn_current",
+        "model-a",
+        "chat",
+    )
+
+    events = parse_sse(asyncio.run(collect_stream(
+        request=SimpleNamespace(messages=[]),
+        settings={"ollama_url": "http://127.0.0.1:11434", "model_provider": "ollama"},
+        model="model-a",
+        session_id="sess_basic",
+        turn_id="turn_current",
+        run_id="run_terminal_evidence",
+        prompt_sha256="digest",
+        user_message_id=3,
+        user_query="current question",
+        temporary_context="",
+        images=[],
+        run_control=control,
+        post_chat=lambda *_args, **_kwargs: response,
+    )))
+
+    assert [event for event, _ in events] == ["meta", "token", "metrics", "done"]
+    assert [run["status"] for run in fake_db.runs] == ["running", "completed"]
+    current_assistants = [
+        message
+        for message in fake_db.messages
+        if message["role"] == "assistant"
+        and message["turn_id"] == "turn_current"
+    ]
+    assert [message["content"] for message in current_assistants] == [
+        "one durable answer"
+    ]
 
 
 def test_provider_failure_does_not_persist_assistant(monkeypatch):
@@ -257,7 +361,157 @@ def test_provider_failure_does_not_persist_assistant(monkeypatch):
     assert [event for event, _ in events] == ["meta", "error"]
     assert fake_db.messages[-1]["role"] == "user"
     assert fake_db.runs[-1]["status"] == "failed"
+
+
+def test_completion_fails_closed_if_session_project_changes(monkeypatch):
+    fake_db = FakeDatabase()
+    monkeypatch.setattr(chat_runtime, "database", fake_db)
+    monkeypatch.setattr(
+        fake_db,
+        "get_session",
+        lambda session_id: {"id": session_id, "project_id": "project-two"},
+    )
+    response = FakeResponse([
+        encoded_chunk("answer from old project"),
+        encoded_chunk(done=True, eval_count=2),
+    ])
+    control = ChatRunControl(
+        "run_scope_change", "sess_basic", "turn_current", "model-a", "chat"
+    )
+
+    events = parse_sse(asyncio.run(collect_stream(
+        request=SimpleNamespace(messages=[]),
+        settings={"ollama_url": "http://127.0.0.1:11434", "model_provider": "ollama"},
+        model="model-a", session_id="sess_basic", turn_id="turn_current",
+        run_id="run_scope_change", prompt_sha256="digest", user_message_id=3,
+        user_query="current question", temporary_context="", images=[],
+        run_control=control, project_id="project-one",
+        archive_sync=lambda _session_id: (_ for _ in ()).throw(
+            AssertionError("changed scope must not be archived")
+        ),
+        post_chat=lambda *_args, **_kwargs: response,
+    )))
+
+    assert [event for event, _ in events] == ["meta", "token", "error"]
+    assert events[-1][1]["code"] == "SESSION_PROJECT_CHANGED"
+    assert [item for item in fake_db.messages if item["role"] == "assistant"] == [
+        fake_db.messages[1]
+    ]
+    assert fake_db.runs[-1]["status"] == "failed"
     assert response.closed
+
+
+def test_provider_failure_classification_preserves_project_scope(monkeypatch):
+    fake_db = FakeDatabase()
+    monkeypatch.setattr(chat_runtime, "database", fake_db)
+    seen = {}
+
+    def classify(_settings, _model, _status, _text, *, project_id=None):
+        seen["project_id"] = project_id
+        return {
+            "code": "PROVIDER_ERROR",
+            "message": "Provider failed.",
+            "recoverable": True,
+        }
+
+    monkeypatch.setattr(chat_runtime, "model_call_error", classify)
+    control = ChatRunControl(
+        "run_scoped_failure", "sess_basic", "turn_current", "model-a", "chat"
+    )
+    response = FakeResponse(status_code=503, text="unavailable")
+
+    asyncio.run(collect_stream(
+        request=SimpleNamespace(messages=[]),
+        settings={"ollama_url": "http://127.0.0.1:11434", "model_provider": "ollama"},
+        model="model-a", session_id="sess_basic", turn_id="turn_current",
+        run_id="run_scoped_failure", prompt_sha256="digest", user_message_id=3,
+        user_query="hello", temporary_context="", images=[],
+        run_control=control, project_id="project-one",
+        post_chat=lambda *_args, **_kwargs: response,
+    ))
+
+    assert seen == {"project_id": "project-one"}
+
+
+def test_transport_failure_classification_preserves_project_scope(monkeypatch):
+    fake_db = FakeDatabase()
+    monkeypatch.setattr(chat_runtime, "database", fake_db)
+    seen = {}
+
+    def classify(_settings, _model, _error, *, project_id=None):
+        seen["project_id"] = project_id
+        return {
+            "code": "PROVIDER_UNREACHABLE",
+            "message": "Provider unavailable.",
+            "recoverable": True,
+        }
+
+    monkeypatch.setattr(chat_runtime, "model_transport_error", classify)
+    control = ChatRunControl(
+        "run_scoped_transport_failure",
+        "sess_basic",
+        "turn_current",
+        "model-a",
+        "chat",
+    )
+
+    def failed_post_chat(*_args, **_kwargs):
+        raise RuntimeError("transport failed")
+
+    asyncio.run(collect_stream(
+        request=SimpleNamespace(messages=[]),
+        settings={
+            "ollama_url": "http://127.0.0.1:11434",
+            "model_provider": "ollama",
+        },
+        model="model-a",
+        session_id="sess_basic",
+        turn_id="turn_current",
+        run_id="run_scoped_transport_failure",
+        prompt_sha256="digest",
+        user_message_id=3,
+        user_query="hello",
+        temporary_context="",
+        images=[],
+        run_control=control,
+        project_id="project-one",
+        post_chat=failed_post_chat,
+    ))
+
+    assert seen == {"project_id": "project-one"}
+
+
+def test_basic_completion_persists_generated_artifact_refs(monkeypatch):
+    fake_db = FakeDatabase()
+    monkeypatch.setattr(chat_runtime, "database", fake_db)
+    response = FakeResponse([
+        encoded_chunk("Here is the file:\n```html\n<h1>Hello</h1>\n```"),
+        encoded_chunk(done=True, eval_count=8, eval_duration=1_000_000_000),
+    ])
+    control = ChatRunControl(
+        "run_generated_basic", "sess_basic", "turn_current", "model-a", "chat"
+    )
+
+    events = parse_sse(asyncio.run(collect_stream(
+        request=SimpleNamespace(messages=[]),
+        settings={"ollama_url": "http://127.0.0.1:11434", "model_provider": "ollama"},
+        model="model-a", session_id="sess_basic", turn_id="turn_current",
+        run_id="run_generated_basic", prompt_sha256="digest", user_message_id=3,
+        user_query="create html", temporary_context="", images=[],
+        run_control=control, post_chat=lambda *_args, **_kwargs: response,
+    )))
+
+    assert [event for event, _ in events] == ["meta", "token", "metrics", "done"]
+    assistant_refs = fake_db.messages[-1]["artifacts"]
+    run_refs = fake_db.runs[-1]["artifacts"]
+    assert assistant_refs == run_refs
+    assert len(assistant_refs) == 1
+    artifact_id = assistant_refs[0]["artifact_id"]
+    assert fake_db.artifacts[artifact_id]["files"][0]["path"] == "generated-01.html"
+    assert any(
+        event == "artifact" and payload["artifact_id"] == artifact_id
+        for _run_id, event, payload in fake_db.public_events
+    )
 
 
 def test_hidden_reasoning_is_filtered_across_stream_chunks(monkeypatch):

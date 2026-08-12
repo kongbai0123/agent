@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 import threading
 import time
@@ -11,7 +12,13 @@ from typing import Any, AsyncIterator, Callable, Iterable, Mapping, Optional, Se
 
 import database
 from chat.events import encode_sse
-from chat.runtime import VisibleResponseFilter, clean_basic_reply
+from chat.generated_artifacts import persist_generated_artifacts
+from chat.runtime import (
+    VisibleResponseFilter,
+    clean_basic_reply,
+    completed_conversation_history,
+    normalize_history_snapshot,
+)
 from chat_cancellation import ChatRunCancelled, ChatRunControl, ChatRunDeadlineExceeded
 from hermes import (
     HERMES_OUTPUT_RESERVE_TOKENS,
@@ -38,6 +45,7 @@ MAX_HISTORY_CHARS = 48_000
 HERMES_READONLY_TOOL_EVENT_ALLOWLIST = frozenset(
     {"project_read_file", "project_search_files"}
 )
+LOGGER = logging.getLogger(__name__)
 
 
 class HermesToolEventPolicyError(HermesError):
@@ -51,8 +59,35 @@ class HermesToolEventPolicyError(HermesError):
         )
 
 
+class HermesSessionScopeChangedError(HermesError):
+    """The Session no longer belongs to the Project bound to this Run."""
+
+    code = "SESSION_PROJECT_CHANGED"
+
+    def __init__(self) -> None:
+        super().__init__("The session project changed while this run was active.")
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _record_public_event(
+    run_id: str, event: str, payload: dict[str, Any]
+) -> dict[str, Any]:
+    append = getattr(database, "append_run_event", None)
+    if not callable(append):
+        return {"sequence": 0, "persisted": False}
+    try:
+        return append(run_id, event, payload)
+    except Exception as exc:
+        # Workbench event rows are best-effort Inspector evidence.  They cannot
+        # invalidate a durable Hermes answer, trigger fallback, or cause a
+        # second assistant response after the Run is already completed.
+        LOGGER.warning(
+            "Hermes public event recording degraded (%s).", type(exc).__name__
+        )
+        return {"sequence": 0, "persisted": False}
 
 
 def hermes_conversation_history(
@@ -62,46 +97,10 @@ def hermes_conversation_history(
 ) -> list[dict[str, str]]:
     """Keep only earlier complete user/assistant pairs within deterministic caps."""
 
-    result: list[dict[str, str]] = []
-    pending: Optional[str] = None
-    pending_turn = ""
-    for item in messages:
-        if not isinstance(item, Mapping):
-            continue
-        role = str(item.get("role") or "")
-        turn_id = str(item.get("turn_id") or "")
-        content = str(item.get("llm_content") or item.get("content") or "").strip()
-        if not content or (current_turn_id and turn_id == current_turn_id):
-            continue
-        if role == "user":
-            pending = content
-            pending_turn = turn_id
-        elif role == "assistant" and pending:
-            if pending_turn and turn_id and pending_turn != turn_id:
-                pending = None
-                pending_turn = ""
-                continue
-            result.extend(
-                (
-                    {"role": "user", "content": pending},
-                    {"role": "assistant", "content": content},
-                )
-            )
-            pending = None
-            pending_turn = ""
-
-    selected: list[dict[str, str]] = []
-    remaining = MAX_HISTORY_CHARS
-    for index in range(len(result) - 2, -1, -2):
-        pair = result[index : index + 2]
-        size = sum(len(item["content"]) for item in pair)
-        if size > remaining:
-            break
-        selected[0:0] = pair
-        remaining -= size
-        if len(selected) >= MAX_HISTORY_MESSAGES:
-            break
-    return selected[-MAX_HISTORY_MESSAGES:]
+    return completed_conversation_history(
+        messages,
+        current_turn_id=current_turn_id,
+    )
 
 
 def _event_payload(event: SSEEvent) -> tuple[str, Mapping[str, Any]]:
@@ -315,7 +314,13 @@ def _persist_failure(
     model: str,
     status: str,
     failure: Optional[Mapping[str, Any]],
+    project_id: Optional[str] = None,
 ) -> None:
+    normalized_failure = dict(failure or {})
+    if normalized_failure:
+        normalized_failure["recoverable"] = bool(
+            normalized_failure.get("recoverable", False)
+        )
     database.upsert_run(
         run_id,
         session_id,
@@ -323,11 +328,21 @@ def _persist_failure(
         model,
         "chat",
         status,
+        tasks=[
+            {"id": "prepare", "label": "Prepare Hermes run", "status": "completed"},
+            {
+                "id": "execute",
+                "label": "Run Hermes agent",
+                "status": "cancelled" if status == "cancelled" else "failed",
+            },
+            {"id": "finalize", "label": "Save result", "status": "pending"},
+        ],
         metrics={
             "runtime": "hermes",
-            **({"error": dict(failure)} if failure else {}),
+            **({"error": normalized_failure} if normalized_failure else {}),
         },
         completed_at=_now_iso(),
+        project_id=project_id,
     )
 
 
@@ -384,6 +399,10 @@ async def stream_hermes_chat(
     ],
     temporary_context: str = "",
     attachment: Optional[HermesProjectSkillsAttachment] = None,
+    project_id: Optional[str] = None,
+    retry_of_run_id: Optional[str] = None,
+    input_manifest: Optional[dict[str, Any]] = None,
+    history_snapshot: Optional[Iterable[Any]] = None,
     archive_sync: Optional[Callable[[str], bool]] = None,
 ) -> AsyncIterator[str]:
     """Run Hermes while preserving Workbench's existing SSE/persistence contract."""
@@ -398,6 +417,28 @@ async def stream_hermes_chat(
     runtime_model = str(manager.config.default_model or model)
     prepared = attachment
     decision: Optional[HermesIntegrationDecision] = None
+    bound_project_id = project_id
+    if bound_project_id is None:
+        session = database.get_session(session_id)
+        bound_project_id = session.get("project_id") if session else None
+    database.upsert_run(
+        run_id,
+        session_id,
+        turn_id,
+        runtime_model,
+        "chat",
+        "running",
+        tasks=[
+            {"id": "prepare", "label": "Prepare Hermes run", "status": "running"},
+            {"id": "execute", "label": "Run Hermes agent", "status": "pending"},
+            {"id": "finalize", "label": "Save result", "status": "pending"},
+        ],
+        events=[],
+        sources=(prepared.provenance if prepared is not None else []),
+        project_id=bound_project_id,
+        retry_of_run_id=retry_of_run_id,
+        input_manifest=input_manifest,
+    )
     try:
         run_control.raise_if_cancelled_or_expired()
         if prepared is None:
@@ -421,15 +462,18 @@ async def stream_hermes_chat(
             model=runtime_model,
             status="cancelled",
             failure=None,
+            project_id=bound_project_id,
         )
-        yield encode_sse(
-            "cancelled",
-            {
-                **binding,
-                "message": "The chat request was cancelled.",
-                "deadline_exceeded": run_control.deadline_exceeded(),
-            },
+        cancelled_payload = {
+            **binding,
+            "message": "The chat request was cancelled.",
+            "recoverable": True,
+            "deadline_exceeded": run_control.deadline_exceeded(),
+        }
+        _record_public_event(
+            run_id, "cancelled", cancelled_payload
         )
+        yield encode_sse("cancelled", cancelled_payload)
         return
     except Exception as exc:
         failure = _failure_payload(exc)
@@ -440,7 +484,9 @@ async def stream_hermes_chat(
             model=runtime_model,
             status="failed",
             failure=failure,
+            project_id=bound_project_id,
         )
+        _record_public_event(run_id, "error", failure)
         yield encode_sse("error", failure)
         return
 
@@ -455,9 +501,13 @@ async def stream_hermes_chat(
             yield item
         return
 
-    history = hermes_conversation_history(
-        database.get_messages_by_session(session_id),
-        current_turn_id=turn_id,
+    history = (
+        normalize_history_snapshot(history_snapshot)
+        if history_snapshot is not None
+        else hermes_conversation_history(
+            database.get_messages_by_session(session_id),
+            current_turn_id=turn_id,
+        )
     )
     try:
         context_budget = budget_hermes_context(
@@ -502,7 +552,15 @@ async def stream_hermes_chat(
             runtime_model,
             "chat",
             "running",
+            tasks=[
+                {"id": "prepare", "label": "Prepare Hermes run", "status": "completed"},
+                {"id": "execute", "label": "Run Hermes agent", "status": "running"},
+                {"id": "finalize", "label": "Save result", "status": "pending"},
+            ],
             sources=prepared.provenance,
+            project_id=prepared.project_id,
+            retry_of_run_id=retry_of_run_id,
+            input_manifest=input_manifest,
         )
         stopper = HermesUpstreamCancellation(manager, run_id)
         run_control.attach(stopper)
@@ -514,7 +572,9 @@ async def stream_hermes_chat(
             "hermes_run_id": snapshot.hermes_run_id,
             "project_id": prepared.project_id,
             "project_skill_count": len(prepared.sources),
+            "retry_of_run_id": retry_of_run_id,
         }
+        _record_public_event(run_id, "meta", meta)
         yield encode_sse("meta", meta)
         meta_emitted = True
 
@@ -548,9 +608,17 @@ async def stream_hermes_chat(
                     answer_parts.append(output)
                     yield encode_sse("token", {"content": output})
             elif name == "tool.started":
-                yield encode_sse("tool_start", tool_events.started(payload))
+                public_tool = tool_events.started(payload)
+                _record_public_event(
+                    run_id, "tool_start", public_tool
+                )
+                yield encode_sse("tool_start", public_tool)
             elif name == "tool.completed":
-                yield encode_sse("tool_end", tool_events.completed(payload))
+                public_tool = tool_events.completed(payload)
+                _record_public_event(
+                    run_id, "tool_end", public_tool
+                )
+                yield encode_sse("tool_end", public_tool)
             elif name.startswith("tool."):
                 tool_events.reject()
             elif name == "approval.request":
@@ -567,14 +635,25 @@ async def stream_hermes_chat(
                     ).strip().casefold()
                     if risk not in {"low", "medium", "high", "critical"}:
                         risk = "high"
+                    approval_payload = {
+                        "approval_id": approval.approval_id,
+                        "capability": approval.capability,
+                        "message": approval.summary,
+                        "run_id": run_id,
+                        "risk": risk,
+                        "status": approval.status,
+                        "choices": list(getattr(approval, "choices", ("once", "deny"))),
+                    }
+                    _record_public_event(
+                        run_id, "approval_required", approval_payload
+                    )
                     yield encode_sse(
                         "approval_required",
                         {
-                            "approval_id": approval.approval_id,
-                            "capability": approval.capability,
-                            "message": approval.summary,
-                            "run_id": run_id,
-                            "risk": risk,
+                            key: approval_payload[key]
+                            for key in (
+                                "approval_id", "capability", "message", "run_id", "risk"
+                            )
                         },
                     )
             elif name == "run.completed":
@@ -654,6 +733,16 @@ async def stream_hermes_chat(
             attachment=prepared,
             context_budget=context_budget,
         )
+        session = database.get_session(session_id)
+        if not session or session.get("project_id") != prepared.project_id:
+            raise HermesSessionScopeChangedError()
+        artifact_references = persist_generated_artifacts(
+            database,
+            run_id=run_id,
+            session_id=session_id,
+            turn_id=turn_id,
+            answer=answer,
+        )
         database.add_message(
             session_id,
             "assistant",
@@ -662,12 +751,25 @@ async def stream_hermes_chat(
             llm_content=answer,
             sources=prepared.provenance,
             process_events=[],
-            artifacts=[],
+            artifacts=artifact_references,
             turn_id=turn_id,
             parent_message_id=user_message_id,
         )
         if len(database.get_messages_by_session(session_id)) <= 2:
             database.update_session_title(session_id, user_query[:40])
+        completed_run_fields: dict[str, Any] = {
+            "tasks": [
+                {"id": "prepare", "label": "Prepare Hermes run", "status": "completed"},
+                {"id": "execute", "label": "Run Hermes agent", "status": "completed"},
+                {"id": "finalize", "label": "Save result", "status": "completed"},
+            ],
+            "sources": prepared.provenance,
+            "metrics": metrics,
+            "completed_at": _now_iso(),
+            "project_id": prepared.project_id,
+        }
+        if artifact_references:
+            completed_run_fields["artifacts"] = artifact_references
         database.upsert_run(
             run_id,
             session_id,
@@ -675,16 +777,16 @@ async def stream_hermes_chat(
             runtime_model,
             "chat",
             "completed",
-            sources=prepared.provenance,
-            metrics=metrics,
-            completed_at=_now_iso(),
+            **completed_run_fields,
         )
         manager.approval_store.expire_run(run_id)
         manager.complete(decision, success=True)
         decision_finalized = True
         if archive_sync is not None:
             archive_sync(session_id)
+        _record_public_event(run_id, "metrics", metrics)
         yield encode_sse("metrics", metrics)
+        _record_public_event(run_id, "done", binding)
         yield encode_sse("done", binding)
     except (ChatRunCancelled, ChatRunDeadlineExceeded):
         if stopper is not None:
@@ -698,16 +800,19 @@ async def stream_hermes_chat(
             model=runtime_model,
             status="cancelled",
             failure=None,
+            project_id=prepared.project_id,
         )
         manager.approval_store.expire_run(run_id)
-        yield encode_sse(
-            "cancelled",
-            {
-                **binding,
-                "message": "The chat request was cancelled.",
-                "deadline_exceeded": run_control.deadline_exceeded(),
-            },
+        cancelled_payload = {
+            **binding,
+            "message": "The chat request was cancelled.",
+            "recoverable": True,
+            "deadline_exceeded": run_control.deadline_exceeded(),
+        }
+        _record_public_event(
+            run_id, "cancelled", cancelled_payload
         )
+        yield encode_sse("cancelled", cancelled_payload)
     except Exception as exc:
         if stopper is not None:
             await asyncio.to_thread(stopper.close)
@@ -743,8 +848,10 @@ async def stream_hermes_chat(
             model=runtime_model,
             status="failed",
             failure=failure,
+            project_id=prepared.project_id,
         )
         manager.approval_store.expire_run(run_id)
+        _record_public_event(run_id, "error", failure)
         yield encode_sse("error", failure)
     finally:
         if stopper is not None and not decision_finalized:
@@ -761,6 +868,7 @@ async def stream_hermes_chat(
                 model=runtime_model,
                 status="cancelled",
                 failure=None,
+                project_id=(prepared.project_id if prepared is not None else project_id),
             )
             manager.approval_store.expire_run(run_id)
         if stopper is not None:

@@ -93,7 +93,7 @@ def test_each_hermes_field_uses_an_accessible_bulleted_hover_help():
     assert ".hermes-field-help-disclosure:focus-within .hermes-field-help" in STYLE_CSS
     assert ".hermes-settings-field:has(.hermes-field-help-trigger:hover)" in STYLE_CSS
     assert "right: 0" in STYLE_CSS
-    assert "z-index: 130" in STYLE_CSS
+    assert "z-index: 541" in STYLE_CSS
     assert "visibility: hidden" in STYLE_CSS
     assert 'hermes-settings.js?v=1.1.2-hover-help-dom' in INDEX_HTML
 

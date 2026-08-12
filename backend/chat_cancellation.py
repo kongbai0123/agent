@@ -534,6 +534,16 @@ def active_chat_models(exclude_run_id: Optional[str] = None) -> Set[str]:
     return models
 
 
+def has_active_chat_run(session_id: str) -> bool:
+    """Return whether a non-cancelled Run currently owns the Session scope."""
+
+    with _CONTROLS_LOCK:
+        return any(
+            control.session_id == session_id and not control.cancelled.is_set()
+            for control in _CONTROLS.values()
+        )
+
+
 def cancel_session_chat_runs(
     session_id: str,
     *,

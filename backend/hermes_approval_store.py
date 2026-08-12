@@ -389,6 +389,28 @@ class PersistentHermesApprovalStore:
             ).fetchall()
         return [self._record(row) for row in rows]
 
+    def list_for_run(
+        self,
+        workbench_run_id: str,
+        *,
+        limit: int = 100,
+    ) -> list[PersistentHermesApproval]:
+        """Return persisted approval state for execution-snapshot hydration."""
+
+        run_id = _text(workbench_run_id, "Workbench run ID")
+        safe_limit = max(1, min(int(limit), 500))
+        with self._connection_factory() as conn:
+            self._ensure_schema(conn)
+            rows = conn.execute(
+                """
+                SELECT * FROM hermes_approval_requests
+                WHERE workbench_run_id = ?
+                ORDER BY created_at ASC LIMIT ?
+                """,
+                (run_id, safe_limit),
+            ).fetchall()
+        return [self._record(row) for row in rows]
+
 
 __all__ = [
     "HermesApprovalConflictError",

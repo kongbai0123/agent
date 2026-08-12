@@ -95,6 +95,7 @@ async function ensureSession() {
         projectId: activeProjectId,
     });
     renderOutputSkillsPane(activeProjectId);
+    syncRunInspectorContext(activeProjectId);
     return currentSessionId;
 }
 
@@ -280,7 +281,6 @@ const sandboxSubtitle = document.getElementById('sandbox-subtitle');
 const btnSandboxDownload = document.getElementById('btn-sandbox-download');
 const btnSandboxClose = document.getElementById('btn-sandbox-close');
 const outputFloatingPanel = document.getElementById('output-floating-panel');
-const outputFloatingTab = document.getElementById('output-floating-tab');
 const outputPanelProject = document.getElementById('output-panel-project');
 const outputSkillsMount = document.getElementById('output-skills-mount');
 const tabSandboxPreview = document.getElementById('tab-sandbox-preview');
@@ -525,6 +525,13 @@ function renderTaskProgress() {
     const items = [...taskProgressItems.values()].sort((a, b) => b.updatedAt - a.updatedAt);
     taskProgressCount.textContent = String(items.length);
     taskProgressCenter.hidden = items.length === 0;
+    if (
+        items.length > 0
+        && window.matchMedia('(max-width: 840px)').matches
+        && window.workbenchRunInspector?.isOpen?.()
+    ) {
+        setTaskProgressCollapsed(true);
+    }
     items.forEach(item => {
         const card = document.createElement('article');
         card.className = `task-progress-item ${item.mode === 'indeterminate' ? 'indeterminate' : ''} ${item.status || 'running'}`;
@@ -558,6 +565,22 @@ function renderTaskProgress() {
         card.append(row, detail, track);
         taskProgressList.appendChild(card);
     });
+}
+
+function setTaskProgressCollapsed(collapsed) {
+    if (!taskProgressCenter || !taskProgressToggle) return;
+    taskProgressCenter.classList.toggle('collapsed', collapsed === true);
+    taskProgressToggle.setAttribute('aria-expanded', String(collapsed !== true));
+    taskProgressToggle.setAttribute('aria-label', collapsed ? '展開執行進度' : '收合執行進度');
+    taskProgressToggle.title = collapsed ? '展開執行進度' : '收合執行進度';
+}
+
+function prepareRunInspectorOpen() {
+    closeInspectorPanel();
+    closeAgentCollaboration(true);
+    if (window.matchMedia('(max-width: 840px)').matches && !taskProgressCenter?.hidden) {
+        setTaskProgressCollapsed(true);
+    }
 }
 
 function updateTaskProgress(id, changes = {}) {
@@ -608,10 +631,15 @@ function finishTaskProgress(id, status = 'completed', detail = '') {
 function initTaskProgress() {
     if (!taskProgressCenter || !taskProgressToggle) return;
     taskProgressToggle.addEventListener('click', () => {
-        const collapsed = taskProgressCenter.classList.toggle('collapsed');
-        taskProgressToggle.setAttribute('aria-expanded', String(!collapsed));
-        taskProgressToggle.setAttribute('aria-label', collapsed ? '展開執行進度' : '收合執行進度');
-        taskProgressToggle.title = collapsed ? '展開執行進度' : '收合執行進度';
+        const expanding = taskProgressCenter.classList.contains('collapsed');
+        if (
+            expanding
+            && window.matchMedia('(max-width: 840px)').matches
+            && window.workbenchRunInspector?.isOpen?.()
+        ) {
+            setOutputFloatingPanelOpen(false);
+        }
+        setTaskProgressCollapsed(!expanding);
     });
     taskProgressClockTimer = setInterval(refreshTaskProgressClock, 1000);
 }
@@ -883,6 +911,7 @@ function renderAgentCollaboration() {
 
 function openAgentCollaboration(force = false) {
     if (!agentCollaborationPanel || (!force && agentPanelDismissedForRun)) return;
+    setOutputFloatingPanelOpen(false);
     closeInspectorPanel();
     agentCollaborationPanel.hidden = false;
     document.getElementById('rail-agents')?.classList.add('active');
@@ -1299,7 +1328,16 @@ async function initApp() {
         apiBase: API_BASE,
         showToast,
         createIcons: safeCreateIcons,
-        openContextMenu
+        openContextMenu,
+        closeContextMenu
+    });
+    window.workbenchRunInspector?.init({
+        apiFetch,
+        apiBase: API_BASE,
+        showToast,
+        createIcons: safeCreateIcons,
+        retryRun: retryRunFromInspector,
+        beforeOpen: prepareRunInspectorOpen,
     });
     const hermesSettingsContainer = document.getElementById('hermes-settings-container');
     if (hermesSettingsContainer) {
@@ -1375,11 +1413,6 @@ function initThemeToggle() {
 
 // 監聽器設定
 function setupEventListeners() {
-    // 浮動工作框屬於頁面骨架，開關不應等待後端、模型或 Session 初始化。
-    outputFloatingTab.addEventListener('click', () => {
-        setOutputFloatingPanelOpen(outputFloatingPanel.hidden);
-    });
-
     // 輸入框高度自動調整與 Enter 送出
     userInput.addEventListener('input', () => {
         userInput.style.height = 'auto';
@@ -1635,8 +1668,10 @@ function createClientRunId() {
 async function cancelActiveChatRun() {
     if (!isGenerating || isCancellingGeneration) return;
     isCancellingGeneration = true;
+    window.workbenchRunInspector?.cancelPendingApprovals?.('目前執行已停止。');
     setGeneratingUI(true, true);
     const runId = currentChatRunId;
+    const activeAbort = chatAbort;
     const cancelRequest = runId
         ? apiFetch(`${API_BASE}/api/chat/runs/${encodeURIComponent(runId)}/cancel`, {
             method: 'POST',
@@ -1660,7 +1695,7 @@ async function cancelActiveChatRun() {
         cancelRequest,
         new Promise(resolve => setTimeout(resolve, 250))
     ]);
-    if (chatAbort) chatAbort.abort();
+    if (activeAbort) activeAbort.abort();
     const cancelResult = await cancelRequest;
     const cleanup = cancelResult?.cleanup;
     if (cleanup) {
@@ -1836,17 +1871,27 @@ function renderOutputSkillsPane(projectId = activeProjectId, message = '') {
     safeCreateIcons();
 }
 
+function syncRunInspectorContext(projectId = activeProjectId, projectName = '') {
+    const project = projectId ? sidebarProjects.find(item => item.id === projectId) : null;
+    void window.workbenchRunInspector?.setContext({
+        sessionId: currentSessionId,
+        projectId: project?.id || projectId || null,
+        projectName: projectName || project?.name || '',
+    });
+}
+
 function clearOutputSkillsContext(message = '正在切換專案…') {
     window.workbenchProjectSkills?.setSessionContext({ sessionId: null, projectId: null });
+    void window.workbenchRunInspector?.setContext({ sessionId: null, projectId: null, projectName: '' });
     renderOutputSkillsPane(null, message);
 }
 
 function setOutputFloatingPanelOpen(open) {
-    const expanded = open === true;
-    outputFloatingPanel.hidden = !expanded;
-    outputFloatingTab.classList.toggle('active', expanded);
-    outputFloatingTab.setAttribute('aria-selected', expanded ? 'true' : 'false');
-    outputFloatingTab.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+    if (open === true && !window.workbenchRunInspector?.isOpen()) {
+        window.workbenchRunInspector?.selectTab('skills');
+    } else if (open !== true && window.workbenchRunInspector?.isOpen()) {
+        window.workbenchRunInspector?.selectTab(window.workbenchRunInspector.getState().activeTab, { toggle: true });
+    }
 }
 
 async function loadSessions(searchVal = '') {
@@ -1866,6 +1911,7 @@ async function loadSessions(searchVal = '') {
             projectId: currentSession?.project_id || null
         });
         renderOutputSkillsPane(currentSession?.project_id || null);
+        syncRunInspectorContext(currentSession?.project_id || null, currentSession?.project_name || '');
         renderSidebar();
         renderProjectSwitcher();
         safeCreateIcons();
@@ -2255,6 +2301,10 @@ function emptySidebarRow(text) {
 
 function openContextMenu(event, items) {
     event.stopPropagation();
+    window.workbenchProjectSkills?.closeMenus();
+    if (sidebarContextMenu.parentElement !== document.body) {
+        document.body.appendChild(sidebarContextMenu);
+    }
     sidebarContextMenu.innerHTML = '';
     items.forEach(item => {
         if (item.separator) {
@@ -2263,7 +2313,12 @@ function openContextMenu(event, items) {
         }
         const button = document.createElement('button');
         button.className = item.danger ? 'danger' : '';
-        button.innerHTML = `<i data-lucide="${item.icon}"></i><span>${item.label}</span>`;
+        const menuIcon = document.createElement('i');
+        menuIcon.dataset.lucide = String(item.icon || 'circle');
+        menuIcon.setAttribute('aria-hidden', 'true');
+        const menuLabel = document.createElement('span');
+        menuLabel.textContent = String(item.label || '');
+        button.append(menuIcon, menuLabel);
         button.addEventListener('click', async () => {
             sidebarContextMenu.hidden = true;
             await item.run();
@@ -2273,9 +2328,18 @@ function openContextMenu(event, items) {
     sidebarContextMenu.hidden = false;
     const rect = event.currentTarget.getBoundingClientRect();
     const width = 190;
-    sidebarContextMenu.style.left = `${Math.min(rect.right - width, window.innerWidth - width - 8)}px`;
-    sidebarContextMenu.style.top = `${Math.min(rect.bottom + 4, window.innerHeight - sidebarContextMenu.offsetHeight - 8)}px`;
+    const left = Math.max(8, Math.min(rect.right - width, window.innerWidth - width - 8));
+    const availableBelow = window.innerHeight - rect.bottom - 8;
+    const top = availableBelow >= sidebarContextMenu.offsetHeight
+        ? rect.bottom + 4
+        : Math.max(8, rect.top - sidebarContextMenu.offsetHeight - 4);
+    sidebarContextMenu.style.left = `${left}px`;
+    sidebarContextMenu.style.top = `${top}px`;
     safeCreateIcons();
+}
+
+function closeContextMenu() {
+    if (sidebarContextMenu) sidebarContextMenu.hidden = true;
 }
 
 function openProjectMenu(event, project) {
@@ -2550,6 +2614,7 @@ async function deleteProject(project) {
 }
 
 async function createNewSession(projectId = null) {
+    if (isGenerating) await cancelActiveChatRun();
     clearOutputSkillsContext('正在建立新對話…');
     try {
         const res = await apiFetch(`${API_BASE}/api/sessions`, {
@@ -2582,6 +2647,8 @@ async function createNewSession(projectId = null) {
 }
 
 async function changeSession(sessionId) {
+    if (sessionId === currentSessionId) return;
+    if (isGenerating) await cancelActiveChatRun();
     currentSessionId = sessionId;
     clearOutputSkillsContext();
     chatMessages.innerHTML = '';
@@ -2933,6 +3000,26 @@ async function handleClearDatabase() {
 // 4. 對話送出與串流處理 (過濾 / 剔除思考區與工具卡片)
 // ==========================================================================
 
+async function retryRunFromInspector(runId, run = {}) {
+    if (!runId) throw new Error('缺少要重新執行的 Run。');
+    if (isGenerating) throw new Error('目前已有一輪正在執行。');
+    return handleChatSubmit({
+        preventDefault() {},
+        retryOfRunId: runId,
+        retryModel: run.model || null,
+    });
+}
+
+function streamEventMatches(identity, data = {}) {
+    if (!identity || currentSessionId !== identity.sessionId || activeProjectId !== identity.projectId) return false;
+    if (data.run_id && String(data.run_id) !== identity.runId) return false;
+    if (data.session_id && String(data.session_id) !== String(identity.sessionId || '')) return false;
+    if (Object.prototype.hasOwnProperty.call(data, 'project_id')) {
+        if (String(data.project_id || '') !== String(identity.projectId || '')) return false;
+    }
+    return true;
+}
+
 async function handleChatSubmit(e) {
     e.preventDefault();
     // 生成中：送出鈕作為「停止」（中止串流讀取，保留已生成內容）
@@ -2941,10 +3028,14 @@ async function handleChatSubmit(e) {
         return;
     }
 
-    let question = userInput.value.trim();
-    if (!question && currentImages.length === 0) return;
+    const retryOfRunId = String(e?.retryOfRunId || '').trim() || null;
+    const retryModel = String(e?.retryModel || '').trim() || null;
+    const retryInput = retryOfRunId ? runRetryInputs.get(retryOfRunId) : null;
+    let userMessageAddedToConversation = false;
+    let question = retryInput?.question || userInput.value.trim();
+    if (!retryOfRunId && !question && currentImages.length === 0) return;
     let explicitSkillIds = [];
-    if (!BASIC_CHAT_MODE && question.startsWith('/skill') && window.workbenchSkills) {
+    if (!retryOfRunId && !BASIC_CHAT_MODE && question.startsWith('/skill') && window.workbenchSkills) {
         try {
             const prepared = await window.workbenchSkills.prepareSubmission(question);
             if (!prepared) {
@@ -2967,17 +3058,21 @@ async function handleChatSubmit(e) {
     }
     
     // 複製當前的待發送圖片，並清空預覽容器
-    const imagesToSend = [...currentImages];
-    currentImages = [];
-    imagePreviewContainer.innerHTML = '';
-    imagePreviewContainer.style.display = 'none';
+    const imagesToSend = retryOfRunId ? [] : [...currentImages];
+    if (!retryOfRunId) {
+        currentImages = [];
+        imagePreviewContainer.innerHTML = '';
+        imagePreviewContainer.style.display = 'none';
+    }
     
     // 1. 將使用者訊息渲染到對話歷史中 (帶有上傳的圖片)
-    appendMessage('user', question, imagesToSend);
+    if (!retryOfRunId) appendMessage('user', question, imagesToSend);
     
     // 2. 重置輸入框
-    userInput.value = '';
-    userInput.style.height = 'auto';
+    if (!retryOfRunId) {
+        userInput.value = '';
+        userInput.style.height = 'auto';
+    }
     
     // 3. 建立助理回覆的 placeholder
     const assistantMsgEl = createAssistantMessagePlaceholder();
@@ -2991,6 +3086,7 @@ async function handleChatSubmit(e) {
     resetAgentCollaboration();
     const runStart = performance.now();
     const progressId = `chat-generation-${Date.now()}`;
+    let streamIdentity = null;
     let chatProgressStatus = 'completed';
     let firstTokenAt = 0;
     let approxTokens = 0;
@@ -3007,24 +3103,42 @@ async function handleChatSubmit(e) {
         await ensureSession();
         if (isCancellingGeneration) throw new DOMException('Chat run cancelled before dispatch', 'AbortError');
         currentChatRunId = createClientRunId();
-
-        // P0-1：LLM 上下文只來自 conversationState，本輪問題只加入一次
-        addLLMMessage('user', sendQuestion, {
-            images: imagesToSend.length,
-            temporary_context_enabled: !!temporaryContextText
+        streamIdentity = Object.freeze({
+            runId: currentChatRunId,
+            sessionId: currentSessionId,
+            projectId: activeProjectId || null,
+        });
+        window.workbenchRunInspector?.beginRun({
+            ...streamIdentity,
+            model: retryModel || modelSelect.value,
+            retryOfRunId,
         });
 
+        // P0-1：LLM 上下文只來自 conversationState，本輪問題只加入一次
+        if (!retryOfRunId) {
+            addLLMMessage('user', sendQuestion, {
+                images: imagesToSend.length,
+                temporary_context_enabled: !!temporaryContextText
+            });
+            userMessageAddedToConversation = true;
+        }
+
         const payload = {
-            model: modelSelect.value,
+            model: retryModel || modelSelect.value,
             messages: getLLMMessages(),
             use_rag: BASIC_CHAT_MODE ? false : ragToggle.checked,
             session_id: currentSessionId,
             images: imagesToSend,
             temporary_context: temporaryContextText || "",
             run_id: currentChatRunId,
+            retry_of_run_id: retryOfRunId,
             skill_ids: explicitSkillIds,
             skill_auto: true
         };
+        runRetryInputs.set(currentChatRunId, {
+            question: sendQuestion,
+            temporaryContextEnabled: !!temporaryContextText,
+        });
         const response = await apiFetch(`${API_BASE}/api/chat`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -3275,11 +3389,15 @@ async function handleChatSubmit(e) {
                     try {
                         const eventData = JSON.parse(dataStr);
                         const eventType = currentEventType || eventData.type || 'token';
+                        if (!streamEventMatches(streamIdentity, eventData)) continue;
                         pushSseLog(eventType, dataStr);
                         if (eventType !== 'token') handleAgentCollaborationEvent(eventType, eventData);
+                        if (eventType !== 'token' && eventType !== 'approval_required') {
+                            window.workbenchRunInspector?.handleEvent(eventType, eventData, streamIdentity);
+                        }
                         
                         if (eventType === 'meta') {
-                            if (eventData.run_id) currentChatRunId = eventData.run_id;
+                            if (eventData.run_id && String(eventData.run_id) !== streamIdentity.runId) continue;
                         } else if (eventType === 'skills') {
                             window.workbenchSkills?.handleRunEvent(eventData);
                         } else if (eventType === 'cancelled') {
@@ -3289,26 +3407,33 @@ async function handleChatSubmit(e) {
                             addAgentCollaborationMessage('planner', '停止', eventData.message || '後端已停止 Agent Runtime。');
                         } else if (eventType === 'approval_required') {
                             const capabilityName = eventData.capability || '未命名系統能力';
-                            const approved = window.confirm(
-                                `${eventData.message || 'Agent 要求執行系統級能力。'}\n\n`
-                                + `能力：${capabilityName}\n風險：${riskLabel(eventData.risk)}\n\n`
-                                + '只有在你了解這項操作時才按「確定」。'
-                            );
-                            const approvalRunId = eventData.run_id || currentChatRunId;
-                            const approvalResponse = await apiFetch(
-                                `${API_BASE}/api/chat/runs/${encodeURIComponent(approvalRunId)}/approval`,
-                                {
-                                    method: 'POST',
-                                    headers: { 'Content-Type': 'application/json' },
-                                    body: JSON.stringify({
-                                        approval_id: eventData.approval_id,
-                                        approved,
-                                        decided_by: 'local_user'
-                                    })
-                                }
-                            );
-                            if (!approvalResponse.ok) {
-                                throw new Error('能力批准已逾時或無法送達後端。');
+                            let approved = false;
+                            if (window.workbenchRunInspector?.handleApproval) {
+                                approved = await window.workbenchRunInspector.handleApproval(
+                                    eventData,
+                                    streamIdentity,
+                                    chatAbort?.signal
+                                );
+                            } else {
+                                approved = window.confirm(
+                                    `${eventData.message || 'Agent 要求執行系統級能力。'}\n\n`
+                                    + `能力：${capabilityName}\n風險：${riskLabel(eventData.risk)}\n\n`
+                                    + '只有在你了解這項操作時才按「確定」。'
+                                );
+                                const approvalRunId = eventData.run_id || currentChatRunId;
+                                const approvalResponse = await apiFetch(
+                                    `${API_BASE}/api/chat/runs/${encodeURIComponent(approvalRunId)}/approval`,
+                                    {
+                                        method: 'POST',
+                                        headers: { 'Content-Type': 'application/json' },
+                                        body: JSON.stringify({
+                                            approval_id: eventData.approval_id,
+                                            approved,
+                                            decided_by: 'local_user'
+                                        })
+                                    }
+                                );
+                                if (!approvalResponse.ok) throw new Error('能力批准已逾時或無法送達後端。');
                             }
                             execLog.push({
                                 kind: 'validation',
@@ -3560,9 +3685,6 @@ async function handleChatSubmit(e) {
                             renderSources(assistantMsgEl, sources);
                             scrollToBottom();
                         } else if (eventType === 'done') {
-                            if (eventData.session_id) {
-                                currentSessionId = eventData.session_id;
-                            }
                             // 🔍 隱藏思維鏈 🔍
                             thoughtChainVisualizer.classList.remove('active');
                             setAssistantResponsePhase(assistantMsgEl, 'clear');
@@ -3657,6 +3779,10 @@ async function handleChatSubmit(e) {
     } catch (error) {
         if (error && error.name === 'AbortError') {
             chatProgressStatus = 'cancelled';
+            window.workbenchRunInspector?.handleEvent('cancelled', {
+                run_id: currentChatRunId,
+                message: '使用者已停止目前執行。',
+            }, streamIdentity || {});
             agentCollaborationState.running = false;
             addAgentCollaborationMessage('planner', '停止', '使用者已停止目前 Agent 工作。');
             Object.values(agentCollaborationState.agents).forEach(agent => {
@@ -3669,6 +3795,7 @@ async function handleChatSubmit(e) {
             bubbleEl.insertAdjacentHTML('beforeend', '<div class="answer-ragnote">已停止生成（本輪回覆未完整）。</div>');
         } else {
             chatProgressStatus = 'failed';
+            window.workbenchRunInspector?.markError(error, { retryAllowed: false });
             agentCollaborationState.running = false;
             setAgentStatus('critic', 'blocked');
             addAgentCollaborationMessage('critic', '阻塞', `執行中斷：${error?.message || '未知錯誤'}`, { tone: 'challenge' });
@@ -3676,7 +3803,11 @@ async function handleChatSubmit(e) {
             if (thinkingEl) thinkingEl.remove();
             setAssistantResponsePhase(assistantMsgEl, 'clear');
             // P0-1：請求失敗時回滾本輪 user 訊息，避免使用者重試後上下文出現重複問題
-            if (conversationState.length > 0 && conversationState[conversationState.length - 1].role === 'user') {
+            if (
+                userMessageAddedToConversation
+                && conversationState.length > 0
+                && conversationState[conversationState.length - 1].role === 'user'
+            ) {
                 conversationState.pop();
             }
             bubbleEl.innerHTML = renderConnectionErrorCard();
@@ -5339,6 +5470,7 @@ async function refreshSafirStatus() {
 // ---- 全域狀態 ----
 let chatAbort = null;                 // 生成中止控制器（送出鈕 = 停止）
 let currentChatRunId = null;          // 後端 Run ID，用於真正取消 Ollama 工作
+const runRetryInputs = new Map();      // 僅供同一頁面的「重新執行本輪」恢復正式輸入
 let runHistory = [];                  // Agent Run 紀錄（Inspector Run tab）
 let sseLogBuffer = [];                // 原始 SSE 事件（Inspector Logs tab）
 let lastMetrics = null;               // 最近一次生成指標
@@ -5597,6 +5729,7 @@ function closeInspectorPanel() {
 function openInspector(tab) {
     const pane = document.getElementById(`inspector-pane-${tab}`);
     if (!pane) return;
+    setOutputFloatingPanelOpen(false);
     closeAgentCollaboration(false);
     artifactsSandboxPanel.classList.add('active');
     artifactsSandboxPanel.setAttribute('aria-label', 'Inspector 面板');
