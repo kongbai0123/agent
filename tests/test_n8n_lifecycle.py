@@ -72,7 +72,7 @@ class N8nLifecycleTests(unittest.TestCase):
             "N8N_RESTRICT_FILE_ACCESS_TO",
         ):
             self.assertTrue(
-                Path(environment[name]).is_relative_to(self.runtime),
+                Path(environment[name]).is_relative_to(self.paths.runtime_root),
                 f"{name} escaped runtime",
             )
         self.assertNotIn("DATABASE_URL", environment)
