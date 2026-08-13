@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "n8n_version": "2.32.5",
+  "node_version": "24.15.0",
+  "listen_address": "127.0.0.1",
+  "port": 5678,
+  "data_root": "runtime/n8n-data",
+  "tool_root": "runtime/tools/n8n",
+  "gmail_redirect_uri": "http://localhost:5678/rest/oauth2-credential/callback",
+  "workflow_templates": [
+    "config/n8n-workflows/workbench-gmail-inbound-v1.json",
+    "config/n8n-workflows/workbench-gmail-send-v1.json"
+  ]
+}

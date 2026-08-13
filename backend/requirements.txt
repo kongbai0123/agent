@@ -5,6 +5,7 @@ packaging==24.2
 PyYAML==6.0.3
 python-multipart==0.0.32
 requests==2.34.2
+cryptography==49.0.0
 chromadb==0.5.3
 langchain==0.2.5
 langchain-community==0.2.5

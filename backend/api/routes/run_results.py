@@ -462,6 +462,10 @@ def _bound_run(
     run = database.get_run(run_id)
     if not run:
         raise _not_found(error_payload, "RUN_NOT_FOUND", "Run was not found.")
+    if str(run.get("mode") or "").strip().casefold() == "email":
+        # Email evidence contains a separately encrypted/private data model
+        # and is exposed only by the n8n Gmail mail-run API.
+        raise _not_found(error_payload, "RUN_NOT_FOUND", "Run was not found.")
     session_id = str(run.get("session_id") or "")
     session = database.get_session(session_id)
     if not session or session.get("project_id") != run.get("project_id"):

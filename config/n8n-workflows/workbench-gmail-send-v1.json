@@ -1,0 +1,153 @@
+{
+  "templateId": "workbench-gmail-send-v1",
+  "name": "Workbench Gmail Send v1",
+  "active": false,
+  "nodes": [
+    {
+      "parameters": {"httpMethod": "POST", "path": "workbench-gmail-send-v1", "authentication": "headerAuth", "responseMode": "responseNode", "options": {}},
+      "id": "gmail-send-webhook", "name": "Webhook", "type": "n8n-nodes-base.webhook", "typeVersion": 2.1,
+      "position": [0, 0], "webhookId": "workbench-gmail-send-v1",
+      "credentials": {"httpHeaderAuth": {"id": "__WORKBENCH_WEBHOOK_CREDENTIAL_ID__", "name": "Workbench Delivery Webhook"}}
+    },
+    {
+      "parameters": {"mode": "manual", "assignments": {"assignments": [
+        {"id": "claim-delivery", "name": "delivery_id", "type": "string", "value": "={{$json.body.delivery_id}}"},
+        {"id": "claim-token", "name": "claim_token", "type": "string", "value": "={{$json.body.claim_token}}"},
+        {"id": "claim-id", "name": "claim_id", "type": "string", "value": "={{$execution.id}}"},
+        {"id": "claim-body", "name": "request_body", "type": "string", "value": "={{JSON.stringify({claim_id:$execution.id,claim_token:$json.body.claim_token})}}"},
+        {"id": "claim-path", "name": "request_path", "type": "string", "value": "={{'/api/integrations/n8n/v1/gmail/deliveries/'+$json.body.delivery_id+'/claim'}}"},
+        {"id": "claim-time", "name": "timestamp", "type": "string", "value": "={{Math.floor(Date.now()/1000).toString()}}"}
+      ]}, "includeOtherFields": false, "options": {}},
+      "id": "gmail-send-prepare-claim", "name": "Prepare Claim", "type": "n8n-nodes-base.set", "typeVersion": 3.4, "position": [220, 0]
+    },
+    {
+      "parameters": {"action": "hash", "binaryData": false, "type": "SHA256", "value": "={{$json.request_body}}", "dataPropertyName": "body_sha256", "encoding": "hex"},
+      "id": "gmail-send-claim-sha", "name": "Hash Claim Body", "type": "n8n-nodes-base.crypto", "typeVersion": 2, "position": [440, 0]
+    },
+    {
+      "parameters": {"action": "generate", "dataPropertyName": "nonce", "encodingType": "hex", "stringLength": 32},
+      "id": "gmail-send-claim-nonce", "name": "Generate Claim Nonce", "type": "n8n-nodes-base.crypto", "typeVersion": 2, "position": [660, 0]
+    },
+    {
+      "parameters": {"mode": "manual", "assignments": {"assignments": [
+        {"id": "claim-canonical", "name": "canonical", "type": "string", "value": "={{'POST\\n'+$json.request_path+'\\n'+$json.timestamp+'\\n'+$json.nonce+'\\n'+$json.body_sha256}}"}
+      ]}, "includeOtherFields": true, "options": {}},
+      "id": "gmail-send-claim-canonical", "name": "Build Claim Canonical", "type": "n8n-nodes-base.set", "typeVersion": 3.4, "position": [880, 0]
+    },
+    {
+      "parameters": {"action": "hmac", "binaryData": false, "type": "SHA256", "value": "={{$json.canonical}}", "dataPropertyName": "signature", "encoding": "hex"},
+      "id": "gmail-send-sign-claim", "name": "Sign Claim", "type": "n8n-nodes-base.crypto", "typeVersion": 2, "position": [1100, 0],
+      "credentials": {"crypto": {"id": "__WORKBENCH_HMAC_CREDENTIAL_ID__", "name": "Workbench HMAC"}}
+    },
+    {
+      "parameters": {"method": "POST", "url": "=http://127.0.0.1:8000/api/integrations/n8n/v1/gmail/deliveries/{{$json.delivery_id}}/claim", "authentication": "none", "sendHeaders": true,
+        "headerParameters": {"parameters": [
+          {"name": "X-N8N-Timestamp", "value": "={{$json.timestamp}}"}, {"name": "X-N8N-Nonce", "value": "={{$json.nonce}}"},
+          {"name": "X-N8N-Signature", "value": "={{$json.signature}}"}, {"name": "X-N8N-Profile", "value": "gmail"}
+        ]}, "sendBody": true, "contentType": "raw", "rawContentType": "application/json", "body": "={{$json.request_body}}", "options": {"timeout": 10000}},
+      "id": "gmail-send-claim", "name": "Claim Delivery", "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.2, "position": [1320, 0]
+    },
+    {
+      "parameters": {"resource": "draft", "operation": "create", "subject": "={{$json.subject}}", "emailType": "text", "message": "={{$json.body_text}}", "options": {"sendTo": "={{$json.recipient}}", "threadId": "={{$json.gmail_thread_id||''}}"}},
+      "id": "gmail-send-create-draft", "name": "Create Gmail Draft", "type": "n8n-nodes-base.gmail", "typeVersion": 2.1, "position": [1540, 0],
+      "credentials": {"gmailOAuth2": {"id": "__GMAIL_CREDENTIAL_ID__", "name": "Workbench Gmail OAuth"}}, "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {"method": "POST", "url": "https://gmail.googleapis.com/gmail/v1/users/me/drafts/send", "authentication": "predefinedCredentialType", "nodeCredentialType": "gmailOAuth2", "sendBody": true, "contentType": "json", "jsonBody": "={{JSON.stringify({id:$json.id})}}", "options": {"timeout": 10000}},
+      "id": "gmail-send-draft", "name": "Send Gmail Draft", "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.2, "position": [1760, -80],
+      "credentials": {"gmailOAuth2": {"id": "__GMAIL_CREDENTIAL_ID__", "name": "Workbench Gmail OAuth"}}, "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {"mode": "manual", "assignments": {"assignments": [
+        {"id": "success-delivery", "name": "delivery_id", "type": "string", "value": "={{$('Claim Delivery').item.json.delivery_id}}"},
+        {"id": "success-body", "name": "request_body", "type": "string", "value": "={{JSON.stringify({result_id:$execution.id+'-sent',result_token:$('Claim Delivery').item.json.result_token,status:'sent',gmail_message_id:$json.id,gmail_thread_id:$json.threadId})}}"},
+        {"id": "success-path", "name": "request_path", "type": "string", "value": "={{'/api/integrations/n8n/v1/gmail/deliveries/'+$('Claim Delivery').item.json.delivery_id+'/result'}}"},
+        {"id": "success-time", "name": "timestamp", "type": "string", "value": "={{Math.floor(Date.now()/1000).toString()}}"}
+      ]}, "includeOtherFields": false, "options": {}},
+      "id": "gmail-send-prepare-success", "name": "Prepare Success Result", "type": "n8n-nodes-base.set", "typeVersion": 3.4, "position": [1980, -120]
+    },
+    {
+      "parameters": {"action": "hash", "binaryData": false, "type": "SHA256", "value": "={{$json.request_body}}", "dataPropertyName": "body_sha256", "encoding": "hex"},
+      "id": "gmail-send-success-sha", "name": "Hash Success Body", "type": "n8n-nodes-base.crypto", "typeVersion": 2, "position": [2200, -120]
+    },
+    {
+      "parameters": {"action": "generate", "dataPropertyName": "nonce", "encodingType": "hex", "stringLength": 32},
+      "id": "gmail-send-success-nonce", "name": "Generate Success Nonce", "type": "n8n-nodes-base.crypto", "typeVersion": 2, "position": [2420, -120]
+    },
+    {
+      "parameters": {"mode": "manual", "assignments": {"assignments": [{"id": "success-canonical", "name": "canonical", "type": "string", "value": "={{'POST\\n'+$json.request_path+'\\n'+$json.timestamp+'\\n'+$json.nonce+'\\n'+$json.body_sha256}}"}]}, "includeOtherFields": true, "options": {}},
+      "id": "gmail-send-success-canonical", "name": "Build Success Canonical", "type": "n8n-nodes-base.set", "typeVersion": 3.4, "position": [2640, -120]
+    },
+    {
+      "parameters": {"action": "hmac", "binaryData": false, "type": "SHA256", "value": "={{$json.canonical}}", "dataPropertyName": "signature", "encoding": "hex"},
+      "id": "gmail-send-sign-success", "name": "Sign Success Result", "type": "n8n-nodes-base.crypto", "typeVersion": 2, "position": [2860, -120],
+      "credentials": {"crypto": {"id": "__WORKBENCH_HMAC_CREDENTIAL_ID__", "name": "Workbench HMAC"}}
+    },
+    {
+      "parameters": {"method": "POST", "url": "=http://127.0.0.1:8000/api/integrations/n8n/v1/gmail/deliveries/{{$json.delivery_id}}/result", "authentication": "none", "sendHeaders": true,
+        "headerParameters": {"parameters": [{"name": "X-N8N-Timestamp", "value": "={{$json.timestamp}}"}, {"name": "X-N8N-Nonce", "value": "={{$json.nonce}}"}, {"name": "X-N8N-Signature", "value": "={{$json.signature}}"}, {"name": "X-N8N-Profile", "value": "gmail"}]},
+        "sendBody": true, "contentType": "raw", "rawContentType": "application/json", "body": "={{$json.request_body}}", "options": {"timeout": 10000}},
+      "id": "gmail-send-success", "name": "Report Success", "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.2, "position": [3080, -120]
+    },
+    {
+      "parameters": {"mode": "manual", "assignments": {"assignments": [
+        {"id": "failure-delivery", "name": "delivery_id", "type": "string", "value": "={{$('Claim Delivery').item.json.delivery_id}}"},
+        {"id": "failure-body", "name": "request_body", "type": "string", "value": "={{JSON.stringify({result_id:$execution.id+'-failed',result_token:$('Claim Delivery').item.json.result_token,status:'failed',error_code:'GMAIL_SEND_FAILED',recoverable:true})}}"},
+        {"id": "failure-path", "name": "request_path", "type": "string", "value": "={{'/api/integrations/n8n/v1/gmail/deliveries/'+$('Claim Delivery').item.json.delivery_id+'/result'}}"},
+        {"id": "failure-time", "name": "timestamp", "type": "string", "value": "={{Math.floor(Date.now()/1000).toString()}}"}
+      ]}, "includeOtherFields": false, "options": {}},
+      "id": "gmail-send-prepare-failure", "name": "Prepare Failure Result", "type": "n8n-nodes-base.set", "typeVersion": 3.4, "position": [1980, 120]
+    },
+    {
+      "parameters": {"action": "hash", "binaryData": false, "type": "SHA256", "value": "={{$json.request_body}}", "dataPropertyName": "body_sha256", "encoding": "hex"},
+      "id": "gmail-send-failure-sha", "name": "Hash Failure Body", "type": "n8n-nodes-base.crypto", "typeVersion": 2, "position": [2200, 120]
+    },
+    {
+      "parameters": {"action": "generate", "dataPropertyName": "nonce", "encodingType": "hex", "stringLength": 32},
+      "id": "gmail-send-failure-nonce", "name": "Generate Failure Nonce", "type": "n8n-nodes-base.crypto", "typeVersion": 2, "position": [2420, 120]
+    },
+    {
+      "parameters": {"mode": "manual", "assignments": {"assignments": [{"id": "failure-canonical", "name": "canonical", "type": "string", "value": "={{'POST\\n'+$json.request_path+'\\n'+$json.timestamp+'\\n'+$json.nonce+'\\n'+$json.body_sha256}}"}]}, "includeOtherFields": true, "options": {}},
+      "id": "gmail-send-failure-canonical", "name": "Build Failure Canonical", "type": "n8n-nodes-base.set", "typeVersion": 3.4, "position": [2640, 120]
+    },
+    {
+      "parameters": {"action": "hmac", "binaryData": false, "type": "SHA256", "value": "={{$json.canonical}}", "dataPropertyName": "signature", "encoding": "hex"},
+      "id": "gmail-send-sign-failure", "name": "Sign Failure Result", "type": "n8n-nodes-base.crypto", "typeVersion": 2, "position": [2860, 120],
+      "credentials": {"crypto": {"id": "__WORKBENCH_HMAC_CREDENTIAL_ID__", "name": "Workbench HMAC"}}
+    },
+    {
+      "parameters": {"method": "POST", "url": "=http://127.0.0.1:8000/api/integrations/n8n/v1/gmail/deliveries/{{$json.delivery_id}}/result", "authentication": "none", "sendHeaders": true,
+        "headerParameters": {"parameters": [{"name": "X-N8N-Timestamp", "value": "={{$json.timestamp}}"}, {"name": "X-N8N-Nonce", "value": "={{$json.nonce}}"}, {"name": "X-N8N-Signature", "value": "={{$json.signature}}"}, {"name": "X-N8N-Profile", "value": "gmail"}]},
+        "sendBody": true, "contentType": "raw", "rawContentType": "application/json", "body": "={{$json.request_body}}", "options": {"timeout": 10000}},
+      "id": "gmail-send-failure", "name": "Report Failure", "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.2, "position": [3080, 120]
+    },
+    {
+      "parameters": {"respondWith": "json", "responseBody": "={{JSON.stringify({accepted:true})}}", "options": {}},
+      "id": "gmail-send-response", "name": "Respond Accepted", "type": "n8n-nodes-base.respondToWebhook", "typeVersion": 1.4, "position": [3300, 0]
+    }
+  ],
+  "connections": {
+    "Webhook": {"main": [[{"node": "Prepare Claim", "type": "main", "index": 0}]]},
+    "Prepare Claim": {"main": [[{"node": "Hash Claim Body", "type": "main", "index": 0}]]},
+    "Hash Claim Body": {"main": [[{"node": "Generate Claim Nonce", "type": "main", "index": 0}]]},
+    "Generate Claim Nonce": {"main": [[{"node": "Build Claim Canonical", "type": "main", "index": 0}]]},
+    "Build Claim Canonical": {"main": [[{"node": "Sign Claim", "type": "main", "index": 0}]]},
+    "Sign Claim": {"main": [[{"node": "Claim Delivery", "type": "main", "index": 0}]]},
+    "Claim Delivery": {"main": [[{"node": "Create Gmail Draft", "type": "main", "index": 0}]]},
+    "Create Gmail Draft": {"main": [[{"node": "Send Gmail Draft", "type": "main", "index": 0}], [{"node": "Prepare Failure Result", "type": "main", "index": 0}]]},
+    "Send Gmail Draft": {"main": [[{"node": "Prepare Success Result", "type": "main", "index": 0}], [{"node": "Prepare Failure Result", "type": "main", "index": 0}]]},
+    "Prepare Success Result": {"main": [[{"node": "Hash Success Body", "type": "main", "index": 0}]]},
+    "Hash Success Body": {"main": [[{"node": "Generate Success Nonce", "type": "main", "index": 0}]]},
+    "Generate Success Nonce": {"main": [[{"node": "Build Success Canonical", "type": "main", "index": 0}]]},
+    "Build Success Canonical": {"main": [[{"node": "Sign Success Result", "type": "main", "index": 0}]]},
+    "Sign Success Result": {"main": [[{"node": "Report Success", "type": "main", "index": 0}]]},
+    "Prepare Failure Result": {"main": [[{"node": "Hash Failure Body", "type": "main", "index": 0}]]},
+    "Hash Failure Body": {"main": [[{"node": "Generate Failure Nonce", "type": "main", "index": 0}]]},
+    "Generate Failure Nonce": {"main": [[{"node": "Build Failure Canonical", "type": "main", "index": 0}]]},
+    "Build Failure Canonical": {"main": [[{"node": "Sign Failure Result", "type": "main", "index": 0}]]},
+    "Sign Failure Result": {"main": [[{"node": "Report Failure", "type": "main", "index": 0}]]},
+    "Report Success": {"main": [[{"node": "Respond Accepted", "type": "main", "index": 0}]]},
+    "Report Failure": {"main": [[{"node": "Respond Accepted", "type": "main", "index": 0}]]}
+  },
+  "settings": {"executionOrder": "v1"}, "staticData": null, "pinData": {}
+}

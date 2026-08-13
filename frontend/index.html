@@ -17,7 +17,7 @@
     <link rel="stylesheet" href="katex.min.css">
     <script src="katex.min.js"></script>
     <script src="auto-render.min.js"></script>
-    <link rel="stylesheet" href="style.css?v=5.17.0-run-inspector">
+    <link rel="stylesheet" href="style.css?v=0.7.0-n8n-agent-governance-beta.1">
 </head>
 <body class="basic-chat-mode">
     <div class="app-container workbench-shell">
@@ -71,6 +71,10 @@
             <nav class="icon-rail" role="navigation" aria-label="主功能導覽">
                 <button class="rail-btn active" id="rail-chat" title="對話" aria-label="對話與歷史紀錄">
                     <i data-lucide="message-square"></i><span class="rail-label">對話</span>
+                </button>
+                <button class="rail-btn" id="rail-workflows" title="工作流程" aria-label="開啟工作流程中心">
+                    <i data-lucide="workflow"></i><span class="rail-label">流程</span>
+                    <span class="rail-notification-badge" id="workflow-rail-badge" aria-hidden="true" hidden>0</span>
                 </button>
                 <button class="rail-btn" id="rail-knowledge" title="知識庫" aria-label="知識庫管理">
                     <i data-lucide="book-open"></i><span class="rail-label">知識庫</span>
@@ -287,6 +291,257 @@
                 </footer>
             </main>
 
+            <!-- n8n 僅負責外部流程；Workbench 保有 Project、Agent、核准與稽核邊界。 -->
+            <main class="workflow-center" id="n8n-workflow-center" aria-labelledby="workflow-center-title" hidden>
+                <header class="workflow-center-header">
+                    <div>
+                        <span class="workflow-eyebrow">WORKBENCH × N8N</span>
+                        <h1 id="workflow-center-title">工作流程</h1>
+                        <p>使用本機 n8n 接收 Gmail 標籤事件；草稿必須回到 Workbench 編輯與核准。</p>
+                    </div>
+                    <button type="button" class="btn btn-secondary compact" id="workflow-refresh">
+                        <i data-lucide="refresh-cw" aria-hidden="true"></i>重新整理
+                    </button>
+                </header>
+
+                <div class="workflow-center-body">
+                    <section class="workflow-card workflow-service-card" aria-labelledby="workflow-service-title">
+                        <div class="workflow-card-head">
+                            <div>
+                                <h2 id="workflow-service-title">本機 n8n 服務</h2>
+                                <p id="workflow-service-detail">正在檢查服務狀態…</p>
+                            </div>
+                            <span class="workflow-status-pill" id="workflow-service-state" role="status">檢查中</span>
+                        </div>
+                        <dl class="workflow-service-metrics" id="workflow-service-metrics"></dl>
+                        <div class="workflow-actions">
+                            <button type="button" class="btn btn-primary compact" id="workflow-service-start">
+                                <i data-lucide="play" aria-hidden="true"></i>啟動 n8n
+                            </button>
+                            <button type="button" class="btn btn-secondary compact" id="workflow-service-stop">
+                                <i data-lucide="square" aria-hidden="true"></i>停止 n8n
+                            </button>
+                            <button type="button" class="btn btn-secondary compact" id="workflow-service-open">
+                                <i data-lucide="external-link" aria-hidden="true"></i>在瀏覽器開啟 n8n
+                            </button>
+                        </div>
+                        <p class="workflow-security-note"><i data-lucide="shield-check" aria-hidden="true"></i>不在 Workbench 內嵌 n8n 編輯器；服務只允許本機回送受控事件。</p>
+                    </section>
+
+                    <section class="workflow-card n8n-plan-mode" aria-labelledby="n8n-plan-title">
+                        <div class="workflow-card-head">
+                            <div>
+                                <span class="workflow-eyebrow">PLAN MODE</span>
+                                <h2 id="n8n-plan-title">Agent n8n 操作助理</h2>
+                                <p>規劃與問題是執行前的安全層；Agent 會先說明方案、結果、風險與權限，再建立可執行的待核准提案。</p>
+                            </div>
+                            <span class="workflow-status-pill" id="n8n-plan-state" role="status" aria-live="polite">尚未開始</span>
+                        </div>
+                        <div class="n8n-plan-layout">
+                            <div class="n8n-plan-conversation">
+                                <div id="n8n-plan-messages" class="n8n-plan-messages" role="log" aria-live="polite" aria-relevant="additions text" aria-label="n8n 規劃對話">
+                                    <article class="n8n-plan-message is-agent">
+                                        <strong>Agent</strong>
+                                        <p>請描述你想完成的流程。我會先說明可行做法、可能結果、風險與需要開放的權限。</p>
+                                    </article>
+                                </div>
+                                <div id="n8n-plan-options" class="n8n-plan-options" role="group" aria-label="Agent 建議選項" hidden></div>
+                                <form id="n8n-plan-form" class="workflow-form n8n-plan-form">
+                                    <label for="n8n-plan-session">
+                                        <span>操作 Session</span>
+                                        <select id="n8n-plan-session" required>
+                                            <option value="">請先選擇此 Project 的 Session</option>
+                                        </select>
+                                        <small>計畫、提案與核准都會固定綁定此 Session，避免跨 Project 操作。</small>
+                                    </label>
+                                    <label for="n8n-plan-input">
+                                        <span>告訴 Agent 你想完成甚麼</span>
+                                        <textarea id="n8n-plan-input" maxlength="4000" rows="3" placeholder="例如：收到指定客戶的 Gmail 後，整理內容並建立回覆草稿。" required></textarea>
+                                        <small>Shift+Enter 換行。本階段先整理方案；建立並核准提案後，Broker 才會實際操作 n8n。</small>
+                                    </label>
+                                    <div class="workflow-actions workflow-actions-end">
+                                        <button type="button" class="btn btn-secondary" id="n8n-plan-reset" disabled>重新規劃</button>
+                                        <button type="submit" class="btn btn-primary" id="n8n-plan-send">
+                                            <i data-lucide="send" aria-hidden="true"></i>送出給 Agent
+                                        </button>
+                                    </div>
+                                </form>
+                            </div>
+                            <aside id="n8n-plan-impact" class="n8n-plan-impact" aria-label="規劃影響摘要" hidden>
+                                <section class="n8n-plan-impact-card is-risk" aria-labelledby="n8n-plan-risks-title">
+                                    <h3 id="n8n-plan-risks-title"><i data-lucide="triangle-alert" aria-hidden="true"></i>可能風險</h3>
+                                    <ul id="n8n-plan-risks"></ul>
+                                </section>
+                                <section class="n8n-plan-impact-card" aria-labelledby="n8n-plan-outcomes-title">
+                                    <h3 id="n8n-plan-outcomes-title"><i data-lucide="git-branch" aria-hidden="true"></i>可能結果</h3>
+                                    <ul id="n8n-plan-outcomes"></ul>
+                                </section>
+                                <section class="n8n-plan-impact-card is-permission" aria-labelledby="n8n-plan-permissions-title">
+                                    <h3 id="n8n-plan-permissions-title"><i data-lucide="key-round" aria-hidden="true"></i>需要的權限</h3>
+                                    <ul id="n8n-plan-permissions"></ul>
+                                </section>
+                            </aside>
+                        </div>
+                        <div id="n8n-plan-proposal-confirm" class="n8n-plan-proposal-confirm" hidden>
+                            <div>
+                                <strong>建立操作提案前確認</strong>
+                                <p id="n8n-plan-proposal-summary">這一步只會建立可執行的待核准提案；核准後 Broker 才會依提案內容實際操作 n8n。</p>
+                            </div>
+                            <label class="n8n-plan-confirm-row" for="n8n-plan-proposal-ack">
+                                <input type="checkbox" id="n8n-plan-proposal-ack">
+                                <span>我已閱讀風險、可能結果與所需權限，並同意建立此提案。</span>
+                            </label>
+                            <div class="workflow-actions workflow-actions-end">
+                                <button type="button" class="btn btn-primary" id="n8n-plan-propose" disabled>建立可執行操作提案</button>
+                            </div>
+                        </div>
+                    </section>
+
+                    <section class="workflow-card n8n-agent-governance" aria-labelledby="n8n-agent-policy-title">
+                        <div class="workflow-card-head">
+                            <div>
+                                <h2 id="n8n-agent-policy-title">Agent 管理權限</h2>
+                                <p>以 Project 隔離 n8n 管理能力；Secret 永遠不會交給 Agent。</p>
+                            </div>
+                            <span class="workflow-status-pill" id="n8n-agent-policy-state">限制權限</span>
+                        </div>
+                        <form id="n8n-agent-policy-form" class="workflow-form">
+                            <div class="workflow-grid n8n-agent-policy-grid">
+                                <label><span>Project</span><select id="n8n-agent-project" required><option value="">請選擇 Project</option></select></label>
+                                <label><span>權限模式</span><select id="n8n-agent-mode"><option value="off">停用</option><option value="restricted">限制權限</option><option value="full_audit">完整管理／完全審核</option></select></label>
+                                <label><span>完整模式有效期限</span><select id="n8n-agent-duration"><option value="one_hour">一小時</option><option value="session">目前 Session</option><option value="persistent">直到手動關閉</option><option value="smart">智慧模式（閒置 30 分鐘自動降級）</option></select></label>
+                            </div>
+                            <div class="workflow-risk-callout" id="n8n-agent-risk-callout" role="alert">
+                                <strong>風險提醒</strong>
+                                <ul><li>發布、執行或刪除流程可能改變外部服務。</li><li>完整模式仍需逐次核准，不能讓 Agent 自行提高權限。</li><li>Code、命令、檔案與 Community Node 需要隔離 runner 及雙重核准。</li></ul>
+                            </div>
+                            <label class="workflow-switch-row"><span><strong>我了解完整管理風險</strong><small>只有切換到完整管理時需要勾選。</small></span><input type="checkbox" id="n8n-agent-ack"></label>
+                            <div class="workflow-actions workflow-actions-end"><span class="workflow-save-state" id="n8n-agent-policy-message" aria-live="polite"></span><button type="submit" class="btn btn-primary" id="n8n-agent-policy-save">儲存 Agent 權限</button></div>
+                        </form>
+                        <details class="n8n-agent-api-key-panel"><summary>設定 Workbench 專用 n8n API Key</summary><form id="n8n-agent-api-key-form" class="workflow-form"><label><span>API Key</span><input type="password" id="n8n-agent-api-key" autocomplete="new-password" required minlength="16"><small>只會以 DPAPI 保存；不會出現在 Prompt、Log 或稽核。</small></label><div class="workflow-actions workflow-actions-end"><button class="btn btn-secondary" type="submit">安全儲存</button></div></form></details>
+                    </section>
+
+                    <div class="workflow-grid n8n-agent-lists">
+                        <section class="workflow-card" aria-labelledby="n8n-managed-workflows-title"><div class="workflow-card-head"><div><h2 id="n8n-managed-workflows-title">受治理的 Workflows</h2><p>系統 Gmail 流程受到保護，Agent 不可修改。</p></div><span id="n8n-managed-workflows-count" class="workflow-run-count">0 筆</span></div><div id="n8n-managed-workflows-list" class="mail-run-list" aria-live="polite"><div class="workflow-empty">尚未載入。</div></div></section>
+                        <section class="workflow-card" aria-labelledby="n8n-operation-requests-title"><div class="workflow-card-head"><div><h2 id="n8n-operation-requests-title">操作與待核准</h2><p>點選操作可在右上檢查器查看 Diff、風險並核准。</p></div><span id="n8n-operation-requests-count" class="workflow-run-count">0 筆</span></div><div id="n8n-operation-requests-list" class="mail-run-list" aria-live="polite"><div class="workflow-empty">尚無操作。</div></div></section>
+                    </div>
+
+                    <section class="workflow-card" aria-labelledby="n8n-agent-audits-title"><div class="workflow-card-head"><div><h2 id="n8n-agent-audits-title">完整稽核紀錄</h2><p>只保存安全摘要與 digest，不保存 Secret。</p></div></div><div id="n8n-agent-audits-list" class="mail-run-list" aria-live="polite"><div class="workflow-empty">尚無稽核紀錄。</div></div></section>
+
+                    <div class="workflow-grid">
+                        <section class="workflow-card" aria-labelledby="mail-profile-title">
+                            <div class="workflow-card-head">
+                                <div>
+                                    <h2 id="mail-profile-title">Gmail Mail Profile</h2>
+                                    <p>Reply 與新郵件共用同一個 Project、Skills、references 與核准政策。</p>
+                                </div>
+                                <span class="workflow-save-state" id="mail-profile-save-state" aria-live="polite"></span>
+                            </div>
+                            <form id="mail-profile-form" class="workflow-form">
+                                <label>
+                                    <span>觸發標籤</span>
+                                    <input id="mail-profile-label" value="Workbench-Agent" readonly aria-readonly="true">
+                                    <small>將此標籤加到 Gmail 郵件後，n8n 才會建立 Reply 草稿。</small>
+                                </label>
+                                <label>
+                                    <span>Canary 收件者</span>
+                                    <input id="mail-profile-recipient" placeholder="由本機安全設定提供" readonly aria-readonly="true">
+                                    <small>Reply 與新郵件都不能改成其他地址。</small>
+                                </label>
+                                <label>
+                                    <span>Workbench Project</span>
+                                    <select id="mail-profile-project" required>
+                                        <option value="">請選擇專案</option>
+                                    </select>
+                                    <small>只會載入這個 Project 啟用的 Skills 與 references。</small>
+                                </label>
+                                <label>
+                                    <span>Agent 工作指示</span>
+                                    <textarea id="mail-profile-instruction" rows="6" maxlength="4000" required placeholder="例如：以繁體中文撰寫簡潔、禮貌且不承諾未確認事項的郵件。"></textarea>
+                                    <small><span id="mail-profile-instruction-count">0</span> / 4000 字</small>
+                                </label>
+                                <label>
+                                    <span>預設模型</span>
+                                    <select id="mail-profile-model">
+                                        <option value="">使用 Workbench 預設模型</option>
+                                    </select>
+                                    <small>模型選項只來自目前可用的聊天模型；可在建立新郵件時暫時覆寫。</small>
+                                </label>
+                                <label class="workflow-switch-row">
+                                    <span>
+                                        <strong>啟用 Gmail 標籤流程</strong>
+                                        <small>停用只會停止建立新草稿，不會刪除既有執行紀錄。</small>
+                                    </span>
+                                    <input type="checkbox" id="mail-profile-enabled" role="switch">
+                                </label>
+                                <label class="workflow-switch-row">
+                                    <span>
+                                        <strong>隨 Workbench 啟動 n8n</strong>
+                                        <small>預設關閉。只有需要 Gmail 排程在 Workbench 開啟期間持續執行時才啟用。</small>
+                                    </span>
+                                    <input type="checkbox" id="mail-profile-auto-start" role="switch">
+                                </label>
+                                <div class="workflow-actions workflow-actions-end">
+                                    <button type="submit" class="btn btn-primary" id="mail-profile-save">儲存 Mail Profile</button>
+                                </div>
+                            </form>
+                        </section>
+
+                        <section class="workflow-card" aria-labelledby="mail-compose-title">
+                            <div class="workflow-card-head">
+                                <div>
+                                    <h2 id="mail-compose-title">建立新郵件草稿</h2>
+                                    <p>由 Workbench 建立新信；不需要先收到 Gmail 郵件。</p>
+                                </div>
+                            </div>
+                            <form id="mail-compose-form" class="workflow-form">
+                                <label>
+                                    <span>收件者</span>
+                                    <input id="mail-compose-recipient" placeholder="由本機安全設定提供" readonly aria-readonly="true">
+                                </label>
+                                <label>
+                                    <span>主旨（選填）</span>
+                                    <input id="mail-compose-subject" maxlength="240" autocomplete="off" placeholder="留白時由 Agent 產生">
+                                </label>
+                                <label>
+                                    <span>撰寫指示</span>
+                                    <textarea id="mail-compose-instruction" rows="8" maxlength="12000" required placeholder="描述收信情境、希望傳達的重點、語氣及其他限制；這裡不是最終郵件正文。"></textarea>
+                                    <small>Agent 會依此指示產生草稿；最終正文需在右上檢查器確認。</small>
+                                </label>
+                                <label>
+                                    <span>本次模型（選填）</span>
+                                    <select id="mail-compose-model">
+                                        <option value="">使用 Mail Profile 預設模型</option>
+                                    </select>
+                                </label>
+                                <div class="workflow-locked-summary">
+                                    <i data-lucide="lock-keyhole" aria-hidden="true"></i>
+                                    <span>收件者、附件與 Project 來源在建立後鎖定；主旨與正文可在核准前編輯。</span>
+                                </div>
+                                <div class="workflow-actions workflow-actions-end">
+                                    <button type="submit" class="btn btn-primary" id="mail-compose-create">
+                                        <i data-lucide="mail-plus" aria-hidden="true"></i>建立待核准草稿
+                                    </button>
+                                </div>
+                            </form>
+                        </section>
+                    </div>
+
+                    <section class="workflow-card" aria-labelledby="mail-runs-title">
+                        <div class="workflow-card-head">
+                            <div>
+                                <h2 id="mail-runs-title">最近郵件執行</h2>
+                                <p>背景事件只更新數量；必須由你選取紀錄，才會切換右上浮動檢查器。</p>
+                            </div>
+                            <span class="workflow-run-count" id="mail-runs-count">0 筆</span>
+                        </div>
+                        <div class="mail-run-list" id="mail-runs-list" aria-live="polite">
+                            <div class="workflow-empty">尚無郵件執行紀錄。</div>
+                        </div>
+                    </section>
+                </div>
+            </main>
+
             <!-- ================= Agent 協作側欄 ================= -->
             <aside class="agent-collaboration-panel" id="agent-collaboration-panel" aria-label="Agent 協作" hidden>
                 <div class="agent-collaboration-resizer" id="agent-collaboration-resizer" role="separator" aria-label="拖曳調整 Agent 協作面板寬度" aria-orientation="vertical" tabindex="0">
@@ -464,12 +719,14 @@
                     <div class="run-inspector-content" id="run-execution-content" aria-live="polite">
                         <div class="output-panel-empty">尚無執行紀錄</div>
                     </div>
+                    <div class="mail-inspector-content" id="mail-inspector-execution" aria-live="polite" hidden></div>
                 </section>
                 <section class="output-panel-pane" id="output-pane-results" role="tabpanel"
                     aria-labelledby="output-tab-results" tabindex="0" hidden>
                     <div class="run-inspector-content" id="run-results-content" aria-live="polite">
                         <div class="output-panel-empty">尚無結果</div>
                     </div>
+                    <div class="mail-inspector-content" id="mail-inspector-results" aria-live="polite" hidden></div>
                 </section>
             </div>
         </aside>
@@ -485,6 +742,7 @@
                 <i data-lucide="activity" aria-hidden="true"></i>
                 <span>執行</span>
                 <span class="output-tab-badge" id="output-tab-execution-badge" hidden>0</span>
+                <span class="output-tab-badge is-warning mail-approval-badge" id="mail-approval-badge" aria-hidden="true" hidden>0</span>
             </button>
             <button type="button" class="output-floating-tab" id="output-tab-results" role="tab"
                 aria-controls="output-pane-results" aria-selected="false" aria-expanded="false" tabindex="-1" title="顯示或隱藏結果與變更">
@@ -1507,7 +1765,9 @@
     <script src="basic-chat-mode.js?v=1.0.2-sidebar-contract"></script>
     <script src="project-skills-sidebar.js?v=1.2.1-add-menu-a11y"></script>
     <script src="run-inspector.js?v=1.0.0"></script>
+    <script src="n8n-workflows.js?v=0.7.0-n8n-agent-governance-beta.1"></script>
+    <script src="n8n-agent-governance.js?v=0.7.0-n8n-agent-governance-beta.1"></script>
     <script src="hermes-settings.js?v=1.1.2-hover-help-dom"></script>
-    <script src="app.js?v=5.15.0-run-inspector"></script>
+    <script src="app.js?v=0.7.0-n8n-agent-governance-beta.1"></script>
 </body>
 </html>

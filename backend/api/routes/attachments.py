@@ -23,6 +23,7 @@ def build_attachments_router(
     project_attachments_dir: Callable[..., Any],
     extract_pdf_text: Callable[[str], str],
     sync_session_archive: Callable[[str], bool],
+    session_access_guard: Optional[Callable[[str, str], None]] = None,
 ) -> APIRouter:
     router = APIRouter(tags=["attachments"])
 
@@ -33,6 +34,8 @@ def build_attachments_router(
         session_id: Optional[str] = Form(None),
     ):
         filename = os.path.basename(file.filename or "temporary_context")
+        if session_id and session_access_guard is not None:
+            session_access_guard(session_id, "temporary_context")
         if session_id and not database.get_session(session_id):
             raise HTTPException(
                 status_code=404,
@@ -98,15 +101,24 @@ def build_attachments_router(
                     recoverable=False,
                 ),
             )
+        session_id = str(context.get("session_id") or "")
+        if session_id and session_access_guard is not None:
+            session_access_guard(session_id, "temporary_context_read")
         return context
 
     @router.delete("/api/temp-contexts/{temporary_context_id}")
     def delete_temp_context(temporary_context_id: str):
+        context = database.get_temporary_context(temporary_context_id)
+        session_id = str((context or {}).get("session_id") or "")
+        if session_id and session_access_guard is not None:
+            session_access_guard(session_id, "temporary_context_delete")
         return {"success": database.delete_temporary_context(temporary_context_id)}
 
     @router.post("/api/attachments")
     def create_attachment(request: AttachmentRequest):
         try:
+            if request.session_id and session_access_guard is not None:
+                session_access_guard(request.session_id, "attachment")
             raw = request.data.split(",", 1)[1] if "," in request.data else request.data
             data = base64.b64decode(raw, validate=True)
             attachment_id = create_id("att")
@@ -157,6 +169,9 @@ def build_attachments_router(
                     recoverable=False,
                 ),
             )
+        session_id = str(attachment.get("session_id") or "")
+        if session_id and session_access_guard is not None:
+            session_access_guard(session_id, "attachment_read")
         return attachment
 
     return router

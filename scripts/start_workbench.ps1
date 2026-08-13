@@ -38,7 +38,7 @@ $hermesProjectsRoot = Join-Path $projectRoot "projects"
 $hermesStartScript = Join-Path $projectRoot "scripts\start_hermes_sidecar.ps1"
 $hermesProductionOps = Join-Path $projectRoot "scripts\hermes_production_ops.py"
 $backendUrl = "http://127.0.0.1:$BackendPort"
-$frontendVersion = "5.13.5-project-skills-hermes"
+$frontendVersion = "0.7.0-n8n-agent-governance-beta.1"
 $websiteUrl = "$backendUrl/index.html?v=$frontendVersion"
 $discoveryConfigPath = Join-Path $runtimeDir "server-discovery-config.json"
 $discoveryCachePath = Join-Path $runtimeDir "server-discovery-cache.json"
@@ -651,6 +651,36 @@ function Stop-OwnedProcess {
     catch { Write-LauncherLog "Cleanup warning for process $($Process.Id): $($_.Exception.Message)" }
 }
 
+function Stop-ManagedN8nBeforeBackend {
+    if ($null -eq $backendProcess) { return }
+    try {
+        if ($backendProcess.HasExited) { return }
+    }
+    catch { return }
+
+    $tokenPath = Join-Path $hermesDatabaseRoot "workbench-session-token"
+    if (-not (Test-Path -LiteralPath $tokenPath -PathType Leaf)) {
+        Write-LauncherLog "n8n shutdown skipped because the Workbench session token is unavailable."
+        return
+    }
+    try {
+        $sessionToken = (Get-Content -LiteralPath $tokenPath -Raw -ErrorAction Stop).Trim()
+        if ([string]::IsNullOrWhiteSpace($sessionToken)) { throw "session token is empty" }
+        $headers = @{ "X-Workbench-Token" = $sessionToken }
+        # The managed lifecycle allows up to 35 seconds for n8n's graceful
+        # shutdown before it re-verifies ownership and force-stops the exact
+        # process tree.  Keep the HTTP client deadline above that server-side
+        # bound; a shorter deadline leaves an owned n8n process orphaned while
+        # the Workbench backend is torn down.
+        Invoke-RestMethod -Method Post -Uri "$backendUrl/api/integrations/n8n/stop" `
+            -Headers $headers -TimeoutSec 50 -ErrorAction Stop | Out-Null
+        Write-LauncherLog "Workbench-owned n8n stopped before backend shutdown."
+    }
+    catch {
+        Write-LauncherLog "n8n graceful shutdown warning: $($_.Exception.Message)"
+    }
+}
+
 function Stop-HermesSidecar {
     param([System.Diagnostics.Process]$Process)
     if ($null -eq $Process) { return }
@@ -757,8 +787,32 @@ function Get-HermesLaunchPlan {
     return $plan
 }
 
-function Start-ManagedHermesSidecar {
+function Initialize-HermesBackendEnvironment {
     $script:hermesLaunchPlan = Get-HermesLaunchPlan
+    if (-not [bool]$script:hermesLaunchPlan.enabled) {
+        [Environment]::SetEnvironmentVariable("HERMES_API_SERVER_KEY", $null, "Process")
+        return
+    }
+    $apiKeyPath = Join-Path $hermesRuntimeDir "secrets\api_server.key"
+    if (-not (Test-Path -LiteralPath $apiKeyPath -PathType Leaf)) {
+        throw "Hermes launch plan is enabled but its reviewed API key is unavailable."
+    }
+    $apiKey = ([System.IO.File]::ReadAllText($apiKeyPath)).Trim()
+    if ($apiKey.Length -lt 43 -or $apiKey -match "[\r\n\s]") {
+        throw "Hermes API key is malformed."
+    }
+    # The launch-plan resolver has already verified that the receipt points to
+    # this exact runtime key.  Preload it so the backend can become available
+    # while the optional Docker sidecar completes its readiness gate.
+    $env:HERMES_API_SERVER_KEY = $apiKey
+    $script:hermesEnvironmentManaged = $true
+}
+
+function Start-ManagedHermesSidecar {
+    param([switch]$UseResolvedPlan)
+    if (-not $UseResolvedPlan -or $null -eq $script:hermesLaunchPlan) {
+        $script:hermesLaunchPlan = Get-HermesLaunchPlan
+    }
     if (-not [bool]$script:hermesLaunchPlan.enabled) {
         $script:hermesProcess = $null
         $script:hermesHealthFailureCount = 0
@@ -1087,7 +1141,7 @@ try {
         Write-LauncherLog "Startup screen opened; loading backend services."
     }
 
-    Start-ManagedHermesSidecar
+    Initialize-HermesBackendEnvironment
 
     $backendArgs = @("-m", "uvicorn", "app:app", "--app-dir", "backend", "--host", "127.0.0.1", "--port", "$BackendPort")
     $backendProcess = Start-Process -FilePath $pythonPath -ArgumentList $backendArgs -WorkingDirectory $projectRoot -WindowStyle Hidden -RedirectStandardOutput $backendOut -RedirectStandardError $backendErr -PassThru
@@ -1106,7 +1160,18 @@ try {
         Add-ProcessToJob -Job $jobHandle -Process $backendWorker
         $backendWorker.PriorityClass = [Diagnostics.ProcessPriorityClass]::BelowNormal
     }
-    Write-LauncherLog "Workbench is ready; the startup screen will enter $websiteUrl"
+    Write-LauncherLog "Workbench core is ready; the startup screen will enter $websiteUrl"
+
+    # Hermes is optional for the shell, settings, projects, and basic chat.
+    # Start it only after the backend is reachable so its Docker readiness gate
+    # no longer holds the entire UI on the loading screen.
+    try {
+        Start-ManagedHermesSidecar -UseResolvedPlan
+    }
+    catch {
+        Write-LauncherLog "Hermes remained unavailable after core startup: $($_.Exception.Message)"
+        $script:hermesProcess = $null
+    }
 
     if ($SmokeTest) { Write-LauncherLog "Smoke test passed."; exit 0 }
     if ($NoBrowser) {
@@ -1136,6 +1201,7 @@ catch {
     exit 1
 }
 finally {
+    Stop-ManagedN8nBeforeBackend
     Stop-OwnedProcess -Process $browserProcess
     Stop-OwnedProcess -Process $frontendWorker
     Stop-OwnedProcess -Process $backendWorker

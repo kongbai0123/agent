@@ -1351,16 +1351,18 @@ async function initApp() {
     }
     safeCreateIcons();
 
-    // 1. 檢查後端與 Ollama 狀態
-    const status = await checkSystemStatus();
+    // 1. 系統狀態與專案資料互不相依，並行載入以縮短首屏等待。
+    const statusPromise = checkSystemStatus();
+    const sessionsPromise = loadSessions();
+    const status = await statusPromise;
     if (getOllamaConnectionStatus(status) === 'connected') {
         await loadModels();
     } else {
         showSystemWarning('Ollama 未連線');
     }
 
-    // 2. 載入對話歷史會話與知識庫狀態
-    await loadSessions();
+    // 2. 確保側欄資料完成，再啟用完整 Workbench 控制器。
+    await sessionsPromise;
     loadRagStatus(); // P1-2
 
     // 3. 載入第十階段高階功能控制器
@@ -1653,6 +1655,7 @@ async function loadModels() {
             sendBtn.disabled = true;
             updateWelcomeDashboard();
         }
+        window.workbenchN8nWorkflows?.refreshModels?.();
         return data;
     } catch (e) {
         console.error('Failed to load models:', e);
@@ -1914,6 +1917,8 @@ async function loadSessions(searchVal = '') {
         syncRunInspectorContext(currentSession?.project_id || null, currentSession?.project_name || '');
         renderSidebar();
         renderProjectSwitcher();
+        window.workbenchN8nWorkflows?.refreshProjects?.();
+        window.workbenchN8nGovernance?.refreshProjects?.();
         safeCreateIcons();
     } catch (e) {
         console.error('Failed to load sessions:', e);
@@ -6550,6 +6555,36 @@ function initA11y() {
     });
 }
 
+let primaryWorkspace = 'chat';
+
+function setPrimaryWorkspace(workspace = 'chat') {
+    const workflowMode = workspace === 'workflows';
+    const chatWorkspace = document.querySelector('main.chat-container');
+    const workflowCenter = document.getElementById('n8n-workflow-center');
+    const drawer = document.getElementById('chat-drawer');
+    const railChat = document.getElementById('rail-chat');
+    const railWorkflows = document.getElementById('rail-workflows');
+    if (!chatWorkspace || !workflowCenter || !drawer || !railChat || !railWorkflows) return;
+
+    primaryWorkspace = workflowMode ? 'workflows' : 'chat';
+    chatWorkspace.hidden = workflowMode;
+    workflowCenter.hidden = !workflowMode;
+    drawer.hidden = workflowMode;
+    railChat.classList.toggle('active', !workflowMode);
+    railWorkflows.classList.toggle('active', workflowMode);
+    railChat.setAttribute('aria-current', workflowMode ? 'false' : 'page');
+    railWorkflows.setAttribute('aria-current', workflowMode ? 'page' : 'false');
+
+    if (workflowMode) {
+        closeInspectorPanel();
+        closeAgentCollaboration(true);
+        return;
+    }
+
+    window.workbenchN8nWorkflows?.close?.();
+    window.workbenchN8nWorkflows?.useChatInspectorContext?.({ open: false });
+}
+
 // ---- Workbench 初始化 ----
 function initWorkbench(status) {
     window.workbenchExtensions?.init({
@@ -6573,12 +6608,35 @@ function initWorkbench(status) {
         inferModelKind: inferredProviderModelKind,
         createIcons: safeCreateIcons
     });
+    window.workbenchN8nWorkflows?.init({
+        apiFetch,
+        apiBase: API_BASE,
+        showToast,
+        createIcons: safeCreateIcons,
+        getProjects: () => sidebarProjects,
+        getActiveProjectId: () => activeProjectId,
+        getModels: () => Array.from(modelSelect.options)
+            .filter(option => option.value)
+            .map(option => ({ value: option.value, label: option.textContent || option.value })),
+        onWorkspaceOpen: () => setPrimaryWorkspace('workflows')
+    });
+    window.workbenchN8nGovernance?.init({
+        apiFetch,
+        apiBase: API_BASE,
+        showToast,
+        createIcons: safeCreateIcons,
+        getProjects: () => sidebarProjects,
+        getSessions: () => sidebarSessions,
+        getActiveProjectId: () => activeProjectId,
+        getCurrentSessionId: () => currentSessionId,
+    });
     // Rail 導覽
     const drawer = document.getElementById('chat-drawer');
     document.getElementById('rail-chat').addEventListener('click', () => {
+        setPrimaryWorkspace('chat');
         drawer.classList.remove('collapsed');
-        document.getElementById('rail-chat').classList.add('active');
     });
+    document.getElementById('rail-workflows').addEventListener('click', () => window.workbenchN8nWorkflows?.open?.());
     document.getElementById('chat-drawer-close').addEventListener('click', () => {
         if (window.matchMedia('(max-width: 900px)').matches) {
             drawer.classList.add('collapsed');
@@ -6601,6 +6659,7 @@ function initWorkbench(status) {
     document.getElementById('rail-cloud-llm').addEventListener('click', () => window.workbenchCloudLlm?.open());
     document.getElementById('rail-extensions').addEventListener('click', () => window.workbenchExtensions?.open('installed'));
     document.getElementById('rail-settings').addEventListener('click', () => document.getElementById('btn-settings-trigger').click());
+    setPrimaryWorkspace('chat');
 
     // Top Bar chips 點擊行為（P3.3）
     document.getElementById('chip-model').addEventListener('click', () => openModelManager('installed'));

@@ -1,6 +1,6 @@
 # Local AI Workbench
 
-Windows 本機優先的 AI 聊天工作台。現行版本以 Basic Chat 為主體，並提供可選的 Hermes sidecar、專案隔離的 Project Skills、附件、Session 與輸出面板。
+Windows 本機優先的 AI 聊天工作台。現行版本以 Basic Chat 為主體，並提供可選的 Hermes sidecar、專案隔離的 Project Skills、附件、Session、輸出面板，以及受治理的本機 n8n／Gmail 整合。
 
 ## 目前功能
 
@@ -12,15 +12,18 @@ Windows 本機優先的 AI 聊天工作台。現行版本以 Basic Chat 為主�
 - Hermes 以獨立 loopback sidecar 漸進接入，不取代 Workbench UI
 - Hermes 生產化監控、熔斷、回退與 Canary → 5% → 25% → 50% → 全量 rollout
 - Hermes Project Skills 工具限 Docker、單一專案、唯讀政策
+- Sidebar「流程」提供受管理的本機 n8n 生命週期、Gmail 草稿與人工核准
+- Agent 可先提出 n8n 操作方案、風險、預期結果與權限需求；使用者核准不可變 Diff 後才由 Broker 執行
+- n8n API Key、Gmail OAuth 與郵件密文只保存在本機安全邊界，不會提供給模型
 - 執行資料、對話、附件、資料庫、模型與本機設定不納入 Git
 
 ## 目錄
 
 ```text
-backend/      FastAPI、Basic Chat、Project Skills、Hermes 與資料存取
-frontend/     Workbench UI 與輸出 Skills 面板
-config/       Hermes 固定版本與安全政策模板
-scripts/      Windows 啟動、更新、Hermes 安裝與維運工具
+backend/      FastAPI、Basic Chat、Project Skills、Hermes、n8n Broker 與資料存取
+frontend/     Workbench UI、流程工作區與浮動檢查器
+config/       Hermes 與 n8n 固定版本、安全政策及 Workflow 模板
+scripts/      Windows 啟動、更新、Hermes／n8n 安裝與維運工具
 tests/        離線、可重現的契約與整合測試
 docs/         現行維運與安全說明
 launcher/     Windows 啟動器原始碼
@@ -30,7 +33,7 @@ projects/     使用者專案資料（Git 排除）
 
 ## Windows 啟動
 
-需求：Windows 10/11、Python 3.11、Node.js 20（僅開發檢查需要）、已安裝的 Ollama 或其他 OpenAI-compatible 服務。
+需求：Windows 10/11、Python 3.11、Node.js 20（開發檢查）；啟用受管理 n8n 時另使用固定的 Node.js 24.15.0 與 n8n 2.32.5。模型可使用 Ollama 或其他 OpenAI-compatible 服務。
 
 ```powershell
 py -3.11 -m venv .venv
@@ -64,6 +67,12 @@ Hermes 是可選服務。預設關閉；未安裝、健康檢查失敗、能力�
 
 生產操作、升級條件、監控與回退方式請參閱 [Hermes 生產化手冊](docs/HERMES_PRODUCTION_RUNBOOK.md)。
 
+## n8n 與 Gmail
+
+n8n 是獨立的本機 loopback 服務。Workbench 不會讓 Agent 直接取得 n8n API Key、Gmail OAuth Token 或管理介面權限；Agent 只建立 Project／Session 綁定的結構化提案，伺服器重新計算 Workflow 快照、Diff、風險與 digest，人工核准後才由 Broker 執行。Gmail V1 的固定收件者由本機 `WORKBENCH_N8N_GMAIL_RECIPIENT` 提供，不寫入公開原始碼；未設定時郵件整合會安全停用。
+
+預設採限制權限。高風險節點、任意 Workflow 執行與 Credential 管理在對應隔離／Project ownership 尚未就緒時 fail closed。系統管理的 Gmail Workflows 永遠受保護。安裝、設定、操作與故障處理請參閱 [n8n Agent 治理手冊](docs/N8N_AGENT_GOVERNANCE.md)。
+
 ## 驗證
 
 ```powershell
@@ -89,5 +98,6 @@ GitHub Actions 使用同一份 hashed dependency lock，並上傳 JUnit 與 depe
 ## 相關文件
 
 - [Hermes 生產化與分批啟用](docs/HERMES_PRODUCTION_RUNBOOK.md)
+- [n8n Agent 治理與 Gmail 整合](docs/N8N_AGENT_GOVERNANCE.md)
 - [依賴安全稽核](docs/DEPENDENCY_AUDIT.md)
 - [Windows 啟動器與更新器](docs/WINDOWS_LAUNCHER_AND_UPDATER.md)

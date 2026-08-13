@@ -80,6 +80,171 @@ def _ensure_capability_audit_schema(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_capability_audits_run ON capability_audits(run_id, created_at)")
 
 
+def _ensure_n8n_gmail_schema(conn: sqlite3.Connection) -> None:
+    """Create the additive, private persistence used by the Gmail bridge."""
+
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS n8n_gmail_profiles (
+            profile_id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            workflow_key TEXT NOT NULL,
+            required_label TEXT NOT NULL,
+            fixed_recipient TEXT NOT NULL,
+            instruction_ciphertext TEXT,
+            default_model TEXT,
+            enabled INTEGER NOT NULL DEFAULT 0,
+            auto_start INTEGER NOT NULL DEFAULT 0,
+            retention_days INTEGER NOT NULL DEFAULT 30,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            CHECK (profile_id = 'gmail'),
+            CHECK (retention_days BETWEEN 1 AND 3650)
+        );
+
+        CREATE TABLE IF NOT EXISTS n8n_gmail_nonces (
+            profile_id TEXT NOT NULL,
+            nonce TEXT NOT NULL,
+            method TEXT,
+            path TEXT,
+            request_timestamp INTEGER,
+            request_sha256 TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (profile_id, nonce)
+        );
+        CREATE INDEX IF NOT EXISTS idx_n8n_gmail_nonces_expiry
+            ON n8n_gmail_nonces(expires_at);
+
+        CREATE TABLE IF NOT EXISTS n8n_gmail_threads (
+            thread_id TEXT PRIMARY KEY,
+            profile_id TEXT NOT NULL,
+            project_id TEXT NOT NULL,
+            session_id TEXT NOT NULL UNIQUE,
+            gmail_thread_id TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            tombstoned_at TEXT,
+            UNIQUE (profile_id, gmail_thread_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_n8n_gmail_threads_project
+            ON n8n_gmail_threads(project_id, updated_at DESC);
+
+        CREATE TABLE IF NOT EXISTS n8n_gmail_events (
+            event_id TEXT PRIMARY KEY,
+            profile_id TEXT NOT NULL,
+            project_id TEXT NOT NULL,
+            gmail_message_id TEXT NOT NULL,
+            gmail_thread_id TEXT NOT NULL,
+            thread_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            run_id TEXT NOT NULL,
+            draft_id TEXT,
+            request_sha256 TEXT NOT NULL,
+            payload_ciphertext TEXT,
+            state TEXT NOT NULL,
+            error_code TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            tombstoned_at TEXT,
+            UNIQUE (profile_id, gmail_message_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_n8n_gmail_events_thread
+            ON n8n_gmail_events(thread_id, created_at DESC);
+
+        CREATE TABLE IF NOT EXISTS n8n_gmail_drafts (
+            draft_id TEXT PRIMARY KEY,
+            profile_id TEXT NOT NULL,
+            project_id TEXT NOT NULL,
+            thread_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            run_id TEXT NOT NULL,
+            event_id TEXT,
+            kind TEXT NOT NULL,
+            gmail_message_id TEXT,
+            gmail_thread_id TEXT,
+            recipient_ciphertext TEXT,
+            subject_ciphertext TEXT,
+            body_ciphertext TEXT,
+            input_ciphertext TEXT,
+            generation_meta_ciphertext TEXT,
+            revision INTEGER NOT NULL DEFAULT 1,
+            content_sha256 TEXT NOT NULL,
+            status TEXT NOT NULL,
+            delivery_id TEXT,
+            approved_revision INTEGER,
+            approved_sha256 TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            approved_at TEXT,
+            completed_at TEXT,
+            tombstoned_at TEXT,
+            CHECK (kind IN ('reply', 'compose'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_n8n_gmail_drafts_session
+            ON n8n_gmail_drafts(session_id, updated_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_n8n_gmail_drafts_status
+            ON n8n_gmail_drafts(status, updated_at DESC);
+
+        CREATE TABLE IF NOT EXISTS n8n_gmail_deliveries (
+            delivery_id TEXT PRIMARY KEY,
+            profile_id TEXT NOT NULL,
+            project_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            run_id TEXT NOT NULL,
+            draft_id TEXT NOT NULL UNIQUE,
+            revision INTEGER NOT NULL,
+            content_sha256 TEXT NOT NULL,
+            status TEXT NOT NULL,
+            claim_token_sha256 TEXT,
+            claim_id TEXT,
+            result_token_sha256 TEXT,
+            result_id TEXT,
+            result_sha256 TEXT,
+            gmail_message_id TEXT,
+            gmail_thread_id TEXT,
+            error_code TEXT,
+            recoverable INTEGER,
+            created_at TEXT NOT NULL,
+            claimed_at TEXT,
+            completed_at TEXT,
+            updated_at TEXT NOT NULL,
+            expires_at TEXT,
+            dispatch_attempts INTEGER NOT NULL DEFAULT 0,
+            last_dispatched_at TEXT,
+            tombstoned_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_n8n_gmail_deliveries_status
+            ON n8n_gmail_deliveries(status, updated_at DESC);
+        """
+    )
+    _ensure_columns(
+        conn.cursor(),
+        "n8n_gmail_profiles",
+        {
+            "instruction_ciphertext": "TEXT",
+            "default_model": "TEXT",
+            "auto_start": "INTEGER NOT NULL DEFAULT 0",
+        },
+    )
+    _ensure_columns(
+        conn.cursor(),
+        "n8n_gmail_nonces",
+        {"method": "TEXT", "path": "TEXT", "request_timestamp": "INTEGER"},
+    )
+    _ensure_columns(conn.cursor(), "n8n_gmail_drafts", {"input_ciphertext": "TEXT"})
+    _ensure_columns(
+        conn.cursor(),
+        "n8n_gmail_deliveries",
+        {
+            "expires_at": "TEXT",
+            "claim_token_sha256": "TEXT",
+            "dispatch_attempts": "INTEGER NOT NULL DEFAULT 0",
+            "last_dispatched_at": "TEXT",
+        },
+    )
+
+
 def init_db():
     with get_db_conn() as conn:
         cursor = conn.cursor()
@@ -484,6 +649,8 @@ def init_db():
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_capability_audits_run ON capability_audits(run_id, created_at)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_capability_approvals_run ON capability_approvals(run_id, requested_at)")
 
+        _ensure_n8n_gmail_schema(conn)
+
         now = _now()
         cursor.execute("UPDATE sessions SET created_at = COALESCE(created_at, ?), updated_at = COALESCE(updated_at, ?)", (now, now))
         cursor.execute("UPDATE messages SET visible_content = COALESCE(visible_content, content), llm_content = COALESCE(llm_content, content)")
@@ -522,20 +689,29 @@ def create_session(
     return session_id
 
 
-def get_all_sessions(search_query: Optional[str] = None) -> List[Dict[str, Any]]:
+def get_all_sessions(
+    search_query: Optional[str] = None,
+    *,
+    include_integration: bool = False,
+) -> List[Dict[str, Any]]:
     sql = """
         SELECT s.*, p.name AS project_name,
                (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id) AS actual_message_count
         FROM sessions s
         LEFT JOIN projects p ON p.id = s.project_id
     """
-    params: tuple[Any, ...] = ()
+    filters: List[str] = []
+    values: List[Any] = []
+    if not include_integration:
+        filters.append("s.mode <> 'email'")
     if search_query:
-        sql += " WHERE s.title LIKE ? OR p.name LIKE ?"
-        params = (f"%{search_query}%", f"%{search_query}%")
+        filters.append("(s.title LIKE ? OR p.name LIKE ?)")
+        values.extend((f"%{search_query}%", f"%{search_query}%"))
+    if filters:
+        sql += " WHERE " + " AND ".join(filters)
     sql += " ORDER BY s.pinned DESC, CASE WHEN s.sort_order > 0 THEN 0 ELSE 1 END, s.sort_order ASC, s.updated_at DESC, s.created_at DESC"
     with get_db_conn() as conn:
-        rows = conn.execute(sql, params).fetchall()
+        rows = conn.execute(sql, tuple(values)).fetchall()
         sessions = []
         for row in rows:
             item = dict(row)
@@ -775,8 +951,8 @@ def get_project_by_root_path(root_path: str) -> Optional[Dict[str, Any]]:
 def get_projects(search_query: Optional[str] = None) -> List[Dict[str, Any]]:
     sql = """
         SELECT p.*,
-               COUNT(s.id) AS task_count,
-               SUM(CASE WHEN s.archived = 0 THEN 1 ELSE 0 END) AS active_task_count
+               SUM(CASE WHEN s.id IS NOT NULL AND s.mode <> 'email' THEN 1 ELSE 0 END) AS task_count,
+               SUM(CASE WHEN s.archived = 0 AND s.mode <> 'email' THEN 1 ELSE 0 END) AS active_task_count
         FROM projects p
         LEFT JOIN sessions s ON s.project_id = p.id
     """
@@ -2090,3 +2266,939 @@ def list_model_install_jobs(limit: int = 20) -> List[Dict[str, Any]]:
             (safe_limit,),
         ).fetchall()
         return [dict(row) for row in rows]
+
+
+# ---------------------------------------------------------------------------
+# Private n8n Gmail integration persistence
+
+
+def upsert_n8n_gmail_profile(
+    *,
+    project_id: str,
+    workflow_key: str,
+    required_label: str,
+    fixed_recipient: str,
+    instruction_ciphertext: str,
+    default_model: Optional[str],
+    enabled: bool,
+    auto_start: bool,
+    retention_days: int,
+) -> Dict[str, Any]:
+    now = _now()
+    with get_db_conn() as conn:
+        _ensure_n8n_gmail_schema(conn)
+        existing = conn.execute(
+            "SELECT project_id FROM n8n_gmail_profiles WHERE profile_id = 'gmail'"
+        ).fetchone()
+        if existing and existing["project_id"] != project_id:
+            active = conn.execute(
+                """
+                SELECT 1 FROM n8n_gmail_drafts
+                WHERE profile_id = 'gmail' AND tombstoned_at IS NULL
+                  AND status IN ('queued', 'generating', 'awaiting_approval', 'approved_queued', 'sending')
+                LIMIT 1
+                """
+            ).fetchone()
+            if active:
+                raise ValueError("The Gmail project binding cannot change while work is active.")
+        conn.execute(
+            """
+            INSERT INTO n8n_gmail_profiles (
+                profile_id, project_id, workflow_key, required_label,
+                fixed_recipient, instruction_ciphertext, default_model, enabled,
+                auto_start, retention_days, created_at, updated_at
+            ) VALUES ('gmail', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(profile_id) DO UPDATE SET
+                project_id=excluded.project_id,
+                workflow_key=excluded.workflow_key,
+                required_label=excluded.required_label,
+                fixed_recipient=excluded.fixed_recipient,
+                instruction_ciphertext=excluded.instruction_ciphertext,
+                default_model=excluded.default_model,
+                enabled=excluded.enabled,
+                auto_start=excluded.auto_start,
+                retention_days=excluded.retention_days,
+                updated_at=excluded.updated_at
+            """,
+            (
+                project_id, workflow_key, required_label, fixed_recipient,
+                instruction_ciphertext, default_model, int(enabled), int(auto_start),
+                int(retention_days), now, now,
+            ),
+        )
+        row = conn.execute(
+            "SELECT * FROM n8n_gmail_profiles WHERE profile_id = 'gmail'"
+        ).fetchone()
+        return dict(row)
+
+
+def get_n8n_gmail_profile() -> Optional[Dict[str, Any]]:
+    with get_db_conn() as conn:
+        _ensure_n8n_gmail_schema(conn)
+        row = conn.execute(
+            "SELECT * FROM n8n_gmail_profiles WHERE profile_id = 'gmail'"
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def disable_n8n_gmail_profile() -> bool:
+    with get_db_conn() as conn:
+        _ensure_n8n_gmail_schema(conn)
+        cur = conn.execute(
+            "UPDATE n8n_gmail_profiles SET enabled = 0, updated_at = ? WHERE profile_id = 'gmail'",
+            (_now(),),
+        )
+        return cur.rowcount == 1
+
+
+def n8n_gmail_project_binding(project_id: str) -> Optional[Dict[str, Any]]:
+    """Return the configured binding used by project move/delete guards.
+
+    Disabling mail stops execution, but it does not erase encrypted Project
+    data.  Rebinding must happen before deleting or moving the old Project so
+    private integration rows cannot silently become orphaned.
+    """
+
+    with get_db_conn() as conn:
+        _ensure_n8n_gmail_schema(conn)
+        row = conn.execute(
+            """
+            SELECT profile_id, project_id, enabled
+            FROM n8n_gmail_profiles WHERE project_id = ?
+            UNION ALL
+            SELECT 'gmail' AS profile_id, project_id, 0 AS enabled
+            FROM n8n_gmail_threads
+            WHERE project_id = ? AND tombstoned_at IS NULL
+            LIMIT 1
+            """,
+            (project_id, project_id),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def reserve_n8n_gmail_nonce(
+    profile_id: str,
+    nonce: str,
+    request_sha256: str,
+    *,
+    method: str,
+    path: str,
+    request_timestamp: int,
+    expires_at: str,
+    created_at: Optional[str] = None,
+) -> bool:
+    with get_db_conn() as conn:
+        _ensure_n8n_gmail_schema(conn)
+        now = created_at or _now()
+        conn.execute("DELETE FROM n8n_gmail_nonces WHERE expires_at < ?", (now,))
+        try:
+            conn.execute(
+                """
+                INSERT INTO n8n_gmail_nonces (
+                    profile_id, nonce, method, path, request_timestamp,
+                    request_sha256, expires_at, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    profile_id, nonce, method.upper(), path, int(request_timestamp),
+                    request_sha256, expires_at, now,
+                ),
+            )
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+
+def create_n8n_gmail_thread(
+    *,
+    thread_id: str,
+    project_id: str,
+    session_id: str,
+    gmail_thread_id: Optional[str],
+) -> Dict[str, Any]:
+    now = _now()
+    with get_db_conn() as conn:
+        _ensure_n8n_gmail_schema(conn)
+        if gmail_thread_id:
+            existing = conn.execute(
+                """
+                SELECT * FROM n8n_gmail_threads
+                WHERE profile_id = 'gmail' AND gmail_thread_id = ?
+                """,
+                (gmail_thread_id,),
+            ).fetchone()
+            if existing:
+                return dict(existing)
+        conn.execute(
+            """
+            INSERT INTO n8n_gmail_threads (
+                thread_id, profile_id, project_id, session_id, gmail_thread_id,
+                created_at, updated_at
+            ) VALUES (?, 'gmail', ?, ?, ?, ?, ?)
+            """,
+            (thread_id, project_id, session_id, gmail_thread_id, now, now),
+        )
+        row = conn.execute(
+            "SELECT * FROM n8n_gmail_threads WHERE thread_id = ?", (thread_id,)
+        ).fetchone()
+        return dict(row)
+
+
+def get_n8n_gmail_thread(
+    *,
+    thread_id: Optional[str] = None,
+    gmail_thread_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    candidates = [
+        ("thread_id", thread_id),
+        ("gmail_thread_id", gmail_thread_id),
+        ("session_id", session_id),
+    ]
+    field, value = next(((field, value) for field, value in candidates if value), (None, None))
+    if field is None:
+        return None
+    with get_db_conn() as conn:
+        _ensure_n8n_gmail_schema(conn)
+        row = conn.execute(
+            f"SELECT * FROM n8n_gmail_threads WHERE profile_id = 'gmail' AND {field} = ?",
+            (value,),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def create_n8n_gmail_event(record: Mapping[str, Any]) -> tuple[bool, Dict[str, Any]]:
+    now = _now()
+    with get_db_conn() as conn:
+        _ensure_n8n_gmail_schema(conn)
+        existing = conn.execute(
+            """
+            SELECT * FROM n8n_gmail_events
+            WHERE event_id = ? OR (profile_id = 'gmail' AND gmail_message_id = ?)
+            LIMIT 1
+            """,
+            (record["event_id"], record["gmail_message_id"]),
+        ).fetchone()
+        if existing:
+            return False, dict(existing)
+        conn.execute(
+            """
+            INSERT INTO n8n_gmail_events (
+                event_id, profile_id, project_id, gmail_message_id,
+                gmail_thread_id, thread_id, session_id, run_id, request_sha256,
+                payload_ciphertext, state, created_at, updated_at
+            ) VALUES (?, 'gmail', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                record["event_id"], record["project_id"], record["gmail_message_id"],
+                record["gmail_thread_id"], record["thread_id"], record["session_id"],
+                record["run_id"], record["request_sha256"], record["payload_ciphertext"],
+                record.get("state", "queued"), now, now,
+            ),
+        )
+        row = conn.execute(
+            "SELECT * FROM n8n_gmail_events WHERE event_id = ?", (record["event_id"],)
+        ).fetchone()
+        return True, dict(row)
+
+
+def find_n8n_gmail_event(
+    *, event_id: str, gmail_message_id: str
+) -> Optional[Dict[str, Any]]:
+    with get_db_conn() as conn:
+        _ensure_n8n_gmail_schema(conn)
+        row = conn.execute(
+            """
+            SELECT * FROM n8n_gmail_events
+            WHERE event_id = ? OR (profile_id = 'gmail' AND gmail_message_id = ?)
+            LIMIT 1
+            """,
+            (event_id, gmail_message_id),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def update_n8n_gmail_event(event_id: str, **changes: Any) -> bool:
+    allowed = {"draft_id", "state", "error_code", "payload_ciphertext", "tombstoned_at"}
+    values = {key: value for key, value in changes.items() if key in allowed}
+    if not values:
+        return False
+    values["updated_at"] = _now()
+    with get_db_conn() as conn:
+        _ensure_n8n_gmail_schema(conn)
+        cur = conn.execute(
+            "UPDATE n8n_gmail_events SET "
+            + ", ".join(f"{key} = ?" for key in values)
+            + " WHERE event_id = ?",
+            (*values.values(), event_id),
+        )
+        return cur.rowcount > 0
+
+
+def create_n8n_gmail_draft(record: Mapping[str, Any]) -> Dict[str, Any]:
+    now = _now()
+    with get_db_conn() as conn:
+        _ensure_n8n_gmail_schema(conn)
+        conn.execute(
+            """
+            INSERT INTO n8n_gmail_drafts (
+                draft_id, profile_id, project_id, thread_id, session_id, run_id,
+                event_id, kind, gmail_message_id, gmail_thread_id,
+                recipient_ciphertext, subject_ciphertext, body_ciphertext,
+                input_ciphertext, generation_meta_ciphertext, revision,
+                content_sha256, status, created_at, updated_at
+            ) VALUES (?, 'gmail', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                record["draft_id"], record["project_id"], record["thread_id"],
+                record["session_id"], record["run_id"], record.get("event_id"),
+                record["kind"], record.get("gmail_message_id"),
+                record.get("gmail_thread_id"), record.get("recipient_ciphertext"),
+                record.get("subject_ciphertext"), record.get("body_ciphertext"),
+                record.get("input_ciphertext"),
+                record.get("generation_meta_ciphertext"), int(record.get("revision", 0)),
+                record["content_sha256"], record.get("status", "queued"), now, now,
+            ),
+        )
+        row = conn.execute(
+            "SELECT * FROM n8n_gmail_drafts WHERE draft_id = ?", (record["draft_id"],)
+        ).fetchone()
+        return dict(row)
+
+
+def get_n8n_gmail_draft(draft_id: str) -> Optional[Dict[str, Any]]:
+    with get_db_conn() as conn:
+        _ensure_n8n_gmail_schema(conn)
+        row = conn.execute(
+            "SELECT * FROM n8n_gmail_drafts WHERE draft_id = ?", (draft_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def get_n8n_gmail_draft_by_run(run_id: str) -> Optional[Dict[str, Any]]:
+    with get_db_conn() as conn:
+        _ensure_n8n_gmail_schema(conn)
+        row = conn.execute(
+            "SELECT * FROM n8n_gmail_drafts WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def list_n8n_gmail_drafts(*, status: Optional[str] = None, limit: int = 100) -> List[Dict[str, Any]]:
+    sql = "SELECT * FROM n8n_gmail_drafts WHERE tombstoned_at IS NULL"
+    values: List[Any] = []
+    if status:
+        sql += " AND status = ?"
+        values.append(status)
+    sql += " ORDER BY updated_at DESC LIMIT ?"
+    values.append(max(1, min(int(limit), 250)))
+    with get_db_conn() as conn:
+        _ensure_n8n_gmail_schema(conn)
+        return [dict(row) for row in conn.execute(sql, values).fetchall()]
+
+
+def claim_n8n_gmail_generation(draft_id: str) -> bool:
+    with get_db_conn() as conn:
+        _ensure_n8n_gmail_schema(conn)
+        cur = conn.execute(
+            """
+            UPDATE n8n_gmail_drafts SET status = 'generating', updated_at = ?
+            WHERE draft_id = ? AND status = 'queued' AND tombstoned_at IS NULL
+            """,
+            (_now(), draft_id),
+        )
+        return cur.rowcount == 1
+
+
+def complete_n8n_gmail_generation(
+    draft_id: str,
+    *,
+    recipient_ciphertext: str,
+    subject_ciphertext: str,
+    body_ciphertext: str,
+    generation_meta_ciphertext: str,
+    content_sha256: str,
+) -> bool:
+    now = _now()
+    with get_db_conn() as conn:
+        _ensure_n8n_gmail_schema(conn)
+        cur = conn.execute(
+            """
+            UPDATE n8n_gmail_drafts SET
+                recipient_ciphertext = ?, subject_ciphertext = ?, body_ciphertext = ?,
+                generation_meta_ciphertext = ?, content_sha256 = ?, revision = 1,
+                status = 'awaiting_approval', updated_at = ?
+            WHERE draft_id = ? AND status = 'generating' AND tombstoned_at IS NULL
+            """,
+            (
+                recipient_ciphertext, subject_ciphertext, body_ciphertext,
+                generation_meta_ciphertext, content_sha256, now, draft_id,
+            ),
+        )
+        if cur.rowcount:
+            conn.execute(
+                "UPDATE n8n_gmail_events SET state = 'awaiting_approval', updated_at = ? WHERE draft_id = ?",
+                (now, draft_id),
+            )
+        return cur.rowcount == 1
+
+
+def fail_n8n_gmail_generation(draft_id: str, error_code: str) -> bool:
+    now = _now()
+    with get_db_conn() as conn:
+        _ensure_n8n_gmail_schema(conn)
+        cur = conn.execute(
+            """
+            UPDATE n8n_gmail_drafts SET status = 'generation_failed',
+                revision = CASE WHEN revision < 1 THEN 1 ELSE revision END,
+                updated_at = ?
+            WHERE draft_id = ? AND status IN ('queued', 'generating')
+            """,
+            (now, draft_id),
+        )
+        conn.execute(
+            """
+            UPDATE n8n_gmail_events SET state = 'generation_failed', error_code = ?, updated_at = ?
+            WHERE draft_id = ?
+            """,
+            (error_code, now, draft_id),
+        )
+        return cur.rowcount == 1
+
+
+def recover_n8n_gmail_generations() -> List[str]:
+    now = _now()
+    with get_db_conn() as conn:
+        _ensure_n8n_gmail_schema(conn)
+        conn.execute(
+            "UPDATE n8n_gmail_drafts SET status = 'queued', updated_at = ? WHERE status = 'generating'",
+            (now,),
+        )
+        return [
+            row[0]
+            for row in conn.execute(
+                "SELECT draft_id FROM n8n_gmail_drafts WHERE status = 'queued' AND tombstoned_at IS NULL"
+            ).fetchall()
+        ]
+
+
+def edit_n8n_gmail_draft(
+    draft_id: str,
+    *,
+    expected_revision: int,
+    expected_sha256: str,
+    subject_ciphertext: str,
+    body_ciphertext: str,
+    content_sha256: str,
+) -> Optional[Dict[str, Any]]:
+    now = _now()
+    with get_db_conn() as conn:
+        _ensure_n8n_gmail_schema(conn)
+        cur = conn.execute(
+            """
+            UPDATE n8n_gmail_drafts SET subject_ciphertext = ?, body_ciphertext = ?,
+                revision = revision + 1, content_sha256 = ?, updated_at = ?
+            WHERE draft_id = ? AND revision = ? AND content_sha256 = ?
+              AND status = 'awaiting_approval' AND tombstoned_at IS NULL
+            """,
+            (
+                subject_ciphertext, body_ciphertext, content_sha256, now, draft_id,
+                int(expected_revision), expected_sha256,
+            ),
+        )
+        if cur.rowcount != 1:
+            return None
+        row = conn.execute(
+            "SELECT * FROM n8n_gmail_drafts WHERE draft_id = ?", (draft_id,)
+        ).fetchone()
+        return dict(row)
+
+
+def reject_n8n_gmail_draft(
+    draft_id: str, *, expected_revision: int, expected_sha256: str
+) -> bool:
+    now = _now()
+    with get_db_conn() as conn:
+        _ensure_n8n_gmail_schema(conn)
+        cur = conn.execute(
+            """
+            UPDATE n8n_gmail_drafts SET status = 'rejected', completed_at = ?, updated_at = ?
+            WHERE draft_id = ? AND revision = ? AND content_sha256 = ?
+              AND status = 'awaiting_approval' AND tombstoned_at IS NULL
+            """,
+            (now, now, draft_id, int(expected_revision), expected_sha256),
+        )
+        if cur.rowcount:
+            conn.execute(
+                "UPDATE n8n_gmail_events SET state = 'rejected', updated_at = ? WHERE draft_id = ?",
+                (now, draft_id),
+            )
+        return cur.rowcount == 1
+
+
+def queue_n8n_gmail_regeneration(
+    draft_id: str,
+    *,
+    expected_revision: int,
+    expected_sha256: str,
+    empty_sha256: str,
+) -> bool:
+    now = _now()
+    with get_db_conn() as conn:
+        _ensure_n8n_gmail_schema(conn)
+        current = conn.execute(
+            "SELECT status, delivery_id FROM n8n_gmail_drafts WHERE draft_id = ?",
+            (draft_id,),
+        ).fetchone()
+        if not current:
+            return False
+        if current["delivery_id"]:
+            unknown_delivery = conn.execute(
+                "SELECT status FROM n8n_gmail_deliveries WHERE delivery_id = ?",
+                (current["delivery_id"],),
+            ).fetchone()
+            if (
+                current["status"] != "delivery_unknown"
+                or not unknown_delivery
+                or unknown_delivery["status"] != "delivery_unknown"
+            ):
+                return False
+        cur = conn.execute(
+            """
+            UPDATE n8n_gmail_drafts SET recipient_ciphertext = NULL,
+                subject_ciphertext = NULL, body_ciphertext = NULL,
+                generation_meta_ciphertext = NULL, revision = 0,
+                content_sha256 = ?, status = 'queued', completed_at = NULL,
+                delivery_id = NULL, approved_revision = NULL,
+                approved_sha256 = NULL, approved_at = NULL,
+                updated_at = ?
+            WHERE draft_id = ? AND revision = ? AND content_sha256 = ?
+              AND status IN ('awaiting_approval', 'rejected', 'generation_failed', 'delivery_unknown')
+              AND tombstoned_at IS NULL
+            """,
+            (empty_sha256, now, draft_id, int(expected_revision), expected_sha256),
+        )
+        if cur.rowcount:
+            if current["delivery_id"]:
+                conn.execute(
+                    """
+                    UPDATE n8n_gmail_deliveries
+                    SET status = 'cancelled', error_code = 'delivery_unknown_resolved',
+                        completed_at = ?, updated_at = ?
+                    WHERE delivery_id = ? AND status = 'delivery_unknown'
+                    """,
+                    (now, now, current["delivery_id"]),
+                )
+            conn.execute(
+                "UPDATE n8n_gmail_events SET state = 'queued', error_code = NULL, updated_at = ? WHERE draft_id = ?",
+                (now, draft_id),
+            )
+        return cur.rowcount == 1
+
+
+def approve_n8n_gmail_draft(
+    draft_id: str,
+    *,
+    expected_revision: int,
+    expected_sha256: str,
+    delivery_id: str,
+    claim_token_sha256: str,
+    expires_at: str,
+) -> tuple[bool, Optional[Dict[str, Any]]]:
+    now = _now()
+    with get_db_conn() as conn:
+        _ensure_n8n_gmail_schema(conn)
+        draft = conn.execute(
+            "SELECT * FROM n8n_gmail_drafts WHERE draft_id = ?", (draft_id,)
+        ).fetchone()
+        if not draft:
+            return False, None
+        if draft["delivery_id"]:
+            delivery = conn.execute(
+                "SELECT * FROM n8n_gmail_deliveries WHERE delivery_id = ?",
+                (draft["delivery_id"],),
+            ).fetchone()
+            same = (
+                int(draft["approved_revision"] or 0) == int(expected_revision)
+                and draft["approved_sha256"] == expected_sha256
+            )
+            return same, dict(delivery) if same and delivery else None
+        if (
+            draft["status"] != "awaiting_approval"
+            or int(draft["revision"]) != int(expected_revision)
+            or draft["content_sha256"] != expected_sha256
+            or draft["tombstoned_at"]
+        ):
+            return False, None
+        conn.execute(
+            """
+            INSERT INTO n8n_gmail_deliveries (
+                delivery_id, profile_id, project_id, session_id, run_id, draft_id,
+                revision, content_sha256, status, claim_token_sha256,
+                created_at, updated_at, expires_at
+            ) VALUES (?, 'gmail', ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)
+            """,
+            (
+                delivery_id, draft["project_id"], draft["session_id"], draft["run_id"],
+                draft_id, expected_revision, expected_sha256, claim_token_sha256,
+                now, now, expires_at,
+            ),
+        )
+        conn.execute(
+            """
+            UPDATE n8n_gmail_drafts SET status = 'approved_queued', delivery_id = ?,
+                approved_revision = ?, approved_sha256 = ?, approved_at = ?, updated_at = ?
+            WHERE draft_id = ?
+            """,
+            (delivery_id, expected_revision, expected_sha256, now, now, draft_id),
+        )
+        row = conn.execute(
+            "SELECT * FROM n8n_gmail_deliveries WHERE delivery_id = ?", (delivery_id,)
+        ).fetchone()
+        return True, dict(row)
+
+
+def get_n8n_gmail_delivery(delivery_id: str) -> Optional[Dict[str, Any]]:
+    with get_db_conn() as conn:
+        _ensure_n8n_gmail_schema(conn)
+        row = conn.execute(
+            "SELECT * FROM n8n_gmail_deliveries WHERE delivery_id = ?", (delivery_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def record_n8n_gmail_dispatch(delivery_id: str, *, succeeded: bool) -> bool:
+    now = _now()
+    with get_db_conn() as conn:
+        _ensure_n8n_gmail_schema(conn)
+        cur = conn.execute(
+            """
+            UPDATE n8n_gmail_deliveries SET dispatch_attempts = dispatch_attempts + 1,
+                last_dispatched_at = ?, error_code = ?, updated_at = ?
+            WHERE delivery_id = ? AND status = 'pending' AND tombstoned_at IS NULL
+            """,
+            (now, None if succeeded else "dispatch_failed", now, delivery_id),
+        )
+        return cur.rowcount == 1
+
+
+def list_pending_n8n_gmail_deliveries(*, now: str, limit: int = 100) -> List[str]:
+    with get_db_conn() as conn:
+        _ensure_n8n_gmail_schema(conn)
+        return [
+            row[0]
+            for row in conn.execute(
+                """
+                SELECT delivery_id FROM n8n_gmail_deliveries
+                WHERE status = 'pending' AND tombstoned_at IS NULL
+                  AND (expires_at IS NULL OR expires_at > ?)
+                ORDER BY updated_at ASC LIMIT ?
+                """,
+                (now, max(1, min(int(limit), 500))),
+            ).fetchall()
+        ]
+
+
+def expire_n8n_gmail_deliveries(*, now: str) -> int:
+    with get_db_conn() as conn:
+        _ensure_n8n_gmail_schema(conn)
+        rows = conn.execute(
+            """
+            SELECT delivery_id, draft_id FROM n8n_gmail_deliveries
+            WHERE status = 'pending' AND expires_at IS NOT NULL AND expires_at <= ?
+            """,
+            (now,),
+        ).fetchall()
+        for row in rows:
+            conn.execute(
+                """
+                UPDATE n8n_gmail_deliveries SET status = 'expired', completed_at = ?,
+                    updated_at = ? WHERE delivery_id = ? AND status = 'pending'
+                """,
+                (now, now, row["delivery_id"]),
+            )
+            conn.execute(
+                "UPDATE n8n_gmail_drafts SET status = 'approval_expired', updated_at = ? WHERE draft_id = ?",
+                (now, row["draft_id"]),
+            )
+        return len(rows)
+
+
+def mark_n8n_gmail_delivery_unknown(delivery_id: str) -> bool:
+    """Fail closed when a claimed delivery can no longer be reconciled.
+
+    Plaintext and the result token are never released twice.  A duplicate
+    claim or Workbench restart therefore moves the original attempt to an
+    explicit manual-review state rather than pretending it is still sending.
+    """
+
+    now = _now()
+    with get_db_conn() as conn:
+        _ensure_n8n_gmail_schema(conn)
+        row = conn.execute(
+            "SELECT draft_id FROM n8n_gmail_deliveries WHERE delivery_id = ? AND status = 'claimed'",
+            (delivery_id,),
+        ).fetchone()
+        if not row:
+            return False
+        conn.execute(
+            """
+            UPDATE n8n_gmail_deliveries
+            SET status = 'delivery_unknown', error_code = 'delivery_result_unknown',
+                updated_at = ?
+            WHERE delivery_id = ? AND status = 'claimed'
+            """,
+            (now, delivery_id),
+        )
+        conn.execute(
+            "UPDATE n8n_gmail_drafts SET status = 'delivery_unknown', updated_at = ? WHERE draft_id = ?",
+            (now, row["draft_id"]),
+        )
+        conn.execute(
+            """
+            UPDATE n8n_gmail_events
+            SET state = 'delivery_unknown', error_code = 'delivery_result_unknown', updated_at = ?
+            WHERE draft_id = ?
+            """,
+            (now, row["draft_id"]),
+        )
+        return True
+
+
+def recover_n8n_gmail_claimed_deliveries() -> int:
+    """Mark every pre-restart claimed delivery as requiring manual review."""
+
+    with get_db_conn() as conn:
+        _ensure_n8n_gmail_schema(conn)
+        identifiers = [
+            str(row[0])
+            for row in conn.execute(
+                "SELECT delivery_id FROM n8n_gmail_deliveries WHERE status = 'claimed'"
+            ).fetchall()
+        ]
+    return sum(1 for identifier in identifiers if mark_n8n_gmail_delivery_unknown(identifier))
+
+
+def n8n_gmail_thread_has_unresolved_delivery(thread_id: str) -> bool:
+    with get_db_conn() as conn:
+        _ensure_n8n_gmail_schema(conn)
+        row = conn.execute(
+            """
+            SELECT 1
+            FROM n8n_gmail_drafts AS d
+            JOIN n8n_gmail_deliveries AS x ON x.delivery_id = d.delivery_id
+            WHERE d.thread_id = ? AND x.status IN ('claimed', 'delivery_unknown')
+              AND x.tombstoned_at IS NULL
+            LIMIT 1
+            """,
+            (thread_id,),
+        ).fetchone()
+        return row is not None
+
+
+def claim_n8n_gmail_delivery(
+    delivery_id: str,
+    *,
+    claim_id: str,
+    result_token_sha256: str,
+    now: Optional[str] = None,
+) -> tuple[str, Optional[Dict[str, Any]]]:
+    now = now or _now()
+    with get_db_conn() as conn:
+        _ensure_n8n_gmail_schema(conn)
+        row = conn.execute(
+            "SELECT * FROM n8n_gmail_deliveries WHERE delivery_id = ?", (delivery_id,)
+        ).fetchone()
+        if not row or row["tombstoned_at"]:
+            return "missing", None
+        if row["status"] == "pending" and row["expires_at"] and row["expires_at"] <= now:
+            conn.execute(
+                """
+                UPDATE n8n_gmail_deliveries SET status = 'expired', completed_at = ?,
+                    updated_at = ? WHERE delivery_id = ? AND status = 'pending'
+                """,
+                (now, now, delivery_id),
+            )
+            conn.execute(
+                "UPDATE n8n_gmail_drafts SET status = 'approval_expired', updated_at = ? WHERE draft_id = ?",
+                (now, row["draft_id"]),
+            )
+            return "expired", dict(row)
+        if row["status"] == "pending":
+            conn.execute(
+                """
+                UPDATE n8n_gmail_deliveries SET status = 'claimed', claim_id = ?,
+                    result_token_sha256 = ?, claimed_at = ?, updated_at = ?
+                WHERE delivery_id = ? AND status = 'pending'
+                """,
+                (claim_id, result_token_sha256, now, now, delivery_id),
+            )
+            conn.execute(
+                "UPDATE n8n_gmail_drafts SET status = 'sending', updated_at = ? WHERE draft_id = ?",
+                (now, row["draft_id"]),
+            )
+            row = conn.execute(
+                "SELECT * FROM n8n_gmail_deliveries WHERE delivery_id = ?", (delivery_id,)
+            ).fetchone()
+            return "claimed", dict(row)
+        if row["status"] == "claimed" and row["claim_id"] == claim_id:
+            return "replay", dict(row)
+        return "conflict", dict(row)
+
+
+def finish_n8n_gmail_delivery(
+    delivery_id: str,
+    *,
+    result_id: str,
+    result_sha256: str,
+    status: str,
+    gmail_message_id: Optional[str],
+    gmail_thread_id: Optional[str],
+    error_code: Optional[str],
+    recoverable: Optional[bool],
+) -> tuple[str, Optional[Dict[str, Any]]]:
+    now = _now()
+    with get_db_conn() as conn:
+        _ensure_n8n_gmail_schema(conn)
+        row = conn.execute(
+            "SELECT * FROM n8n_gmail_deliveries WHERE delivery_id = ?", (delivery_id,)
+        ).fetchone()
+        if not row or row["tombstoned_at"]:
+            return "missing", None
+        if row["status"] in ("sent", "failed"):
+            if row["result_id"] == result_id and row["result_sha256"] == result_sha256:
+                return "replay", dict(row)
+            return "conflict", dict(row)
+        if row["status"] not in ("claimed", "delivery_unknown"):
+            return "conflict", dict(row)
+        conn.execute(
+            """
+            UPDATE n8n_gmail_deliveries SET status = ?, result_id = ?, result_sha256 = ?,
+                gmail_message_id = ?, gmail_thread_id = ?, error_code = ?, recoverable = ?,
+                completed_at = ?, updated_at = ?
+                WHERE delivery_id = ? AND status IN ('claimed', 'delivery_unknown')
+            """,
+            (
+                status, result_id, result_sha256, gmail_message_id, gmail_thread_id,
+                error_code, None if recoverable is None else int(recoverable), now, now,
+                delivery_id,
+            ),
+        )
+        conn.execute(
+            """
+            UPDATE n8n_gmail_drafts SET status = ?, completed_at = ?, updated_at = ?
+            WHERE draft_id = ?
+            """,
+            (status, now, now, row["draft_id"]),
+        )
+        event_state = "sent" if status == "sent" else "delivery_failed"
+        conn.execute(
+            "UPDATE n8n_gmail_events SET state = ?, error_code = ?, updated_at = ? WHERE draft_id = ?",
+            (event_state, error_code, now, row["draft_id"]),
+        )
+        if status == "sent" and gmail_thread_id:
+            conn.execute(
+                """
+                UPDATE n8n_gmail_threads SET gmail_thread_id = COALESCE(gmail_thread_id, ?),
+                    updated_at = ? WHERE session_id = ?
+                """,
+                (gmail_thread_id, now, row["session_id"]),
+            )
+        final = conn.execute(
+            "SELECT * FROM n8n_gmail_deliveries WHERE delivery_id = ?", (delivery_id,)
+        ).fetchone()
+        return "completed", dict(final)
+
+
+def tombstone_n8n_gmail_draft(draft_id: str) -> bool:
+    now = _now()
+    with get_db_conn() as conn:
+        _ensure_n8n_gmail_schema(conn)
+        row = conn.execute(
+            "SELECT event_id, delivery_id FROM n8n_gmail_drafts WHERE draft_id = ?",
+            (draft_id,),
+        ).fetchone()
+        if not row:
+            return False
+        conn.execute(
+            """
+            UPDATE n8n_gmail_drafts SET recipient_ciphertext = NULL,
+                subject_ciphertext = NULL, body_ciphertext = NULL,
+                input_ciphertext = NULL, generation_meta_ciphertext = NULL,
+                status = 'tombstoned',
+                tombstoned_at = COALESCE(tombstoned_at, ?), updated_at = ?
+            WHERE draft_id = ?
+            """,
+            (now, now, draft_id),
+        )
+        if row["event_id"]:
+            conn.execute(
+                """
+                UPDATE n8n_gmail_events SET payload_ciphertext = NULL, state = 'tombstoned',
+                    tombstoned_at = COALESCE(tombstoned_at, ?), updated_at = ?
+                WHERE event_id = ?
+                """,
+                (now, now, row["event_id"]),
+            )
+        if row["delivery_id"]:
+            conn.execute(
+                """
+                UPDATE n8n_gmail_deliveries SET tombstoned_at = COALESCE(tombstoned_at, ?),
+                    updated_at = ? WHERE delivery_id = ?
+                """,
+                (now, now, row["delivery_id"]),
+            )
+        return True
+
+
+def tombstone_n8n_gmail_thread(thread_id: str) -> bool:
+    now = _now()
+    with get_db_conn() as conn:
+        _ensure_n8n_gmail_schema(conn)
+        row = conn.execute(
+            "SELECT thread_id FROM n8n_gmail_threads WHERE thread_id = ?", (thread_id,)
+        ).fetchone()
+        if not row:
+            return False
+        draft_ids = [
+            item[0]
+            for item in conn.execute(
+                "SELECT draft_id FROM n8n_gmail_drafts WHERE thread_id = ?", (thread_id,)
+            ).fetchall()
+        ]
+    for draft_id in draft_ids:
+        tombstone_n8n_gmail_draft(draft_id)
+    with get_db_conn() as conn:
+        conn.execute(
+            """
+            UPDATE n8n_gmail_threads SET tombstoned_at = COALESCE(tombstoned_at, ?),
+                updated_at = ? WHERE thread_id = ?
+            """,
+            (now, now, thread_id),
+        )
+    return True
+
+
+def purge_n8n_gmail_retention(cutoff: str) -> Dict[str, int]:
+    """Erase content before cutoff, retaining only audit tombstones and digests."""
+
+    with get_db_conn() as conn:
+        _ensure_n8n_gmail_schema(conn)
+        draft_ids = [
+            row[0]
+            for row in conn.execute(
+                """
+                SELECT draft_id FROM n8n_gmail_drafts
+                WHERE updated_at < ? AND tombstoned_at IS NULL
+                  AND status IN (
+                      'sent', 'failed', 'send_failed', 'generation_failed',
+                      'rejected', 'cancelled', 'expired', 'approval_expired',
+                      'blocked_recipient'
+                  )
+                """,
+                (cutoff,),
+            ).fetchall()
+        ]
+    for draft_id in draft_ids:
+        tombstone_n8n_gmail_draft(draft_id)
+    return {"tombstoned_drafts": len(draft_ids)}

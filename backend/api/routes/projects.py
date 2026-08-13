@@ -37,6 +37,9 @@ def build_projects_router(
     context_payload: Callable[[Any], Dict[str, Any]],
     project_storage_dir: Callable[..., Path],
     normalize_path: Callable[[Any], Path],
+    project_change_guard: Optional[
+        Callable[[str, str, Optional[Dict[str, Any]]], None]
+    ] = None,
 ) -> APIRouter:
     router = APIRouter(tags=["projects"])
     @router.get("/api/projects")
@@ -199,6 +202,8 @@ def build_projects_router(
     @router.patch("/api/projects/{project_id}")
     def api_patch_project(project_id: str, req: PatchProjectRequest):
         changes = req.model_dump(exclude_unset=True)
+        if project_change_guard is not None and changes.get("archived") is True:
+            project_change_guard(project_id, "archive", changes)
         if "name" in changes:
             changes["name"] = changes["name"].strip()
         if "root_path" in changes:
@@ -251,6 +256,12 @@ def build_projects_router(
                     recoverable=False,
                 ),
             )
+        if project_change_guard is not None:
+            project_change_guard(
+                project_id,
+                "relink",
+                {"root_path": req.root_path},
+            )
         try:
             root = validate_project_path(req.root_path, require_existing=True)
         except ValueError as exc:
@@ -289,6 +300,8 @@ def build_projects_router(
                     recoverable=False,
                 ),
             )
+        if project_change_guard is not None:
+            project_change_guard(project_id, "delete", None)
         storage = project_storage_dir(project_id, create=False)
         if not database.delete_project(project_id):
             raise HTTPException(

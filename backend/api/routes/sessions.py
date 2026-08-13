@@ -27,10 +27,22 @@ def build_sessions_router(
     archive_session: Callable[[str], Any],
     export_session_zip: Callable[[str], Optional[bytes]],
     has_active_chat_run: Callable[[str], bool],
+    session_change_guard: Optional[
+        Callable[[str, str, Optional[Dict[str, Any]]], None]
+    ] = None,
 ) -> APIRouter:
     router = APIRouter(tags=["sessions"])
     @router.post("/api/sessions")
     def api_create_session(req: CreateSessionRequest):
+        if str(req.mode or "chat").strip().casefold() == "email":
+            raise HTTPException(
+                status_code=403,
+                detail=error_payload(
+                    "INTEGRATION_SESSION_RESERVED",
+                    "Email integration sessions can only be created by the integration service.",
+                    recoverable=False,
+                ),
+            )
         sid = req.session_id or create_id("sess")
         if req.project_id and not database.get_project(req.project_id):
             raise HTTPException(
@@ -74,6 +86,12 @@ def build_sessions_router(
                 ),
             )
         for session_id in req.session_ids:
+            if session_change_guard is not None:
+                session_change_guard(
+                    session_id,
+                    "reorder",
+                    {"project_id": req.project_id},
+                )
             current = database.get_session(session_id)
             if (
                 current
@@ -104,6 +122,8 @@ def build_sessions_router(
 
     @router.get("/api/sessions/{session_id}/messages")
     def api_get_messages(session_id: str):
+        if session_change_guard is not None:
+            session_change_guard(session_id, "read_messages", None)
         return {"messages": database.get_messages_by_session(session_id)}
 
     @router.patch("/api/sessions/{session_id}")
@@ -119,6 +139,8 @@ def build_sessions_router(
                 ),
             )
         changes = req.model_dump(exclude_unset=True)
+        if session_change_guard is not None:
+            session_change_guard(session_id, "patch", changes)
         if changes.get("project_id") and not database.get_project(changes["project_id"]):
             raise HTTPException(
                 status_code=404,
@@ -161,6 +183,8 @@ def build_sessions_router(
 
     @router.delete("/api/sessions/{session_id}")
     def api_delete_session(session_id: str):
+        if session_change_guard is not None:
+            session_change_guard(session_id, "delete", None)
         sync_session_archive(session_id)
         archived_to = archive_session(session_id)
         return {
@@ -170,6 +194,8 @@ def build_sessions_router(
 
     @router.get("/api/sessions/{session_id}/export.zip")
     def api_export_session(session_id: str):
+        if session_change_guard is not None:
+            session_change_guard(session_id, "export", None)
         content = export_session_zip(session_id)
         if content is None:
             raise HTTPException(

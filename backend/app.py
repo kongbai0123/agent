@@ -1,9 +1,9 @@
 """Local AI Workbench application entry point.
 
-The production runtime is intentionally a single conversational model loop.
-This module only composes chat, sessions, projects, attachments, settings, and
-model-provider management; orchestration, tools, retrieval pipelines, and
-background automation are not part of the application graph.
+The production chat runtime remains a single conversational model loop.  The
+only background integration composed here is the narrow, manually approved
+n8n Gmail bridge; it is isolated from chat/Hermes tools and from general
+automation or orchestration capabilities.
 """
 
 from __future__ import annotations
@@ -11,10 +11,13 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import json
 import os
 import re
 import secrets
 import stat
+import threading
+import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -31,6 +34,9 @@ from api.routes.attachments import build_attachments_router
 from api.routes.chat import router as chat_router
 from api.routes.hermes import build_hermes_router
 from api.routes.models import build_models_router
+from api.routes.n8n_agent import build_n8n_agent_router
+from api.routes.n8n_gmail import build_n8n_gmail_router
+from api.routes.n8n_runtime import build_n8n_runtime_router
 from api.routes.project_skills import build_project_skills_router
 from api.routes.projects import build_projects_router
 from api.routes.run_results import build_run_results_router
@@ -62,6 +68,7 @@ from core.settings import (
     save_settings,
     validate_settings as validate_chat_settings,
 )
+from email_draft_runtime import EmailDraftRuntime
 from local_session import (
     SESSION_COOKIE_NAME,
     install_local_session_guard,
@@ -74,6 +81,18 @@ from model_client import (
     model_profile_for_model,
     provider_for_model,
     uses_local_model_slot,
+)
+from n8n_gmail_crypto import AesGcmContentCipher
+from n8n_gmail_delivery import N8nDeliveryDispatcher
+from n8n_gmail_secrets import N8nGmailSecretStore
+from n8n_gmail_service import FIXED_TEST_RECIPIENT, GmailIntegrationError, N8nGmailService
+from n8n_agent_governance import N8nAgentGovernanceService, N8nApiBroker
+from n8n_agent_planner import N8nPlanModelGenerator, N8nPlanningService
+from n8n_agent_secrets import N8nAgentSecretStore
+from n8n_lifecycle import (
+    ManagedN8nLifecycle,
+    gmail_workflows_ready,
+    inspect_gmail_workflows_readiness,
 )
 from hermes_factory import (
     HermesIntegrationManagerCache,
@@ -110,7 +129,7 @@ from workspace import (
 )
 
 
-APP_VERSION = "0.6.0-chat-reset"
+APP_VERSION = "0.7.0-n8n-agent-governance-beta.1"
 SETTINGS_PATH = str(
     Path(
         os.environ.get("WORKBENCH_SETTINGS_PATH")
@@ -120,6 +139,9 @@ SETTINGS_PATH = str(
 hermes_manager_cache: Optional[HermesIntegrationManagerCache] = None
 hermes_health_supervisor: Optional[HermesHealthSupervisor] = None
 hermes_rollout_gate: Optional[HermesRolloutGate] = None
+n8n_lifecycle: Optional[ManagedN8nLifecycle] = None
+n8n_gmail_service: Optional[N8nGmailService] = None
+n8n_background_tasks: set[asyncio.Task[Any]] = set()
 
 
 def now_iso() -> str:
@@ -167,6 +189,102 @@ def require_local_workbench(request: Request) -> None:
                 recoverable=False,
             ),
         )
+
+
+def guard_integration_session(
+    session_id: str,
+    action: str,
+    _changes: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Keep private email sessions outside all general chat surfaces."""
+
+    session = database.get_session(session_id)
+    if session and str(session.get("mode") or "").casefold() == "email":
+        raise HTTPException(
+            status_code=404,
+            detail=error_payload(
+                "SESSION_NOT_FOUND",
+                "Session was not found.",
+                recoverable=False,
+            ),
+        )
+
+
+def guard_n8n_project_change(
+    project_id: str,
+    _action: str,
+    _changes: Optional[Dict[str, Any]] = None,
+) -> None:
+    service = n8n_gmail_service
+    if service is None:
+        return
+    try:
+        service.assert_project_mutable(project_id)
+    except GmailIntegrationError as exc:
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail=error_payload(
+                exc.code,
+                exc.message,
+                recoverable=exc.recoverable,
+            ),
+        ) from exc
+
+
+def n8n_profile_enable_guard(profile: Dict[str, Any]) -> Dict[str, Any]:
+    """Require the reviewed runtime, isolation and Gmail workflows."""
+
+    lifecycle = n8n_lifecycle
+    if lifecycle is None:
+        return {
+            "ready": False,
+            "code": "n8n_runtime_unavailable",
+            "message": "The managed n8n runtime is unavailable.",
+            "status_code": 503,
+        }
+    project = database.get_project(str(profile.get("project_id") or ""))
+    if (
+        not project
+        or bool(project.get("archived"))
+        or str(project.get("path_status") or "") != "ready"
+    ):
+        return {
+            "ready": False,
+            "code": "gmail_project_not_ready",
+            "message": "The fixed Gmail project is not ready.",
+            "status_code": 409,
+        }
+    status = lifecycle.status(probe_node=True)
+    installation = status.get("installation") or {}
+    if installation.get("valid") is not True:
+        return {
+            "ready": False,
+            "code": "n8n_installation_invalid",
+            "message": "The pinned n8n installation is not ready.",
+            "status_code": 409,
+        }
+    if status.get("isolation_ready") is not True:
+        return {
+            "ready": False,
+            "code": "n8n_isolation_not_ready",
+            "message": "The low-privilege n8n account and ACLs are not ready.",
+            "status_code": 409,
+        }
+    if status.get("state") in {"port_conflict", "upgrade_required", "failed"}:
+        return {
+            "ready": False,
+            "code": "n8n_runtime_not_ready",
+            "message": "The managed n8n runtime is not in a safe state.",
+            "status_code": 409,
+        }
+    if not gmail_workflows_ready(lifecycle.paths):
+        return {
+            "ready": False,
+            "code": "gmail_workflows_not_ready",
+            "message": "Configure, publish and activate both reviewed Gmail workflows first.",
+            "status_code": 409,
+        }
+    return {"ready": True}
 
 
 def validate_settings(data: Dict[str, Any]) -> Dict[str, Any]:
@@ -288,15 +406,49 @@ def rollback_hermes_rollout() -> Dict[str, Any]:
     }
 
 
+_MODEL_INVENTORY_CACHE_SECONDS = 3.0
+_model_inventory_cache_lock = threading.Lock()
+_model_inventory_cache: Dict[str, Any] = {
+    "key": "",
+    "expires_at": 0.0,
+    "items": [],
+}
+
+
+def _model_inventory_cache_key(settings: Dict[str, Any]) -> str:
+    relevant = {
+        "ollama_url": settings.get("ollama_url"),
+        "model_provider": settings.get("model_provider"),
+        "model_providers": settings.get("model_providers") or [],
+    }
+    encoded = json.dumps(relevant, ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
 def model_inventory() -> List[Dict[str, Any]]:
-    try:
-        return [
-            item
-            for item in provider_model_inventory(load_settings(), timeout=5)
-            if isinstance(item, dict) and item.get("name")
-        ]
-    except Exception:
-        return []
+    settings = load_settings()
+    cache_key = _model_inventory_cache_key(settings)
+    now = time.monotonic()
+    with _model_inventory_cache_lock:
+        if (
+            _model_inventory_cache["key"] == cache_key
+            and now < float(_model_inventory_cache["expires_at"])
+        ):
+            return [dict(item) for item in _model_inventory_cache["items"]]
+        try:
+            items = [
+                item
+                for item in provider_model_inventory(settings, timeout=5)
+                if isinstance(item, dict) and item.get("name")
+            ]
+        except Exception:
+            items = []
+        _model_inventory_cache.update({
+            "key": cache_key,
+            "expires_at": time.monotonic() + _MODEL_INVENTORY_CACHE_SECONDS,
+            "items": [dict(item) for item in items],
+        })
+        return [dict(item) for item in items]
 
 
 def ollama_models() -> List[str]:
@@ -568,6 +720,15 @@ def _retry_request(
                 "RETRY_RUN_NOT_FOUND", "The source run was not found.", recoverable=False
             ),
         )
+    if str(source.get("mode") or "").strip().casefold() == "email":
+        # Integration retries use the encrypted mail state machine.  Keep a
+        # known private Run ID indistinguishable from an unknown chat Run.
+        raise HTTPException(
+            status_code=404,
+            detail=error_payload(
+                "RETRY_RUN_NOT_FOUND", "The source run was not found.", recoverable=False
+            ),
+        )
     allowed, reason = _retry_eligibility(source)
     if not allowed:
         raise HTTPException(
@@ -802,6 +963,34 @@ def configure_chat_run_billing(
     return provider
 
 
+def _schedule_n8n_recovery(callable_: Any, identifier: str) -> None:
+    """Run one durable recovery action without blocking the event loop."""
+
+    async def run() -> None:
+        try:
+            await asyncio.to_thread(callable_, identifier)
+        except Exception as exc:  # private state already records the safe error
+            print(f"[N8N] Recovery action failed: {type(exc).__name__}")
+
+    task = asyncio.create_task(run())
+    n8n_background_tasks.add(task)
+    task.add_done_callback(n8n_background_tasks.discard)
+
+
+def _schedule_n8n_runtime_start(lifecycle: Any) -> None:
+    """Start optional n8n after ASGI readiness instead of blocking the UI."""
+
+    async def run() -> None:
+        try:
+            await asyncio.to_thread(lifecycle.start)
+        except Exception as exc:  # fail closed; core Workbench stays available
+            print(f"[N8N] Managed runtime remained disabled: {type(exc).__name__}")
+
+    task = asyncio.create_task(run(), name="managed-n8n-startup")
+    n8n_background_tasks.add(task)
+    task.add_done_callback(n8n_background_tasks.discard)
+
+
 @asynccontextmanager
 async def app_lifespan(_app: FastAPI):
     try:
@@ -814,12 +1003,44 @@ async def app_lifespan(_app: FastAPI):
     if supervisor is not None:
         try:
             await supervisor.start()
-            await supervisor.probe_once()
         except Exception as exc:  # pragma: no cover - startup best effort
             print(f"[HERMES] Health supervisor failed: {type(exc).__name__}")
+    lifecycle = n8n_lifecycle
+    mail_service = n8n_gmail_service
+    profile = database.get_n8n_gmail_profile()
+    if (
+        lifecycle is not None
+        and profile
+        and bool(profile.get("enabled"))
+        and bool(profile.get("auto_start"))
+    ):
+        _schedule_n8n_runtime_start(lifecycle)
+    if mail_service is not None and profile and bool(profile.get("enabled")):
+        try:
+            database.expire_n8n_gmail_deliveries(now=now_iso())
+            for draft_id in mail_service.recover_generation_jobs():
+                _schedule_n8n_recovery(mail_service.generate_draft, draft_id)
+            for delivery_id in mail_service.recover_delivery_jobs():
+                _schedule_n8n_recovery(mail_service.dispatch_delivery, delivery_id)
+            mail_service.purge_retention()
+        except Exception as exc:  # content remains encrypted and durable
+            print(f"[N8N] Recovery scan failed: {type(exc).__name__}")
     try:
         yield
     finally:
+        if n8n_background_tasks:
+            _, pending = await asyncio.wait(
+                tuple(n8n_background_tasks), timeout=30.0
+            )
+            for task in pending:
+                task.cancel()
+        if lifecycle is not None:
+            try:
+                state = await asyncio.to_thread(lifecycle.status)
+                if state.get("state") in {"ready", "starting", "degraded"}:
+                    await asyncio.to_thread(lifecycle.stop)
+            except Exception as exc:  # ownership checks remain authoritative
+                print(f"[N8N] Managed shutdown incomplete: {type(exc).__name__}")
         if supervisor is not None:
             await supervisor.stop()
         if cache is not None:
@@ -905,22 +1126,6 @@ settings_router = build_settings_router(
     hermes_rollout_guard=guard_hermes_rollout,
 )
 
-projects_router = build_projects_router(
-    database=database,
-    require_local=require_local_workbench,
-    error_payload=error_payload,
-    create_id=create_id,
-    default_project_root=PROJECTS_ROOT,
-    validate_project_path=validate_project_path,
-    managed_project_path=managed_project_path,
-    path_status=path_status,
-    write_project_manifest=write_project_manifest,
-    context_for_project=context_for_project,
-    context_payload=context_payload,
-    project_storage_dir=project_storage_dir,
-    normalize_path=normalize_path,
-)
-
 project_skill_store = ProjectSkillStore(
     database=database,
     project_dir_factory=project_storage_dir,
@@ -944,6 +1149,95 @@ project_skills_router = build_project_skills_router(
     runtime=project_skill_runtime,
     require_local=require_local_workbench,
     error_payload=error_payload,
+    session_access_guard=guard_integration_session,
+)
+
+n8n_lifecycle = ManagedN8nLifecycle()
+n8n_secret_store = N8nGmailSecretStore()
+n8n_agent_secret_store = N8nAgentSecretStore()
+_stored_n8n_mail_profile = database.get_n8n_gmail_profile() or {}
+_stored_n8n_recipient = str(
+    _stored_n8n_mail_profile.get("fixed_recipient") or ""
+).strip()
+_configured_n8n_recipient = str(
+    os.environ.get("WORKBENCH_N8N_GMAIL_RECIPIENT")
+    or (
+        _stored_n8n_recipient
+        if _stored_n8n_recipient.casefold() != FIXED_TEST_RECIPIENT.casefold()
+        else ""
+    )
+    or ""
+).strip()
+_n8n_recipient_is_configured = bool(
+    _configured_n8n_recipient
+    and _configured_n8n_recipient.casefold() != FIXED_TEST_RECIPIENT.casefold()
+)
+n8n_gmail_service = N8nGmailService(
+    cipher=AesGcmContentCipher(n8n_secret_store.content_key),
+    hmac_secret_provider=n8n_secret_store.inbound_hmac_key,
+    outbound_secret_provider=n8n_secret_store.outbound_webhook_key,
+    draft_generator=EmailDraftRuntime(
+        settings_loader=load_settings,
+        project_skill_runtime=project_skill_runtime,
+        database=database,
+    ),
+    delivery_dispatcher=N8nDeliveryDispatcher(
+        secret_provider=n8n_secret_store.outbound_webhook_key,
+    ),
+    enable_guard=n8n_profile_enable_guard,
+    fixed_recipient=_configured_n8n_recipient or FIXED_TEST_RECIPIENT,
+    recipient_configured=_n8n_recipient_is_configured,
+)
+n8n_agent_governance = N8nAgentGovernanceService(
+    broker=N8nApiBroker(n8n_agent_secret_store.api_key),
+    cipher=AesGcmContentCipher(n8n_agent_secret_store.content_key),
+    n8n_running=lambda: n8n_lifecycle.status(probe_node=False).get("state") == "ready",
+    # High-risk nodes remain fail-closed until the separate disposable runner
+    # has its own attestation implementation.
+    high_risk_runner_ready=lambda: False,
+)
+n8n_agent_planner = N8nPlanningService(
+    governance_service=n8n_agent_governance,
+    generator=N8nPlanModelGenerator(settings_loader=load_settings),
+)
+
+projects_router = build_projects_router(
+    database=database,
+    require_local=require_local_workbench,
+    error_payload=error_payload,
+    create_id=create_id,
+    default_project_root=PROJECTS_ROOT,
+    validate_project_path=validate_project_path,
+    managed_project_path=managed_project_path,
+    path_status=path_status,
+    write_project_manifest=write_project_manifest,
+    context_for_project=context_for_project,
+    context_payload=context_payload,
+    project_storage_dir=project_storage_dir,
+    normalize_path=normalize_path,
+    project_change_guard=guard_n8n_project_change,
+)
+
+n8n_gmail_router = build_n8n_gmail_router(
+    service=n8n_gmail_service,
+    require_local=require_local_workbench,
+    error_payload=error_payload,
+)
+n8n_agent_router = build_n8n_agent_router(
+    service=n8n_agent_governance,
+    secret_store=n8n_agent_secret_store,
+    planner=n8n_agent_planner,
+    require_local=require_local_workbench,
+    error_payload=error_payload,
+)
+n8n_runtime_router = build_n8n_runtime_router(
+    lifecycle=n8n_lifecycle,
+    require_local=require_local_workbench,
+    error_payload=error_payload,
+    workflow_ready=lambda: gmail_workflows_ready(n8n_lifecycle.paths),
+    workflow_status=lambda: inspect_gmail_workflows_readiness(n8n_lifecycle.paths),
+    mail_status=n8n_gmail_service.public_event_snapshot,
+    on_stop=lambda: n8n_agent_governance.downgrade_smart_policies("n8n_stopped"),
 )
 
 sessions_router = build_sessions_router(
@@ -957,6 +1251,7 @@ sessions_router = build_sessions_router(
     archive_session=archive_session,
     export_session_zip=export_session_zip,
     has_active_chat_run=has_active_chat_run,
+    session_change_guard=guard_integration_session,
 )
 
 attachments_router = build_attachments_router(
@@ -968,6 +1263,7 @@ attachments_router = build_attachments_router(
     project_attachments_dir=project_attachments_dir,
     extract_pdf_text=extract_pdf_text,
     sync_session_archive=sync_session_archive,
+    session_access_guard=guard_integration_session,
 )
 
 hermes_router = build_hermes_router(
@@ -991,6 +1287,9 @@ for domain_router in (
     project_skills_router,
     attachments_router,
     hermes_router,
+    n8n_gmail_router,
+    n8n_agent_router,
+    n8n_runtime_router,
     run_results_router,
     settings_router,
     models_router,
@@ -1021,6 +1320,15 @@ async def chat(request: ChatRequest):
 
     database.create_session(session_id, model=model)
     session = database.get_session(session_id)
+    if session and str(session.get("mode") or "").casefold() == "email":
+        raise HTTPException(
+            status_code=404,
+            detail=error_payload(
+                "SESSION_NOT_FOUND",
+                "Session was not found.",
+                recoverable=False,
+            ),
+        )
     project = (
         database.get_project(session["project_id"])
         if session and session.get("project_id")
@@ -1284,6 +1592,13 @@ async def chat(request: ChatRequest):
 def cancel_active_chat(run_id: str, request: Request):
     require_local_workbench(request)
     existing = database.get_run(run_id)
+    if existing and str(existing.get("mode") or "").casefold() == "email":
+        raise HTTPException(
+            status_code=404,
+            detail=error_payload(
+                "RUN_NOT_FOUND", "Run not found.", recoverable=False
+            ),
+        )
     if existing and existing.get("status") in {"completed", "failed", "cancelled"}:
         return {
             "success": True,
@@ -1305,6 +1620,7 @@ def latest_session_runs(session_id: str, limit: int = 1):
                 "SESSION_NOT_FOUND", "Session not found.", recoverable=False
             ),
         )
+    guard_integration_session(session_id, "runs_read")
     return {
         "success": True,
         "session_id": session_id,
@@ -1320,6 +1636,13 @@ def latest_session_runs(session_id: str, limit: int = 1):
 def run_execution_snapshot(run_id: str):
     run = database.get_run(run_id)
     if not run:
+        raise HTTPException(
+            status_code=404,
+            detail=error_payload(
+                "RUN_NOT_FOUND", "Run not found.", recoverable=False
+            ),
+        )
+    if str(run.get("mode") or "").casefold() == "email":
         raise HTTPException(
             status_code=404,
             detail=error_payload(

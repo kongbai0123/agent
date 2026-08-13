@@ -1,5 +1,33 @@
 # Local AI Workbench 改版紀錄
 
+## 2026-08-13 — `0.7.0-n8n-agent-governance-beta.1`
+
+### 主要更新
+
+- Sidebar 新增「流程」工作區，提供受管理的 n8n 啟停、狀態、Gmail Profile、Compose、背景 Run 與待核准項目。
+- 新增 Agent n8n 操作助理：先以無工具規劃器說明 2–3 個方案、風險、預期結果與所需權限；選定方案只建立不可變提案，不直接操作 n8n。
+- 新增 Project／Session 綁定的 n8n Broker。人工核准伺服器產生的 Before／After Diff 與 digest 後，才可建立或修改未啟用草稿、發布、啟用、停用或刪除 Workflow。
+- n8n API Key 使用 DPAPI 保護，不進模型、Prompt、Log、SSE、Audit 或 Inspector；跨 Project、封存及 Integration-only Session 均 fail closed。
+- 核准與執行前重新驗證 n8n 目標快照、Project binding、Policy、Runtime、API Key 與官方 Security Audit；任何 stale target 回傳 409。
+- Broker 呼叫後結果無法判定時改列 `execution_unknown`，要求人工對帳並禁止盲目重送。
+- 新增單一 Gmail V1：標籤來信與 Compose 產生純文字草稿，固定收件者、24 小時核准、一次性 Delivery claim、HMAC 防重播與 AES-256-GCM 內容保存。
+- n8n 固定為 2.32.5、Node.js 固定為 24.15.0、資料只使用 D 槽 runtime；低權限帳號／ACL 未就緒時拒絕啟動，不回退到互動使用者。
+
+### 安全限制
+
+- Credential 建立／更新／刪除保持關閉，直到完成 Project-scoped credential ownership。
+- Code、Execute Command、檔案系統與 Community Node 保持關閉，直到額外隔離 Runner 完成 attestation。
+- 任意 Workflow 直接執行保持關閉，直到具備受審核的 Trigger binding。
+- 系統管理的 Gmail Workflow 受保護，Agent 無法採用、修改或刪除。
+
+### 驗證
+
+- `python -m pytest tests -q`：857 passed、3 skipped。
+- n8n 專項：122 passed。
+- Python／JavaScript／PowerShell 語法、Git diff 與 public-tree 邊界檢查通過。
+
+---
+
 ## 2026-08-04 — `0.5.0-agent-skills-beta.1`
 
 ### 主要更新

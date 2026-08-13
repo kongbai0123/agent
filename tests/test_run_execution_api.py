@@ -56,7 +56,7 @@ def _failed_run(
         tasks=[
             {
                 "id": "generate",
-                "label": "Provider failed with sk-abcdefghijklmnop1234",
+                "label": "Provider failed with " + "sk-" + "abcdefghijklmnop1234",
                 "status": "failed",
                 "command": "never expose this command",
                 "args": {"path": "D:/private"},
@@ -164,6 +164,71 @@ def test_latest_and_execution_snapshots_are_project_bound_and_redacted():
     assert "private skill context" not in serialized
     assert "private upstream detail" not in serialized
     assert "storage_path" not in serialized
+
+
+def test_email_integration_sessions_and_runs_are_hidden_from_general_apis():
+    project_id = _id("project")
+    app_module.database.create_project(project_id, project_id, str(ROOT))
+    session_id = _id("email_session")
+    run_id = f"run_{uuid.uuid4().hex}"
+    turn_id = _id("email_turn")
+    attachment_id = _id("email_attachment")
+    context_id = _id("email_context")
+    app_module.database.create_session(
+        session_id,
+        title="Private mail integration",
+        mode="email",
+        project_id=project_id,
+    )
+    app_module.database.upsert_run(
+        run_id,
+        session_id,
+        turn_id,
+        "email-model",
+        "email",
+        "awaiting_approval",
+        project_id=project_id,
+    )
+    app_module.database.save_attachment(
+        attachment_id,
+        session_id,
+        "mail.txt",
+        "text/plain",
+        str(ROOT / "private-mail-attachment"),
+        1,
+        project_id=project_id,
+    )
+    app_module.database.save_temporary_context(
+        context_id,
+        session_id,
+        "mail.txt",
+        "private email context",
+        1,
+    )
+
+    with TestClient(app_module.app) as client:
+        assert client.get("/").status_code == 200
+        responses = (
+            client.get(f"/api/sessions/{session_id}/messages"),
+            client.get(f"/api/sessions/{session_id}/runs?limit=1"),
+            client.get(f"/api/runs/{run_id}"),
+            client.get(f"/api/runs/{run_id}/execution"),
+            client.get(f"/api/runs/{run_id}/results"),
+            client.get(f"/api/runs/{run_id}/skills"),
+            client.get(f"/api/attachments/{attachment_id}"),
+            client.get(f"/api/temp-contexts/{context_id}"),
+            client.delete(f"/api/temp-contexts/{context_id}"),
+            client.post(
+                "/api/chat",
+                json={
+                    "retry_of_run_id": run_id,
+                    "run_id": f"run_{uuid.uuid4().hex}",
+                    "session_id": session_id,
+                },
+            ),
+        )
+
+    assert all(response.status_code == 404 for response in responses)
 
 
 def test_whole_run_retry_replays_persisted_input_into_a_new_run(monkeypatch):

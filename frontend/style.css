@@ -4101,6 +4101,517 @@ html:not([data-theme="dark"]) ::-webkit-scrollbar-thumb:hover {
     }
 }
 
+/* Governed Agent administration for n8n. */
+.n8n-agent-governance {
+    border-color: color-mix(in srgb, #d97706 34%, var(--border-color));
+}
+
+.n8n-plan-mode {
+    border-color: color-mix(in srgb, var(--primary-color) 36%, var(--border-color));
+}
+
+.n8n-plan-layout {
+    margin-top: 16px;
+    display: grid;
+    grid-template-columns: minmax(0, 1.55fr) minmax(260px, .85fr);
+    gap: 14px;
+    align-items: start;
+}
+
+.n8n-plan-conversation {
+    min-width: 0;
+    padding: 12px;
+    border: 1px solid var(--panel-border);
+    border-radius: 12px;
+    background: var(--surface-subtle);
+}
+
+.n8n-plan-messages {
+    min-height: 154px;
+    max-height: 360px;
+    padding: 2px;
+    display: grid;
+    align-content: start;
+    gap: 10px;
+    overflow-y: auto;
+    scroll-behavior: smooth;
+}
+
+.n8n-plan-message {
+    width: fit-content;
+    max-width: min(88%, 720px);
+    padding: 10px 12px;
+    display: grid;
+    gap: 4px;
+    border: 1px solid var(--panel-border);
+    border-radius: 11px 11px 11px 3px;
+    background: var(--elev-bg);
+    color: var(--text-primary);
+    font-size: 13px;
+    line-height: 1.55;
+    overflow-wrap: anywhere;
+}
+
+.n8n-plan-message.is-user {
+    justify-self: end;
+    border-color: color-mix(in srgb, var(--primary-color) 28%, var(--panel-border));
+    border-radius: 11px 11px 3px 11px;
+    background: color-mix(in srgb, var(--primary-color) 9%, var(--elev-bg));
+}
+
+.n8n-plan-message.is-system {
+    width: 100%;
+    max-width: none;
+    border-style: dashed;
+    color: var(--text-muted);
+    font-size: 12px;
+}
+
+.n8n-plan-message strong { font-size: 12px; }
+.n8n-plan-message p { margin: 0; white-space: pre-wrap; }
+
+.n8n-plan-options {
+    margin-top: 10px;
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 8px;
+}
+
+.n8n-plan-options[hidden] { display: none; }
+.n8n-plan-option {
+    min-height: 42px;
+    padding: 8px 10px;
+    border: 1px solid color-mix(in srgb, var(--primary-color) 32%, var(--panel-border));
+    border-radius: 9px;
+    background: var(--elev-bg);
+    color: var(--text-primary);
+    font: inherit;
+    font-size: 12px;
+    font-weight: 700;
+    line-height: 1.4;
+    text-align: start;
+    cursor: pointer;
+}
+
+.n8n-plan-option:hover { background: color-mix(in srgb, var(--primary-color) 8%, var(--elev-bg)); }
+.n8n-plan-option:focus-visible {
+    outline: 2px solid var(--primary-color);
+    outline-offset: 2px;
+}
+
+.n8n-plan-form { margin-top: 12px; }
+.n8n-plan-form textarea { min-height: 86px; }
+.n8n-plan-form button { font-size: 12px; }
+
+.n8n-plan-impact {
+    min-width: 0;
+    display: grid;
+    gap: 9px;
+}
+
+.n8n-plan-impact[hidden] { display: none; }
+.n8n-plan-impact-card {
+    padding: 11px 12px;
+    border: 1px solid var(--panel-border);
+    border-radius: 10px;
+    background: var(--surface-subtle);
+    font-size: 12px;
+    line-height: 1.5;
+}
+
+.n8n-plan-impact-card.is-risk {
+    border-color: color-mix(in srgb, #d97706 38%, var(--panel-border));
+    background: color-mix(in srgb, #f59e0b 7%, var(--surface-subtle));
+}
+
+.n8n-plan-impact-card.is-permission {
+    border-color: color-mix(in srgb, var(--primary-color) 32%, var(--panel-border));
+}
+
+.n8n-plan-impact-card h3 {
+    margin: 0;
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    font-size: 13px;
+}
+
+.n8n-plan-impact-card h3 svg { width: 15px; height: 15px; }
+.n8n-plan-impact-card ul { margin: 7px 0 0; padding-inline-start: 19px; }
+.n8n-plan-impact-card li + li { margin-top: 4px; }
+
+.n8n-plan-proposal-confirm {
+    margin-top: 14px;
+    padding: 13px 14px;
+    display: grid;
+    gap: 10px;
+    border: 1px solid color-mix(in srgb, #d97706 45%, var(--panel-border));
+    border-radius: 11px;
+    background: color-mix(in srgb, #f59e0b 8%, var(--surface, #fff));
+    font-size: 12px;
+    line-height: 1.5;
+}
+
+.n8n-plan-proposal-confirm[hidden] { display: none; }
+.n8n-plan-proposal-confirm p { margin-top: 3px; color: var(--text-muted); }
+.n8n-plan-confirm-row {
+    display: flex;
+    align-items: flex-start;
+    gap: 9px;
+    cursor: pointer;
+}
+.n8n-plan-confirm-row input { width: 18px; height: 18px; flex: 0 0 auto; }
+.n8n-plan-proposal-confirm .workflow-actions { margin-top: 0; }
+.n8n-plan-proposal-confirm button { font-size: 12px; }
+
+.n8n-agent-policy-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+
+.workflow-risk-callout {
+    padding: 12px 14px;
+    border: 1px solid color-mix(in srgb, #d97706 42%, var(--border-color));
+    border-radius: 10px;
+    background: color-mix(in srgb, #f59e0b 9%, var(--surface, #fff));
+    color: var(--text-primary);
+    font-size: 12px;
+    line-height: 1.55;
+}
+
+.workflow-risk-callout ul { margin: 6px 0 0; padding-inline-start: 20px; }
+.n8n-agent-api-key-panel { margin-top: 12px; font-size: 12px; }
+.n8n-agent-api-key-panel summary { cursor: pointer; font-weight: 600; }
+.n8n-operation-row { width: 100%; border: 0; text-align: start; color: inherit; cursor: pointer; }
+.n8n-operation-row:focus-visible { outline: 2px solid var(--accent, #5667d8); outline-offset: 2px; }
+.n8n-operation-diff {
+    max-height: 260px;
+    overflow: auto;
+    padding: 10px;
+    border-radius: 8px;
+    background: var(--surface-muted, rgba(127, 127, 127, .09));
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    font: 12px/1.5 var(--font-mono);
+}
+
+@media (max-width: 900px) {
+    .n8n-plan-layout { grid-template-columns: 1fr; }
+    .n8n-plan-options { grid-template-columns: 1fr; }
+    .n8n-agent-policy-grid { grid-template-columns: 1fr; }
+}
+
+/* ============================================================================
+   n8n Gmail 工作流程中心：外部節點由 n8n 管理，核准留在 Workbench。
+   ============================================================================ */
+.rail-btn { position: relative; }
+.rail-notification-badge {
+    position: absolute;
+    top: 2px;
+    right: 2px;
+    min-width: 17px;
+    height: 17px;
+    padding: 0 4px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 999px;
+    background: var(--warning-color);
+    color: #201f1c;
+    font-size: 12px;
+    font-weight: 700;
+    line-height: 1;
+}
+
+.workflow-center {
+    min-width: 0;
+    height: 100%;
+    flex: 1 1 auto;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    background: var(--chat-bg);
+}
+.workflow-center[hidden],
+.chat-container[hidden],
+.side-drawer[hidden] {
+    display: none;
+}
+.workflow-center-header {
+    min-height: 86px;
+    padding: 16px 24px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 18px;
+    border-bottom: 1px solid var(--panel-border);
+    background: var(--elev-header-bg);
+}
+.workflow-center-header h1 {
+    margin-top: 2px;
+    font-size: 22px;
+    line-height: 1.2;
+}
+.workflow-center-header p,
+.workflow-card-head p {
+    margin-top: 4px;
+    color: var(--text-muted);
+    font-size: 13px;
+    line-height: 1.45;
+}
+.workflow-eyebrow {
+    color: var(--primary-color);
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: .08em;
+}
+.workflow-center-body {
+    width: min(1180px, 100%);
+    margin: 0 auto;
+    padding: 22px;
+    display: grid;
+    gap: 18px;
+    overflow: auto;
+}
+.workflow-grid {
+    min-width: 0;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: 18px;
+}
+.workflow-card {
+    min-width: 0;
+    padding: 18px;
+    border: 1px solid var(--panel-border);
+    border-radius: 14px;
+    background: var(--elev-bg);
+    box-shadow: 0 8px 24px rgba(32, 31, 28, .06);
+}
+.workflow-card-head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px;
+}
+.workflow-card-head h2 { font-size: 17px; line-height: 1.3; }
+.workflow-status-pill,
+.workflow-save-state,
+.workflow-run-count,
+.mail-run-status {
+    flex: 0 0 auto;
+    min-height: 25px;
+    padding: 4px 9px;
+    display: inline-flex;
+    align-items: center;
+    border-radius: 999px;
+    border: 1px solid var(--panel-border);
+    background: var(--ink-04);
+    color: var(--text-muted);
+    font-size: 12px;
+    font-weight: 700;
+}
+.workflow-status-pill.is-success,
+.workflow-save-state.is-success,
+.mail-run-status.is-success { color: var(--success-color); border-color: color-mix(in srgb, var(--success-color) 35%, var(--panel-border)); }
+.workflow-status-pill.is-warning,
+.workflow-save-state.is-warning,
+.mail-run-status.is-warning { color: var(--warning-color); border-color: color-mix(in srgb, var(--warning-color) 45%, var(--panel-border)); }
+.workflow-save-state.is-error,
+.mail-run-status.is-error { color: var(--danger-color); border-color: color-mix(in srgb, var(--danger-color) 38%, var(--panel-border)); }
+.mail-run-status.is-running { color: var(--primary-color); }
+.mail-run-status.is-muted { color: var(--text-muted); }
+.workflow-service-metrics {
+    margin-top: 14px;
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 8px;
+}
+.workflow-service-metrics > div {
+    min-width: 0;
+    padding: 10px;
+    display: grid;
+    gap: 3px;
+    border: 1px solid var(--panel-border);
+    border-radius: 9px;
+    background: var(--surface-subtle);
+}
+.workflow-service-metrics dt { color: var(--text-muted); font-size: 12px; }
+.workflow-service-metrics dd { min-width: 0; overflow-wrap: anywhere; font-size: 13px; font-weight: 700; }
+.workflow-actions {
+    margin-top: 14px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+.workflow-actions-end { justify-content: flex-end; }
+.workflow-actions .btn { min-height: 40px; }
+.workflow-security-note,
+.workflow-locked-summary {
+    margin-top: 12px;
+    padding: 9px 11px;
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    border-radius: 9px;
+    background: color-mix(in srgb, var(--primary-color) 7%, transparent);
+    color: var(--text-light);
+    font-size: 12px;
+    line-height: 1.5;
+}
+.workflow-security-note svg,
+.workflow-locked-summary svg { width: 16px; height: 16px; flex: 0 0 auto; color: var(--primary-color); }
+.workflow-form { margin-top: 15px; display: grid; gap: 13px; }
+.workflow-form label,
+.mail-draft-form label { display: grid; gap: 6px; color: var(--text-primary); font-size: 13px; font-weight: 700; }
+.workflow-form label > small,
+.mail-draft-form label > small { color: var(--text-muted); font-size: 12px; font-weight: 400; line-height: 1.45; }
+.workflow-form input,
+.workflow-form select,
+.workflow-form textarea,
+.mail-draft-form input,
+.mail-draft-form textarea {
+    width: 100%;
+    min-height: 42px;
+    padding: 9px 11px;
+    border: 1px solid var(--panel-border);
+    border-radius: 8px;
+    outline: none;
+    background: var(--surface-subtle);
+    color: var(--text-primary);
+    font: inherit;
+    font-size: 13px;
+    line-height: 1.5;
+}
+.workflow-form textarea,
+.mail-draft-form textarea { min-height: 118px; resize: vertical; }
+.workflow-form input:focus-visible,
+.workflow-form select:focus-visible,
+.workflow-form textarea:focus-visible,
+.mail-draft-form input:focus-visible,
+.mail-draft-form textarea:focus-visible {
+    border-color: var(--primary-color);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--primary-color) 16%, transparent);
+}
+.workflow-form input[readonly],
+.mail-draft-form input:disabled,
+.mail-draft-form textarea:disabled { color: var(--text-muted); background: var(--surface-muted); cursor: not-allowed; }
+.workflow-switch-row {
+    min-height: 52px;
+    padding: 10px 11px;
+    display: flex !important;
+    grid-template-columns: none;
+    align-items: center;
+    justify-content: space-between;
+    gap: 14px;
+    border: 1px solid var(--panel-border);
+    border-radius: 9px;
+}
+.workflow-switch-row > span { display: grid; gap: 3px; }
+.workflow-switch-row input { width: 42px; min-height: 24px; flex: 0 0 auto; }
+.workflow-empty {
+    padding: 14px;
+    border: 1px dashed var(--panel-border);
+    border-radius: 9px;
+    color: var(--text-muted);
+    font-size: 13px;
+    line-height: 1.5;
+    text-align: center;
+}
+.workflow-empty.is-error { color: var(--danger-color); border-color: color-mix(in srgb, var(--danger-color) 45%, var(--panel-border)); }
+.mail-run-list { margin-top: 13px; display: grid; gap: 7px; }
+.mail-run-row {
+    min-width: 0;
+    min-height: 58px;
+    padding: 8px 10px;
+    display: grid;
+    grid-template-columns: 34px minmax(0, 1fr) auto auto;
+    align-items: center;
+    gap: 10px;
+    border: 1px solid var(--panel-border);
+    border-radius: 9px;
+    background: var(--surface-subtle);
+}
+.mail-run-icon {
+    width: 32px;
+    height: 32px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 9px;
+    background: var(--ink-05);
+    color: var(--primary-color);
+}
+.mail-run-icon svg { width: 16px; height: 16px; }
+.mail-run-copy { min-width: 0; display: grid; gap: 3px; }
+.mail-run-copy strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+.mail-run-copy span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-muted); font-size: 12px; }
+
+.mail-approval-badge { right: auto; left: 3px; cursor: pointer; }
+.mail-inspector-content { min-width: 0; padding: 0 12px 12px; overflow-y: auto; }
+.mail-inspector-head {
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    margin: 0 -12px 10px;
+    padding: 10px 12px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    border-bottom: 1px solid var(--panel-border);
+    background: var(--elev-bg);
+}
+.mail-inspector-head > div { min-width: 0; display: grid; gap: 2px; }
+.mail-inspector-head strong { font-size: 13px; }
+.mail-inspector-head span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-muted); font-size: 12px; }
+.mail-inspector-section { margin-top: 9px; }
+.mail-draft-form { margin-top: 8px; display: grid; gap: 11px; }
+.mail-draft-revision {
+    display: grid;
+    gap: 3px;
+    color: var(--text-muted);
+    font-size: 12px;
+}
+.mail-draft-revision code { overflow-wrap: anywhere; font: inherit; }
+.mail-draft-dirty { color: var(--warning-color); font-size: 12px; line-height: 1.4; }
+.mail-draft-actions { display: flex; gap: 7px; flex-wrap: wrap; justify-content: flex-end; }
+.run-inspector-button.danger { border-color: color-mix(in srgb, var(--danger-color) 42%, var(--panel-border)); color: var(--danger-color); }
+.mail-binding-description { margin: 7px 0 10px; color: var(--text-light); font-size: 12px; line-height: 1.55; }
+.mail-metadata-row {
+    min-width: 0;
+    margin-top: 6px;
+    padding: 7px 8px;
+    display: grid;
+    grid-template-columns: 16px minmax(0, 1fr);
+    gap: 2px 7px;
+    align-items: center;
+    border-radius: 7px;
+    background: var(--surface-subtle);
+}
+.mail-metadata-row svg { width: 15px; height: 15px; color: var(--text-muted); grid-row: 1 / 3; }
+.mail-metadata-row span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; font-weight: 700; }
+.mail-metadata-row small { color: var(--text-muted); font-size: 12px; overflow-wrap: anywhere; }
+
+@media (max-width: 1000px) {
+    .workflow-grid { grid-template-columns: 1fr; }
+}
+@media (max-width: 760px) {
+    .workflow-center-header { min-height: 72px; padding: 12px 14px; }
+    .workflow-center-header p { display: none; }
+    .workflow-center-body { padding: 12px; }
+    .workflow-card { padding: 14px; }
+    .workflow-service-metrics { grid-template-columns: 1fr; }
+    .mail-run-row { grid-template-columns: 32px minmax(0, 1fr) auto; }
+    .mail-run-status { grid-column: 2; justify-self: start; }
+    .mail-run-row > .btn { grid-column: 3; grid-row: 1 / 3; }
+}
+@media (max-width: 520px) {
+    .workflow-center-header .btn { min-width: 40px; padding: 8px; font-size: 0; }
+    .workflow-center-header .btn svg { width: 17px; height: 17px; }
+    .workflow-card-head { display: grid; }
+    .workflow-actions .btn { width: 100%; justify-content: center; }
+    .mail-inspector-head { align-items: flex-start; }
+    .mail-inspector-head .run-inspector-button { padding: 6px 8px; }
+}
+
 /* Hermes stays an optional backend while the Workbench remains the UI. */
 .hermes-settings-panel {
     display: grid;

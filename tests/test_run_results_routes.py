@@ -275,7 +275,7 @@ def test_artifact_preview_requires_exact_run_session_and_turn_and_redacts(tmp_pa
         "files": [
             {
                 "path": "report.md",
-                "content": "token=ghp_abcdefghijklmnopqrstuvwxyz1234\nC:\\Users\\private\\note.txt",
+                "content": "token=" + "ghp_" + "abcdefghijklmnopqrstuvwxyz1234\nC:\\Users\\private\\note.txt",
                 "language": "markdown",
             }
         ],

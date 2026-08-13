@@ -90,7 +90,7 @@ def test_status_omits_common_secret_configuration_names(tmp_path: Path) -> None:
 def test_diff_is_bounded_and_redacts_secrets_and_private_absolute_paths(tmp_path: Path) -> None:
     project = _repository(tmp_path / "repo")
     root = Path(str(project["root_path"]))
-    secret = "sk-abcdefghijklmnop123456"
+    secret = "sk-" + "abcdefghijklmnop123456"
     (root / "tracked.txt").write_text(
         f"{secret}\nC:\\Users\\private\\notes.txt\n" + ("x" * (MAX_DIFF_BYTES + 4096)),
         encoding="utf-8",

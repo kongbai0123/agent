@@ -42,6 +42,12 @@ PUBLIC_API_PATHS = frozenset(
     }
 )
 
+# These paths are not public.  They deliberately bypass the browser session
+# token because the n8n service authenticates every request with a separate,
+# route-level HMAC/one-time-token contract.  Keeping the prefix exact prevents
+# an integration credential from becoming a general Workbench API credential.
+SERVICE_AUTH_API_PREFIXES = ("/api/integrations/n8n/v1/gmail/",)
+
 TOKEN_FILENAME = "workbench-session-token"
 SESSION_COOKIE_NAME = "workbench_session"
 
@@ -140,6 +146,9 @@ def install_local_session_guard(app: Any, error_payload: Callable[..., dict]) ->
             )
 
         if path in PUBLIC_API_PATHS:
+            return await call_next(request)
+
+        if any(path.startswith(prefix) for prefix in SERVICE_AUTH_API_PREFIXES):
             return await call_next(request)
 
         # Browser traffic uses a same-origin HttpOnly cookie.  The header remains

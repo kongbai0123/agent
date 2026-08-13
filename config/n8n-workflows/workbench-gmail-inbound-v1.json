@@ -1,0 +1,191 @@
+{
+  "templateId": "workbench-gmail-inbound-v1",
+  "name": "Workbench Gmail Inbound v1",
+  "active": false,
+  "nodes": [
+    {
+      "parameters": {"rule": {"interval": [{"field": "minutes", "minutesInterval": 1}]}},
+      "id": "gmail-inbound-schedule", "name": "Schedule", "type": "n8n-nodes-base.scheduleTrigger", "typeVersion": 1.2, "position": [0, 0]
+    },
+    {
+      "parameters": {"resource": "message", "operation": "getAll", "returnAll": false, "limit": 10, "simple": false, "options": {"downloadAttachments": false}, "filters": {"q": "label:Workbench-Agent in:inbox -in:sent"}},
+      "id": "gmail-inbound-search", "name": "Gmail Search", "type": "n8n-nodes-base.gmail", "typeVersion": 2.1, "position": [220, 0],
+      "credentials": {"gmailOAuth2": {"id": "__GMAIL_CREDENTIAL_ID__", "name": "Workbench Gmail OAuth"}}
+    },
+    {
+      "parameters": {"resource": "thread", "operation": "get", "threadId": "={{$json.threadId}}", "simple": false, "options": {"returnOnlyMessages": false}},
+      "id": "gmail-inbound-thread", "name": "Gmail Thread Get", "type": "n8n-nodes-base.gmail", "typeVersion": 2.1, "position": [440, 0],
+      "credentials": {"gmailOAuth2": {"id": "__GMAIL_CREDENTIAL_ID__", "name": "Workbench Gmail OAuth"}}
+    },
+    {
+      "parameters": {"mode": "manual", "assignments": {"assignments": [
+        {"id": "context-message-id", "name": "gmail_message_id", "type": "string", "value": "={{String($('Gmail Search').item.json.id||'').slice(0,128)}}"},
+        {"id": "context-thread-id", "name": "gmail_thread_id", "type": "string", "value": "={{String($('Gmail Search').item.json.threadId||'').slice(0,128)}}"},
+        {"id": "context-sender", "name": "sender", "type": "string", "value": "={{String($('Gmail Search').item.json.from?.value?.[0]?.address||'').slice(0,320)}}"},
+        {"id": "context-subject", "name": "subject", "type": "string", "value": "={{String($('Gmail Search').item.json.subject||'').slice(0,998)}}"},
+        {"id": "context-current-body", "name": "body_text", "type": "string", "value": "={{String($('Gmail Search').item.json.text||'').slice(0,100000)}}"},
+        {"id": "context-label-id", "name": "workbench_label_id", "type": "string", "value": "={{(()=>{const current=($json.messages||[]).find(message=>message.id===$('Gmail Search').item.json.id)||{};return String((current.labels||[]).find(label=>label.name==='Workbench-Agent')?.id||'');})()}}"},
+        {"id": "context-attachments", "name": "attachments", "type": "array", "value": "={{(()=>{const current=($json.messages||[]).find(message=>message.id===$('Gmail Search').item.json.id)||{};const metadata=[];const walk=part=>{if(!part||metadata.length>=50)return;if(part.body?.attachmentId){const size=Number(part.body.size||0);metadata.push({attachment_id:String(part.body.attachmentId).slice(0,128),filename:String(part.filename||'').slice(0,512),mime_type:String(part.mimeType||'application/octet-stream').slice(0,255),size_bytes:Number.isFinite(size)?Math.max(0,Math.floor(size)):0});}(part.parts||[]).forEach(walk);};walk(current.payload||{});return metadata;})()}}"},
+        {"id": "context-thread-messages", "name": "thread_messages", "type": "array", "value": "={{(()=>{const currentId=String($('Gmail Search').item.json.id||'');const currentBody=String($('Gmail Search').item.json.text||'').slice(0,100000);let remaining=100000-currentBody.length;const decode=data=>String(data||'').replace(/-/g,'+').replace(/_/g,'/').base64Decode();const bodyOf=message=>{const plain=[];const html=[];const walk=part=>{if(!part)return;if(part.body?.data&&part.mimeType==='text/plain')plain.push(decode(part.body.data));if(part.body?.data&&part.mimeType==='text/html')html.push(decode(part.body.data).removeTags());(part.parts||[]).forEach(walk);};walk(message.payload||{});return (plain.length?plain:html).join('\\n');};const selected=($json.messages||[]).filter(message=>String(message.id||'')!==currentId).slice(-20).reverse();const newestFirst=selected.map(message=>{const text=bodyOf(message).slice(0,Math.max(0,remaining));remaining-=text.length;return {gmail_message_id:String(message.id||'').slice(0,128),sender:String(message.From||'').slice(0,320),subject:String(message.Subject||'').slice(0,998),body_text:text,sent_at:String(message.internalDate||message.Date||'').slice(0,64)};});return newestFirst.reverse();})()}}"}
+      ]}, "includeOtherFields": false, "options": {}},
+      "id": "gmail-inbound-context", "name": "Build Gmail Context", "type": "n8n-nodes-base.set", "typeVersion": 3.4, "position": [660, 0]
+    },
+    {
+      "parameters": {"mode": "manual", "assignments": {"assignments": [
+        {"id": "inbound-request-body", "name": "request_body", "type": "string", "value": "={{JSON.stringify({event_id:'gmail-'+$json.gmail_message_id,workflow_key:'__WORKBENCH_WORKFLOW_KEY__',gmail_message_id:$json.gmail_message_id,gmail_thread_id:$json.gmail_thread_id,sender:$json.sender,subject:$json.subject,body_text:$json.body_text,labels:['INBOX','Workbench-Agent'],attachments:$json.attachments,thread_messages:$json.thread_messages})}}"},
+        {"id": "inbound-request-path", "name": "request_path", "type": "string", "value": "/api/integrations/n8n/v1/gmail/events"}
+      ]}, "includeOtherFields": false, "options": {}},
+      "id": "gmail-inbound-prepare", "name": "Prepare Gmail Event", "type": "n8n-nodes-base.set", "typeVersion": 3.4, "position": [880, 0]
+    },
+    {
+      "parameters": {"mode": "manual", "assignments": {"assignments": [
+        {"id": "attempt-1-body", "name": "request_body", "type": "string", "value": "={{$('Prepare Gmail Event').item.json.request_body}}"},
+        {"id": "attempt-1-path", "name": "request_path", "type": "string", "value": "={{$('Prepare Gmail Event').item.json.request_path}}"},
+        {"id": "attempt-1-time", "name": "timestamp", "type": "string", "value": "={{Math.floor(Date.now()/1000).toString()}}"}
+      ]}, "includeOtherFields": false, "options": {}},
+      "id": "gmail-inbound-attempt-1-auth", "name": "Prepare Attempt 1 Auth", "type": "n8n-nodes-base.set", "typeVersion": 3.4, "position": [1100, 0]
+    },
+    {
+      "parameters": {"action": "hash", "binaryData": false, "type": "SHA256", "value": "={{$json.request_body}}", "dataPropertyName": "body_sha256", "encoding": "hex"},
+      "id": "gmail-inbound-attempt-1-sha", "name": "Hash Attempt 1 Body", "type": "n8n-nodes-base.crypto", "typeVersion": 2, "position": [1320, 0]
+    },
+    {
+      "parameters": {"action": "generate", "dataPropertyName": "nonce", "encodingType": "hex", "stringLength": 32},
+      "id": "gmail-inbound-attempt-1-nonce", "name": "Generate Attempt 1 Nonce", "type": "n8n-nodes-base.crypto", "typeVersion": 2, "position": [1540, 0]
+    },
+    {
+      "parameters": {"mode": "manual", "assignments": {"assignments": [{"id": "attempt-1-canonical", "name": "canonical", "type": "string", "value": "={{'POST\\n'+$json.request_path+'\\n'+$json.timestamp+'\\n'+$json.nonce+'\\n'+$json.body_sha256}}"}]}, "includeOtherFields": true, "options": {}},
+      "id": "gmail-inbound-attempt-1-canonical", "name": "Build Attempt 1 Canonical", "type": "n8n-nodes-base.set", "typeVersion": 3.4, "position": [1760, 0]
+    },
+    {
+      "parameters": {"action": "hmac", "binaryData": false, "type": "SHA256", "value": "={{$json.canonical}}", "dataPropertyName": "signature", "encoding": "hex"},
+      "id": "gmail-inbound-attempt-1-sign", "name": "Sign Attempt 1", "type": "n8n-nodes-base.crypto", "typeVersion": 2, "position": [1980, 0],
+      "credentials": {"crypto": {"id": "__WORKBENCH_HMAC_CREDENTIAL_ID__", "name": "Workbench HMAC"}}
+    },
+    {
+      "parameters": {"method": "POST", "url": "http://127.0.0.1:8000/api/integrations/n8n/v1/gmail/events", "authentication": "none", "sendHeaders": true, "headerParameters": {"parameters": [{"name": "X-N8N-Timestamp", "value": "={{$json.timestamp}}"}, {"name": "X-N8N-Nonce", "value": "={{$json.nonce}}"}, {"name": "X-N8N-Signature", "value": "={{$json.signature}}"}, {"name": "X-N8N-Profile", "value": "gmail"}]}, "sendBody": true, "contentType": "raw", "rawContentType": "application/json", "body": "={{$json.request_body}}", "options": {"timeout": 10000, "response": {"response": {"fullResponse": true, "neverError": true, "responseFormat": "json"}}}},
+      "id": "gmail-inbound-attempt-1-submit", "name": "Submit Attempt 1", "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.2, "position": [2200, 0], "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {"conditions": {"options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 2}, "conditions": [{"id": "accepted-attempt-1-condition", "leftValue": "={{Number($json.statusCode||0)===202 && $json.body?.accepted===true}}", "rightValue": true, "operator": {"type": "boolean", "operation": "true", "singleValue": true}}], "combinator": "and"}, "options": {}},
+      "id": "gmail-inbound-attempt-1-accepted", "name": "Accepted Attempt 1", "type": "n8n-nodes-base.if", "typeVersion": 2.2, "position": [2420, 0]
+    },
+    {
+      "parameters": {"conditions": {"options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 2}, "conditions": [{"id": "retry-attempt-1-condition", "leftValue": "={{Boolean($json.error)||Number($json.statusCode||0)>=500}}", "rightValue": true, "operator": {"type": "boolean", "operation": "true", "singleValue": true}}], "combinator": "and"}, "options": {}},
+      "id": "gmail-inbound-attempt-1-retryable", "name": "Retryable Attempt 1", "type": "n8n-nodes-base.if", "typeVersion": 2.2, "position": [2640, 120]
+    },
+    {
+      "parameters": {"mode": "manual", "assignments": {"assignments": [
+        {"id": "attempt-2-body", "name": "request_body", "type": "string", "value": "={{$('Prepare Gmail Event').item.json.request_body}}"},
+        {"id": "attempt-2-path", "name": "request_path", "type": "string", "value": "={{$('Prepare Gmail Event').item.json.request_path}}"},
+        {"id": "attempt-2-time", "name": "timestamp", "type": "string", "value": "={{Math.floor(Date.now()/1000).toString()}}"}
+      ]}, "includeOtherFields": false, "options": {}},
+      "id": "gmail-inbound-attempt-2-auth", "name": "Prepare Attempt 2 Auth", "type": "n8n-nodes-base.set", "typeVersion": 3.4, "position": [2860, 120]
+    },
+    {
+      "parameters": {"action": "hash", "binaryData": false, "type": "SHA256", "value": "={{$json.request_body}}", "dataPropertyName": "body_sha256", "encoding": "hex"},
+      "id": "gmail-inbound-attempt-2-sha", "name": "Hash Attempt 2 Body", "type": "n8n-nodes-base.crypto", "typeVersion": 2, "position": [3080, 120]
+    },
+    {
+      "parameters": {"action": "generate", "dataPropertyName": "nonce", "encodingType": "hex", "stringLength": 32},
+      "id": "gmail-inbound-attempt-2-nonce", "name": "Generate Attempt 2 Nonce", "type": "n8n-nodes-base.crypto", "typeVersion": 2, "position": [3300, 120]
+    },
+    {
+      "parameters": {"mode": "manual", "assignments": {"assignments": [{"id": "attempt-2-canonical", "name": "canonical", "type": "string", "value": "={{'POST\\n'+$json.request_path+'\\n'+$json.timestamp+'\\n'+$json.nonce+'\\n'+$json.body_sha256}}"}]}, "includeOtherFields": true, "options": {}},
+      "id": "gmail-inbound-attempt-2-canonical", "name": "Build Attempt 2 Canonical", "type": "n8n-nodes-base.set", "typeVersion": 3.4, "position": [3520, 120]
+    },
+    {
+      "parameters": {"action": "hmac", "binaryData": false, "type": "SHA256", "value": "={{$json.canonical}}", "dataPropertyName": "signature", "encoding": "hex"},
+      "id": "gmail-inbound-attempt-2-sign", "name": "Sign Attempt 2", "type": "n8n-nodes-base.crypto", "typeVersion": 2, "position": [3740, 120],
+      "credentials": {"crypto": {"id": "__WORKBENCH_HMAC_CREDENTIAL_ID__", "name": "Workbench HMAC"}}
+    },
+    {
+      "parameters": {"method": "POST", "url": "http://127.0.0.1:8000/api/integrations/n8n/v1/gmail/events", "authentication": "none", "sendHeaders": true, "headerParameters": {"parameters": [{"name": "X-N8N-Timestamp", "value": "={{$json.timestamp}}"}, {"name": "X-N8N-Nonce", "value": "={{$json.nonce}}"}, {"name": "X-N8N-Signature", "value": "={{$json.signature}}"}, {"name": "X-N8N-Profile", "value": "gmail"}]}, "sendBody": true, "contentType": "raw", "rawContentType": "application/json", "body": "={{$json.request_body}}", "options": {"timeout": 10000, "response": {"response": {"fullResponse": true, "neverError": true, "responseFormat": "json"}}}},
+      "id": "gmail-inbound-attempt-2-submit", "name": "Submit Attempt 2", "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.2, "position": [3960, 120], "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {"conditions": {"options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 2}, "conditions": [{"id": "accepted-attempt-2-condition", "leftValue": "={{Number($json.statusCode||0)===202 && $json.body?.accepted===true}}", "rightValue": true, "operator": {"type": "boolean", "operation": "true", "singleValue": true}}], "combinator": "and"}, "options": {}},
+      "id": "gmail-inbound-attempt-2-accepted", "name": "Accepted Attempt 2", "type": "n8n-nodes-base.if", "typeVersion": 2.2, "position": [4180, 120]
+    },
+    {
+      "parameters": {"conditions": {"options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 2}, "conditions": [{"id": "retry-attempt-2-condition", "leftValue": "={{Boolean($json.error)||Number($json.statusCode||0)>=500}}", "rightValue": true, "operator": {"type": "boolean", "operation": "true", "singleValue": true}}], "combinator": "and"}, "options": {}},
+      "id": "gmail-inbound-attempt-2-retryable", "name": "Retryable Attempt 2", "type": "n8n-nodes-base.if", "typeVersion": 2.2, "position": [4400, 240]
+    },
+    {
+      "parameters": {"mode": "manual", "assignments": {"assignments": [
+        {"id": "attempt-3-body", "name": "request_body", "type": "string", "value": "={{$('Prepare Gmail Event').item.json.request_body}}"},
+        {"id": "attempt-3-path", "name": "request_path", "type": "string", "value": "={{$('Prepare Gmail Event').item.json.request_path}}"},
+        {"id": "attempt-3-time", "name": "timestamp", "type": "string", "value": "={{Math.floor(Date.now()/1000).toString()}}"}
+      ]}, "includeOtherFields": false, "options": {}},
+      "id": "gmail-inbound-attempt-3-auth", "name": "Prepare Attempt 3 Auth", "type": "n8n-nodes-base.set", "typeVersion": 3.4, "position": [4620, 240]
+    },
+    {
+      "parameters": {"action": "hash", "binaryData": false, "type": "SHA256", "value": "={{$json.request_body}}", "dataPropertyName": "body_sha256", "encoding": "hex"},
+      "id": "gmail-inbound-attempt-3-sha", "name": "Hash Attempt 3 Body", "type": "n8n-nodes-base.crypto", "typeVersion": 2, "position": [4840, 240]
+    },
+    {
+      "parameters": {"action": "generate", "dataPropertyName": "nonce", "encodingType": "hex", "stringLength": 32},
+      "id": "gmail-inbound-attempt-3-nonce", "name": "Generate Attempt 3 Nonce", "type": "n8n-nodes-base.crypto", "typeVersion": 2, "position": [5060, 240]
+    },
+    {
+      "parameters": {"mode": "manual", "assignments": {"assignments": [{"id": "attempt-3-canonical", "name": "canonical", "type": "string", "value": "={{'POST\\n'+$json.request_path+'\\n'+$json.timestamp+'\\n'+$json.nonce+'\\n'+$json.body_sha256}}"}]}, "includeOtherFields": true, "options": {}},
+      "id": "gmail-inbound-attempt-3-canonical", "name": "Build Attempt 3 Canonical", "type": "n8n-nodes-base.set", "typeVersion": 3.4, "position": [5280, 240]
+    },
+    {
+      "parameters": {"action": "hmac", "binaryData": false, "type": "SHA256", "value": "={{$json.canonical}}", "dataPropertyName": "signature", "encoding": "hex"},
+      "id": "gmail-inbound-attempt-3-sign", "name": "Sign Attempt 3", "type": "n8n-nodes-base.crypto", "typeVersion": 2, "position": [5500, 240],
+      "credentials": {"crypto": {"id": "__WORKBENCH_HMAC_CREDENTIAL_ID__", "name": "Workbench HMAC"}}
+    },
+    {
+      "parameters": {"method": "POST", "url": "http://127.0.0.1:8000/api/integrations/n8n/v1/gmail/events", "authentication": "none", "sendHeaders": true, "headerParameters": {"parameters": [{"name": "X-N8N-Timestamp", "value": "={{$json.timestamp}}"}, {"name": "X-N8N-Nonce", "value": "={{$json.nonce}}"}, {"name": "X-N8N-Signature", "value": "={{$json.signature}}"}, {"name": "X-N8N-Profile", "value": "gmail"}]}, "sendBody": true, "contentType": "raw", "rawContentType": "application/json", "body": "={{$json.request_body}}", "options": {"timeout": 10000, "response": {"response": {"fullResponse": true, "neverError": true, "responseFormat": "json"}}}},
+      "id": "gmail-inbound-attempt-3-submit", "name": "Submit Attempt 3", "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.2, "position": [5720, 240], "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {"conditions": {"options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 2}, "conditions": [{"id": "accepted-attempt-3-condition", "leftValue": "={{Number($json.statusCode||0)===202 && $json.body?.accepted===true}}", "rightValue": true, "operator": {"type": "boolean", "operation": "true", "singleValue": true}}], "combinator": "and"}, "options": {}},
+      "id": "gmail-inbound-attempt-3-accepted", "name": "Accepted Attempt 3", "type": "n8n-nodes-base.if", "typeVersion": 2.2, "position": [5940, 240]
+    },
+    {
+      "parameters": {"conditions": {"options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 2}, "conditions": [{"id": "label-available-condition", "leftValue": "={{Boolean($('Build Gmail Context').item.json.workbench_label_id)}}", "rightValue": true, "operator": {"type": "boolean", "operation": "true", "singleValue": true}}], "combinator": "and"}, "options": {}},
+      "id": "gmail-inbound-label-available", "name": "Workbench Label Available", "type": "n8n-nodes-base.if", "typeVersion": 2.2, "position": [6160, -120]
+    },
+    {
+      "parameters": {"resource": "message", "operation": "removeLabels", "messageId": "={{$('Build Gmail Context').item.json.gmail_message_id}}", "labelIds": "={{[$('Build Gmail Context').item.json.workbench_label_id]}}"},
+      "id": "gmail-inbound-remove-label", "name": "Remove Workbench Label", "type": "n8n-nodes-base.gmail", "typeVersion": 2.1, "position": [6380, -120],
+      "credentials": {"gmailOAuth2": {"id": "__GMAIL_CREDENTIAL_ID__", "name": "Workbench Gmail OAuth"}}
+    }
+  ],
+  "connections": {
+    "Schedule": {"main": [[{"node": "Gmail Search", "type": "main", "index": 0}]]},
+    "Gmail Search": {"main": [[{"node": "Gmail Thread Get", "type": "main", "index": 0}]]},
+    "Gmail Thread Get": {"main": [[{"node": "Build Gmail Context", "type": "main", "index": 0}]]},
+    "Build Gmail Context": {"main": [[{"node": "Prepare Gmail Event", "type": "main", "index": 0}]]},
+    "Prepare Gmail Event": {"main": [[{"node": "Prepare Attempt 1 Auth", "type": "main", "index": 0}]]},
+    "Prepare Attempt 1 Auth": {"main": [[{"node": "Hash Attempt 1 Body", "type": "main", "index": 0}]]},
+    "Hash Attempt 1 Body": {"main": [[{"node": "Generate Attempt 1 Nonce", "type": "main", "index": 0}]]},
+    "Generate Attempt 1 Nonce": {"main": [[{"node": "Build Attempt 1 Canonical", "type": "main", "index": 0}]]},
+    "Build Attempt 1 Canonical": {"main": [[{"node": "Sign Attempt 1", "type": "main", "index": 0}]]},
+    "Sign Attempt 1": {"main": [[{"node": "Submit Attempt 1", "type": "main", "index": 0}]]},
+    "Submit Attempt 1": {"main": [[{"node": "Accepted Attempt 1", "type": "main", "index": 0}]]},
+    "Accepted Attempt 1": {"main": [[{"node": "Workbench Label Available", "type": "main", "index": 0}], [{"node": "Retryable Attempt 1", "type": "main", "index": 0}]]},
+    "Retryable Attempt 1": {"main": [[{"node": "Prepare Attempt 2 Auth", "type": "main", "index": 0}], []]},
+    "Prepare Attempt 2 Auth": {"main": [[{"node": "Hash Attempt 2 Body", "type": "main", "index": 0}]]},
+    "Hash Attempt 2 Body": {"main": [[{"node": "Generate Attempt 2 Nonce", "type": "main", "index": 0}]]},
+    "Generate Attempt 2 Nonce": {"main": [[{"node": "Build Attempt 2 Canonical", "type": "main", "index": 0}]]},
+    "Build Attempt 2 Canonical": {"main": [[{"node": "Sign Attempt 2", "type": "main", "index": 0}]]},
+    "Sign Attempt 2": {"main": [[{"node": "Submit Attempt 2", "type": "main", "index": 0}]]},
+    "Submit Attempt 2": {"main": [[{"node": "Accepted Attempt 2", "type": "main", "index": 0}]]},
+    "Accepted Attempt 2": {"main": [[{"node": "Workbench Label Available", "type": "main", "index": 0}], [{"node": "Retryable Attempt 2", "type": "main", "index": 0}]]},
+    "Retryable Attempt 2": {"main": [[{"node": "Prepare Attempt 3 Auth", "type": "main", "index": 0}], []]},
+    "Prepare Attempt 3 Auth": {"main": [[{"node": "Hash Attempt 3 Body", "type": "main", "index": 0}]]},
+    "Hash Attempt 3 Body": {"main": [[{"node": "Generate Attempt 3 Nonce", "type": "main", "index": 0}]]},
+    "Generate Attempt 3 Nonce": {"main": [[{"node": "Build Attempt 3 Canonical", "type": "main", "index": 0}]]},
+    "Build Attempt 3 Canonical": {"main": [[{"node": "Sign Attempt 3", "type": "main", "index": 0}]]},
+    "Sign Attempt 3": {"main": [[{"node": "Submit Attempt 3", "type": "main", "index": 0}]]},
+    "Submit Attempt 3": {"main": [[{"node": "Accepted Attempt 3", "type": "main", "index": 0}]]},
+    "Accepted Attempt 3": {"main": [[{"node": "Workbench Label Available", "type": "main", "index": 0}], []]},
+    "Workbench Label Available": {"main": [[{"node": "Remove Workbench Label", "type": "main", "index": 0}], []]}
+  },
+  "settings": {"executionOrder": "v1"},
+  "staticData": null,
+  "pinData": {}
+}

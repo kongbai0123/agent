@@ -570,6 +570,11 @@ def build_models_router(
         run = database.get_run(run_id)
         if not run:
             raise HTTPException(status_code=404, detail=error_payload("RUN_NOT_FOUND", "Run not found.", recoverable=False))
+        if str(run.get("mode") or "").strip().casefold() == "email":
+            # Integration runs are deliberately available only through the
+            # mail integration projection.  Do not let a known Run ID expose
+            # even metadata through the legacy chat endpoint.
+            raise HTTPException(status_code=404, detail=error_payload("RUN_NOT_FOUND", "Run not found.", recoverable=False))
         session = database.get_session(str(run.get("session_id") or ""))
         if not session or session.get("project_id") != run.get("project_id"):
             raise HTTPException(

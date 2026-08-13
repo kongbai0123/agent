@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Callable, Dict
+from typing import Any, Callable, Dict, Optional
 
 from fastapi import APIRouter, HTTPException, Request, status
 
@@ -37,6 +37,7 @@ def build_project_skills_router(
     runtime: ProjectSkillRuntime,
     require_local: Callable[[Request], None],
     error_payload: Callable[..., Dict[str, Any]],
+    session_access_guard: Optional[Callable[[str, str], None]] = None,
 ) -> APIRouter:
     router = APIRouter(tags=["project-skills"])
 
@@ -179,6 +180,8 @@ def build_project_skills_router(
 
     @router.get("/api/sessions/{session_id}/skills")
     def load_session_skills(session_id: str):
+        if session_access_guard is not None:
+            session_access_guard(session_id, "skills_read")
         try:
             return {"success": True, **runtime.catalog_for_session(session_id)}
         except ProjectSkillError as exc:
@@ -192,6 +195,8 @@ def build_project_skills_router(
         request: Request,
     ):
         require_local(request)
+        if session_access_guard is not None:
+            session_access_guard(session_id, "skills_write")
         try:
             return {
                 "success": True,
@@ -218,6 +223,8 @@ def build_project_skills_router(
                     ),
                 )
             session_id = str(run.get("session_id") or "")
+            if session_access_guard is not None:
+                session_access_guard(session_id, "run_skills_read")
             project_id = run.get("project_id")
             session = runtime.database.get_session(session_id)
             if not session or session.get("project_id") != project_id:

@@ -55,7 +55,7 @@ def test_floating_output_uses_its_own_vertical_tab_toggle():
     assert "if (toggle && state.activeTab === name && state.expanded)" in RUN_INSPECTOR_JS
     for key in ("ArrowDown", "ArrowUp", "Home", "End", "Enter"):
         assert key in RUN_INSPECTOR_JS
-    assert "app.js?v=5.15.0-run-inspector" in INDEX_HTML
+    assert "app.js?v=0.7.0-n8n-agent-governance-beta.1" in INDEX_HTML
     assert "run-inspector.js?v=1.0.0" in INDEX_HTML
 
 
