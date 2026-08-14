@@ -3005,6 +3005,89 @@ async function handleClearDatabase() {
 // 4. 對話送出與串流處理 (過濾 / 剔除思考區與工具卡片)
 // ==========================================================================
 
+function isExplicitN8nOperationIntent(value) {
+    const text = String(value || '').trim();
+    if (!/\bn8n\b/i.test(text)) return false;
+    if (/```/.test(text)) return false;
+
+    // Questions about capabilities or troubleshooting stay in ordinary chat.
+    // Routing is intentionally conservative because the governed planner is
+    // an operation boundary, not a general n8n knowledge assistant.
+    const informational = /(?:請問|想了解|幫我了解|為何|為什麼|是否|能否|可否|可不可以|怎麼|如何|解釋|說明|what\b|why\b|how\b)/i;
+    if (informational.test(text)) return false;
+
+    const operation = /(?:建立|新增|修改|更新|編輯|發布|啟用|啟動|停用|停止|刪除|移除|執行|運行|操作|控制|管理|設定|配置|串接|連接|寄送|發送|回覆|觸發|排程|匯入|測試|create|add|update|edit|publish|activate|deactivate|delete|remove|execute|run|manage|configure|connect|send|reply|trigger|schedule|import|test)/i;
+    if (!operation.test(text)) return false;
+
+    const explicitRequest = /(?:請(?!問)|幫我|替我|為我|我要|我想要|我希望|現在|立即|立刻|直接|please\b|^\s*(?:用|讓|叫|n8n\b|use\b|have\b|make\b|create\b|update\b|publish\b|activate\b|deactivate\b|delete\b|run\b|execute\b))/i;
+    return explicitRequest.test(text);
+}
+
+function isExplicitN8nMailOperation(value) {
+    const text = String(value || '');
+    return /\bn8n\b/i.test(text)
+        && /(?:寄信|寄送|發信|發送(?:電子)?郵件|回覆(?:郵件|信件)|email|e-mail|gmail|send\s+(?:an?\s+)?(?:email|mail)|reply\s+(?:to\s+)?(?:an?\s+)?(?:email|mail))/i.test(text);
+}
+
+function isExplicitN8nWorkflowAuthoringIntent(value) {
+    const text = String(value || '');
+    if (!/\bn8n\b/i.test(text)) return false;
+    return /(?:workflow|work\s*flow|node|nodes|canvas|graph|pipeline|automation|流程|工作流|節點|拉節點|配對節點|串接節點|建立流程|修改流程|新增流程|自動化流程)/i.test(text)
+        && /(?:create|add|build|design|update|edit|connect|wire|deploy|建立|新增|設計|修改|連接|串接|配對|部署|拉)/i.test(text);
+}
+
+async function routeExplicitN8nOperationToPlanner(question) {
+    if (!isExplicitN8nOperationIntent(question)) return false;
+
+    // Opening the dedicated workspace does not grant authority. The planner
+    // remains tool-free and the existing digest-bound proposal plus separate
+    // human approval are still required before the Broker can mutate n8n.
+    // Wait for the managed n8n lifecycle check/start attempt to settle before
+    // asking the Planner for its live readiness snapshot.  This avoids a
+    // false "runtime not ready" result during the on-demand startup race.
+    await window.workbenchN8nWorkflows?.open?.();
+    if (isExplicitN8nMailOperation(question) && !isExplicitN8nWorkflowAuthoringIntent(question)) {
+        const mailResult = await window.workbenchN8nWorkflows?.createComposeFromChat?.({
+            instruction: question,
+        });
+        if (mailResult?.status === 'draft_created') {
+            showToast('郵件草稿已建立；尚未寄送，請在右上檢查器確認並核准。', 'success');
+        } else {
+            showToast(
+                mailResult?.message || '請先完成 Gmail Profile、OAuth 與固定收件者設定；目前未寄送郵件。',
+                'warning'
+            );
+        }
+        userInput.value = '';
+        userInput.style.height = 'auto';
+        return true;
+    }
+    const planner = window.workbenchN8nGovernance;
+    if (typeof planner?.startPlanFromChat !== 'function') {
+        showToast('n8n 操作助理尚未就緒；本次要求未送到一般聊天，也未操作 n8n。', 'warning');
+        return true;
+    }
+
+    try {
+        const result = await planner.startPlanFromChat({
+            message: question,
+            projectId: activeProjectId || '',
+            sessionId: currentSessionId || '',
+            hasAttachments: currentImages.length > 0,
+        });
+        if (result?.status === 'blocked') {
+            showToast(result.message || '請先完成 n8n 規劃所需的 Project 與 Session。', 'warning');
+        } else {
+            showToast('已轉入 n8n 操作助理；目前尚未操作 n8n。', 'success');
+        }
+        userInput.value = '';
+        userInput.style.height = 'auto';
+    } catch (error) {
+        showToast(error?.message || 'n8n 操作規劃無法開始；本次未操作 n8n。', 'error');
+    }
+    return true;
+}
+
 async function retryRunFromInspector(runId, run = {}) {
     if (!runId) throw new Error('缺少要重新執行的 Run。');
     if (isGenerating) throw new Error('目前已有一輪正在執行。');
@@ -3056,6 +3139,16 @@ async function handleChatSubmit(e) {
     }
     // 原始問題直接送交後端，由 Orchestrator 自動判斷處理流程。
     const sendQuestion = question;
+
+    // 明確的 n8n 操作要求必須走既有的受治理 Planner。不要先送到
+    // /api/chat，否則一般聊天只能如實回答它沒有外部操作工具。
+    if (
+        !retryOfRunId
+        && explicitSkillIds.length === 0
+        && currentImages.length === 0
+        && !temporaryContextText
+        && await routeExplicitN8nOperationToPlanner(sendQuestion)
+    ) return;
     
     // 隱藏歡迎卡片
     if (welcomeCard.style.display !== 'none') {

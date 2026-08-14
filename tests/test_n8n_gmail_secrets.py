@@ -27,11 +27,16 @@ def test_dpapi_store_creates_three_distinct_stable_keys_without_plaintext(tmp_pa
     assert len({content, inbound, outbound}) == 3
     assert store.content_key() == content
     assert store.inbound_hmac_key() == inbound
+    credential_value = store.inbound_hmac_credential_value()
+    assert credential_value.encode("ascii") == store.inbound_hmac_verifier_key()
+    assert len(credential_value) == 44
+    assert credential_value.endswith("=")
     assert store.outbound_webhook_key() == outbound
     serialized = path.read_bytes()
     for secret in (content, inbound, outbound):
         assert secret not in serialized
         assert secret.hex().encode("ascii") not in serialized
+    assert credential_value.encode("ascii") not in serialized
     assert store.status() == {
         "available": True,
         "provider": "windows_dpapi",

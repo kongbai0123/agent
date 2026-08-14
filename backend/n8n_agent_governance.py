@@ -33,6 +33,8 @@ OPERATIONS = {
 }
 PROTECTED_WORKFLOW_NAMES = {
     "workbench-gmail-inbound-v1", "workbench-gmail-send-v1",
+    "workbench-agent-bridge-v1", "workbench-approval-gate-v1",
+    "workbench-approval-bridge-v1",
 }
 MUTATING_OPERATIONS = OPERATIONS
 SAFE_DRAFT_OPERATIONS = {"create_draft", "update_draft"}
@@ -44,6 +46,7 @@ SECRET_KEY_RE = re.compile(
     r"(?i)(password|secret|token|api[_-]?key|authorization|cookie|private[_-]?key)"
 )
 WORKFLOW_DIGEST_RE = re.compile(r"^[a-f0-9]{64}$")
+_UNSET = object()
 
 
 class N8nGovernanceError(RuntimeError):
@@ -170,9 +173,12 @@ def _is_high_risk(payload: Mapping[str, Any]) -> bool:
         return True
     for node_type in _node_types(payload):
         normalized = node_type.casefold()
-        if any(marker in normalized for marker in HIGH_RISK_MARKERS):
+        if _node_type_is_high_risk(normalized):
             return True
-        if normalized and not normalized.startswith(("n8n-nodes-base.", "n8n-nodes-langchain.")):
+        if normalized and not normalized.startswith((
+            "n8n-nodes-base.", "n8n-nodes-langchain.",
+            "@n8n/n8n-nodes-langchain.",
+        )):
             return True
     return False
 
@@ -180,11 +186,34 @@ def _is_high_risk(payload: Mapping[str, Any]) -> bool:
 def _node_types_are_high_risk(node_types: list[str]) -> bool:
     for node_type in node_types:
         normalized = node_type.casefold()
-        if any(marker in normalized for marker in HIGH_RISK_MARKERS):
+        if _node_type_is_high_risk(normalized):
             return True
-        if normalized and not normalized.startswith(("n8n-nodes-base.", "n8n-nodes-langchain.")):
+        if normalized and not normalized.startswith((
+            "n8n-nodes-base.", "n8n-nodes-langchain.",
+            "@n8n/n8n-nodes-langchain.",
+        )):
             return True
     return False
+
+
+def _node_type_is_high_risk(normalized: str) -> bool:
+    """Classify nodes that can hide autonomous tools behind one canvas node.
+
+    The reviewed Workbench Agent is represented by an ordinary Execute
+    Sub-workflow node and is governed by an opaque server-side binding.  Native
+    n8n Agent/Tool nodes do not have that boundary: they can hold their own
+    credentials and select tools at runtime.  Keep them searchable for Full
+    Audit planning, but never treat them as a low-risk restricted-mode node.
+    """
+
+    if any(marker in normalized for marker in HIGH_RISK_MARKERS):
+        return True
+    leaf = normalized.rsplit(".", 1)[-1]
+    if normalized.startswith("@n8n/n8n-nodes-langchain."):
+        return "agent" in leaf or leaf.endswith("tool") or "toolexecutor" in leaf
+    if normalized.startswith("n8n-nodes-langchain."):
+        return "agent" in leaf or leaf.endswith("tool") or "toolexecutor" in leaf
+    return leaf in {"messageanagent", "tool", "toolexecutor"} or leaf.endswith("agenttool")
 
 
 def _normalized_workflow_name(value: Any) -> str:
@@ -215,17 +244,22 @@ def _safe_external_target(value: Any) -> Optional[str]:
 def _workflow_facts(workflow: Mapping[str, Any]) -> dict[str, Any]:
     """Return bounded, secret-free facts used for review and canonical diff."""
     nodes = workflow.get("nodes") if isinstance(workflow.get("nodes"), list) else []
-    node_facts: list[dict[str, str]] = []
+    node_facts: list[dict[str, Any]] = []
     credential_aliases: set[str] = set()
     external_targets: set[str] = set()
     for index, node in enumerate(nodes[:500]):
         if not isinstance(node, Mapping):
             continue
         node_type = str(node.get("type") or "")[:255]
+        parameters = node.get("parameters") if isinstance(node.get("parameters"), Mapping) else {}
         node_facts.append({
             "id": str(node.get("id") or f"node-{index}")[:255],
             "name": str(node.get("name") or "")[:255],
             "type": node_type,
+            # Values stay server-side. Reviewers get only changed key names and
+            # a digest proving the reviewed parameter snapshot is immutable.
+            "parameter_keys": sorted(str(key)[:128] for key in parameters)[:100],
+            "parameter_digest": _digest(parameters),
         })
         credentials = node.get("credentials")
         if isinstance(credentials, Mapping):
@@ -234,7 +268,6 @@ def _workflow_facts(workflow: Mapping[str, Any]) -> dict[str, Any]:
                     alias = str(credential.get("name") or "").strip()
                     if alias:
                         credential_aliases.add(alias[:128])
-        parameters = node.get("parameters")
         stack = [parameters] if isinstance(parameters, (Mapping, list)) else []
         while stack:
             current = stack.pop()
@@ -257,10 +290,36 @@ def _workflow_facts(workflow: Mapping[str, Any]) -> dict[str, Any]:
             }:
                 external_targets.add(f"service:{service}")
     node_facts.sort(key=lambda item: (item["id"], item["name"], item["type"]))
+    edges: list[dict[str, Any]] = []
+    connections = workflow.get("connections") if isinstance(workflow.get("connections"), Mapping) else {}
+    for source_name, output_groups in list(connections.items())[:500]:
+        if not isinstance(output_groups, Mapping):
+            continue
+        for output_type, branches in output_groups.items():
+            if not isinstance(branches, list):
+                continue
+            for output_index, targets in enumerate(branches[:64]):
+                if not isinstance(targets, list):
+                    continue
+                for target in targets[:64]:
+                    if not isinstance(target, Mapping):
+                        continue
+                    edges.append({
+                        "from": str(source_name)[:255],
+                        "to": str(target.get("node") or "")[:255],
+                        "output": str(output_type)[:64],
+                        "output_index": output_index,
+                        "input": str(target.get("type") or "main")[:64],
+                        "input_index": max(0, int(target.get("index") or 0)),
+                    })
+    edges.sort(key=lambda item: (
+        item["from"], item["output"], item["output_index"], item["to"], item["input_index"]
+    ))
     return {
         "name": str(workflow.get("name") or "")[:255],
         "active": bool(workflow.get("active")),
         "nodes": node_facts,
+        "edges": edges[:2000],
         "external_targets": sorted(external_targets)[:128],
         "credential_aliases": sorted(credential_aliases)[:128],
     }
@@ -311,6 +370,8 @@ def _canonical_workflow_diff(
 
     before_nodes = {item["id"]: item for item in (before or {}).get("nodes", [])}
     after_nodes = {item["id"]: item for item in (after or {}).get("nodes", [])}
+    before_edges = {_canonical(item): item for item in (before or {}).get("edges", [])}
+    after_edges = {_canonical(item): item for item in (after or {}).get("edges", [])}
     return {
         "source": "server",
         "before": before,
@@ -323,6 +384,10 @@ def _canonical_workflow_diff(
                 for key in sorted(before_nodes.keys() & after_nodes.keys())
                 if before_nodes[key] != after_nodes[key]
             ],
+        },
+        "connections": {
+            "added": [after_edges[key] for key in sorted(after_edges.keys() - before_edges.keys())],
+            "removed": [before_edges[key] for key in sorted(before_edges.keys() - after_edges.keys())],
         },
         "external_targets": {
             "before": (before or {}).get("external_targets", []),
@@ -460,6 +525,25 @@ def _risk(operation: str, payload: Mapping[str, Any], high_risk: bool) -> dict[s
     }
 
 
+def _graph_result_dict(value: Any) -> dict[str, Any]:
+    if hasattr(value, "to_dict") and callable(value.to_dict):
+        value = value.to_dict()
+    if not isinstance(value, Mapping):
+        raise N8nGovernanceError(
+            "N8N_GRAPH_AUTHORING_INVALID",
+            "The graph authoring service returned an invalid result.",
+            status_code=502,
+        )
+    result = json.loads(_canonical(value))
+    if result.get("status") not in {"graph_ready", "needs_input", "blocked"}:
+        raise N8nGovernanceError(
+            "N8N_GRAPH_AUTHORING_INVALID",
+            "The graph authoring service returned an invalid status.",
+            status_code=502,
+        )
+    return result
+
+
 class N8nApiBroker:
     """Narrow server-side n8n Public API client.  The API key is never returned."""
 
@@ -525,9 +609,12 @@ class N8nApiBroker:
             "name": name,
             "active": bool(raw.get("active")),
             "updated_at": raw.get("updatedAt"),
+            "version_id": raw.get("versionId"),
+            "active_version_id": raw.get("activeVersionId"),
             "node_count": len(raw.get("nodes") or []),
             "protected": _is_protected_workflow_name(name),
             "facts": facts,
+            "workflow": _sanitize_proposed_workflow(raw),
             # The full workflow stays inside the Broker boundary; only its
             # digest and bounded review facts leave this method.
             "snapshot_digest": _digest({
@@ -545,6 +632,19 @@ class N8nApiBroker:
             # n8n returns [] when no findings are present.
             return {"status": "clean", "findings": raw, "verified": True}
         return raw if isinstance(raw, Mapping) else {}
+
+    def editor_url(self, workflow_id: str) -> str:
+        parsed = urlsplit(self.base_url)
+        if parsed.scheme not in {"http", "https"} or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
+            raise N8nGovernanceError(
+                "N8N_EDITOR_URL_UNSAFE",
+                "The n8n editor URL is not a verified loopback address.",
+                status_code=503,
+            )
+        safe_id = str(workflow_id or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", safe_id):
+            raise N8nGovernanceError("N8N_WORKFLOW_ID_INVALID", "The workflow identity is invalid.", status_code=502)
+        return f"{self.base_url}/workflow/{safe_id}"
 
     def execute(self, operation: str, payload: Mapping[str, Any], *, secret: Optional[Mapping[str, Any]] = None) -> Mapping[str, Any]:
         workflow_id = str(payload.get("workflow_id") or "").strip()
@@ -578,13 +678,24 @@ class N8nAgentGovernanceService:
     def __init__(
         self, *, broker: Any, cipher: AesGcmContentCipher,
         n8n_running: Callable[[], bool], high_risk_runner_ready: Callable[[], bool] = lambda: False,
-        boot_id: Optional[str] = None,
+        boot_id: Optional[str] = None, graph_authoring: Any = None,
+        graph_binding_finalizer: Optional[Callable[[list[dict[str, Any]], Mapping[str, Any]], Any]] = None,
+        graph_binding_activator: Optional[Callable[[Mapping[str, Any]], Any]] = None,
+        policy_change_callback: Optional[Callable[[str, str], Any]] = None,
+        workflow_change_callback: Optional[Callable[[Mapping[str, Any]], Any]] = None,
+        _allow_legacy_raw_workflows_for_tests: bool = False,
     ) -> None:
         self.broker = broker
         self.cipher = cipher
         self.n8n_running = n8n_running
         self.high_risk_runner_ready = high_risk_runner_ready
         self.boot_id = boot_id or secrets.token_hex(16)
+        self.graph_authoring = graph_authoring
+        self.graph_binding_finalizer = graph_binding_finalizer
+        self.graph_binding_activator = graph_binding_activator
+        self.policy_change_callback = policy_change_callback
+        self.workflow_change_callback = workflow_change_callback
+        self._allow_legacy_raw_workflows_for_tests = bool(_allow_legacy_raw_workflows_for_tests)
         self._lock = threading.RLock()
         self._ensure_schema()
 
@@ -675,6 +786,18 @@ class N8nAgentGovernanceService:
         for row in rows:
             self._audit(row["id"], project_id, "revoked", row["digest"], {"reason": reason}, session_id=row["session_id"], run_id=row["run_id"], actor="system")
 
+    def _notify_policy_change(self, project_id: str, reason: str) -> None:
+        if not callable(self.policy_change_callback):
+            return
+        try:
+            self.policy_change_callback(project_id, reason)
+        except Exception as exc:
+            raise N8nGovernanceError(
+                "N8N_RUNTIME_POLICY_REVOCATION_FAILED",
+                "The n8n runtime permissions could not be revoked safely.",
+                status_code=503,
+            ) from exc
+
     def set_policy(self, project_id: str, value: Mapping[str, Any]) -> dict[str, Any]:
         self._project(project_id)
         mode = str(value.get("mode") or "restricted")
@@ -701,8 +824,11 @@ class N8nAgentGovernanceService:
                 boot_id=excluded.boot_id,revision=n8n_agent_policies.revision+1,updated_at=excluded.updated_at
             """, (project_id, mode, duration, session_id, expires, _iso(now), boot, _iso(now)))
         mode_rank = {"off": 0, "restricted": 1, "full_audit": 2}
+        reason = "policy_changed"
         if previous and mode_rank[mode] < mode_rank.get(previous["mode"], 0):
-            self._revoke_pending(project_id, "policy_downgraded")
+            reason = "policy_downgraded"
+            self._revoke_pending(project_id, reason)
+        self._notify_policy_change(project_id, reason)
         return self.get_policy(project_id, session_id=session_id)
 
     def get_policy(self, project_id: str, *, session_id: Optional[str] = None) -> dict[str, Any]:
@@ -728,6 +854,7 @@ class N8nAgentGovernanceService:
             with database.get_db_conn() as conn:
                 conn.execute("UPDATE n8n_agent_policies SET mode='restricted',revision=revision+1,updated_at=? WHERE project_id=?", (_iso(), project_id))
             self._revoke_pending(project_id, reason)
+            self._notify_policy_change(project_id, reason)
             return self.get_policy(project_id, session_id=session_id)
         try:
             runtime_ready = bool(self.n8n_running())
@@ -753,6 +880,7 @@ class N8nAgentGovernanceService:
             )
         for row in rows:
             self._revoke_pending(row["project_id"], reason)
+            self._notify_policy_change(row["project_id"], reason)
         return len(rows)
 
     def _api_key_configured(self) -> bool:
@@ -878,6 +1006,25 @@ class N8nAgentGovernanceService:
                 "The target workflow changed after the proposal was created.",
                 status_code=409,
             )
+        graph = current.get("diff", {}).get("graph") if isinstance(current.get("diff"), Mapping) else None
+        if isinstance(graph, Mapping):
+            if self.graph_authoring is None:
+                raise N8nGovernanceError("N8N_GRAPH_AUTHORING_UNAVAILABLE", "Graph validation is unavailable.", status_code=503)
+            expected_catalog = str(graph.get("catalog_digest") or "")
+            if not WORKFLOW_DIGEST_RE.fullmatch(expected_catalog) or not secrets.compare_digest(
+                expected_catalog, self._catalog_digest()
+            ):
+                raise N8nGovernanceError("N8N_NODE_CATALOG_STALE", "The node catalog changed after approval.", status_code=409)
+            if str(current.get("operation")) in {"create_draft", "update_draft"}:
+                workflow = payload.get("workflow")
+                expected_graph = str(graph.get("after_digest") or "")
+                observed_graph = (
+                    str(self._authoring().workflow_digest(workflow)) if isinstance(workflow, Mapping) else ""
+                )
+                if not WORKFLOW_DIGEST_RE.fullmatch(expected_graph) or not secrets.compare_digest(
+                    expected_graph, observed_graph
+                ):
+                    raise N8nGovernanceError("N8N_GRAPH_STALE", "The compiled graph changed after approval.", status_code=409)
         return snapshot
 
     def _assert_operation_eligible(
@@ -972,6 +1119,239 @@ class N8nAgentGovernanceService:
         aad = f"n8n-agent-secret:{project_id}:{handle}"
         return _loads(self.cipher.decrypt_text(row["envelope"], aad=aad), {})
 
+    def _authoring(self) -> Any:
+        if self.graph_authoring is None:
+            raise N8nGovernanceError(
+                "N8N_GRAPH_AUTHORING_UNAVAILABLE",
+                "The n8n graph authoring service is unavailable.",
+                status_code=503,
+            )
+        return self.graph_authoring
+
+    def _catalog_digest(self) -> str:
+        authoring = self._authoring()
+        digest = str(getattr(getattr(authoring, "catalog", None), "digest", "") or "")
+        if not WORKFLOW_DIGEST_RE.fullmatch(digest):
+            raise N8nGovernanceError(
+                "N8N_NODE_CATALOG_INVALID",
+                "The pinned n8n node catalog could not be verified.",
+                status_code=503,
+            )
+        return digest
+
+    def search_node_catalog(
+        self, project_id: str, *, session_id: Optional[str] = None,
+        query: str = "", limit: int = 50,
+    ) -> dict[str, Any]:
+        self._project(project_id)
+        self._session(session_id, project_id)
+        policy = self.get_policy(project_id, session_id=session_id)
+        if policy["mode"] == "off":
+            raise N8nGovernanceError("N8N_AGENT_DISABLED", "n8n Agent access is disabled.", status_code=403)
+        authoring = self._authoring()
+        catalog = getattr(authoring, "catalog", None)
+        if catalog is None or not callable(getattr(catalog, "search", None)):
+            raise N8nGovernanceError("N8N_NODE_CATALOG_INVALID", "The node catalog is unavailable.", status_code=503)
+        return {
+            "catalog_digest": self._catalog_digest(),
+            "nodes": catalog.search(str(query or "")[:255], limit=max(1, min(int(limit), 100))),
+        }
+
+    def materialize_planned_choice(
+        self, *, project_id: str, session_id: str, operation: str,
+        semantic: Mapping[str, Any], source: str = "planner",
+    ) -> dict[str, Any]:
+        """Turn semantic intent into a server-owned executable graph snapshot."""
+
+        self._project(project_id)
+        self._session(session_id, project_id)
+        policy = self.get_policy(project_id, session_id=session_id)
+        if policy["mode"] == "off":
+            raise N8nGovernanceError("N8N_AGENT_DISABLED", "n8n Agent access is disabled.", status_code=403)
+        self._require_broker_ready()
+        authoring = self._authoring()
+        semantic = _safe_json(semantic)
+        workflow_id = str(semantic.get("workflow_id") or "").strip()
+        try:
+            if operation == "create_draft":
+                if set(semantic) != {"workflow_spec"} or not isinstance(semantic.get("workflow_spec"), Mapping):
+                    raise N8nGovernanceError("N8N_WORKFLOW_SPEC_REQUIRED", "A semantic workflow spec is required.", status_code=422)
+                result = _graph_result_dict(authoring.materialize(
+                    semantic["workflow_spec"],
+                    context={
+                        "project_id": project_id, "session_id": session_id,
+                        "operation": operation, "source": str(source or "planner")[:32],
+                    },
+                ))
+                base_digest = _digest({"target": "new-workflow"})
+                operation_payload: dict[str, Any] = {}
+            elif operation == "update_draft":
+                if not workflow_id or not isinstance(semantic.get("workflow_patch"), list):
+                    raise N8nGovernanceError("N8N_WORKFLOW_PATCH_REQUIRED", "A semantic workflow patch is required.", status_code=422)
+                snapshot, base_digest = self._load_target_snapshot(project_id, operation, semantic)
+                base_workflow = (snapshot or {}).get("workflow")
+                if not isinstance(base_workflow, Mapping):
+                    raise N8nGovernanceError("N8N_WORKFLOW_LOOKUP_FAILED", "The workflow graph could not be loaded.", status_code=503)
+                result = _graph_result_dict(authoring.apply_patch(
+                    base_workflow,
+                    semantic["workflow_patch"],
+                    context={
+                        "project_id": project_id, "session_id": session_id,
+                        "operation": operation, "source": str(source or "planner")[:32],
+                    },
+                ))
+                operation_payload = {
+                    "workflow_id": workflow_id,
+                    "workflow_name": str((snapshot or {}).get("name") or semantic.get("workflow_name") or "")[:255],
+                }
+            elif operation in {"publish", "activate", "deactivate", "delete"}:
+                snapshot, base_digest = self._load_target_snapshot(project_id, operation, semantic)
+                base_workflow = (snapshot or {}).get("workflow")
+                if not isinstance(base_workflow, Mapping):
+                    raise N8nGovernanceError("N8N_WORKFLOW_LOOKUP_FAILED", "The workflow graph could not be loaded.", status_code=503)
+                if operation in {"publish", "activate"}:
+                    # n8n's editor can change a managed draft after Workbench
+                    # created it.  Publishing or activating therefore reviews
+                    # the exact current graph through the same fail-closed
+                    # catalog, external-action and approval-dominance gates as
+                    # a newly compiled graph.  A snapshot digest alone proves
+                    # freshness; it does not prove that the graph is safe.
+                    result = _graph_result_dict(authoring.adopt(base_workflow))
+                    # Adoption inspects already-persisted protected nodes.  It
+                    # must not manufacture provisional binding claims for a
+                    # state-only operation.
+                    result["binding_claims"] = []
+                else:
+                    # Deactivation and deletion cannot begin workflow
+                    # execution, so an invalid existing graph must not prevent
+                    # the user from safely stopping or removing it.
+                    result = {
+                        "status": "graph_ready",
+                        "workflow": base_workflow,
+                        "graph_preview": authoring.preview(base_workflow),
+                        "validation_status": "ready",
+                        "catalog_digest": self._catalog_digest(),
+                        "graph_digest": authoring.workflow_digest(base_workflow),
+                        "issues": [], "questions": [], "diff": {},
+                    }
+                operation_payload = {
+                    "workflow_id": workflow_id,
+                    "workflow_name": str((snapshot or {}).get("name") or semantic.get("workflow_name") or "")[:255],
+                }
+            else:
+                raise N8nGovernanceError("N8N_OPERATION_INVALID", "The n8n operation is invalid.", status_code=422)
+        except N8nGovernanceError:
+            raise
+        except Exception as exc:
+            code = str(getattr(exc, "code", "") or "N8N_GRAPH_AUTHORING_FAILED")
+            message = str(getattr(exc, "message", "") or "The semantic workflow could not be materialized.")
+            raise N8nGovernanceError(code, message, status_code=422) from exc
+
+        result["catalog_digest"] = str(result.get("catalog_digest") or self._catalog_digest())
+        result["base_digest"] = base_digest
+        if operation_payload:
+            result["operation_payload"] = operation_payload
+        if result.get("status") == "graph_ready":
+            workflow = result.get("workflow")
+            if not isinstance(workflow, Mapping):
+                raise N8nGovernanceError("N8N_GRAPH_AUTHORING_INVALID", "Compiled workflow is missing.", status_code=502)
+            if _is_protected_workflow_name(workflow.get("name")):
+                raise N8nGovernanceError("N8N_WORKFLOW_PROTECTED", "This Workbench workflow is protected.", status_code=403)
+            result["graph_digest"] = str(result.get("graph_digest") or authoring.workflow_digest(workflow))
+        # Bounded catalog context supports at most two model repair attempts.
+        if result.get("status") == "blocked":
+            try:
+                terms: list[str] = []
+                spec = semantic.get("workflow_spec") if isinstance(semantic.get("workflow_spec"), Mapping) else {}
+                nodes = spec.get("nodes") if isinstance(spec.get("nodes"), list) else []
+                for node in nodes:
+                    if not isinstance(node, Mapping):
+                        continue
+                    node_type = str(node.get("type") or "").strip().rsplit(".", 1)[-1]
+                    if node_type and node_type.casefold() not in {item.casefold() for item in terms}:
+                        terms.append(node_type[:64])
+                for issue in result.get("issues") or []:
+                    if not isinstance(issue, Mapping):
+                        continue
+                    details = issue.get("details") if isinstance(issue.get("details"), Mapping) else {}
+                    for candidate in (details.get("type"), details.get("node_type"), issue.get("node")):
+                        term = str(candidate or "").strip().rsplit(".", 1)[-1]
+                        if term and term.casefold() not in {item.casefold() for item in terms}:
+                            terms.append(term[:64])
+                entries: list[dict[str, Any]] = []
+                seen: set[str] = set()
+                for term in terms[:8]:
+                    for entry in getattr(authoring, "catalog").search(term, limit=10):
+                        node_type = str(entry.get("type") or "") if isinstance(entry, Mapping) else ""
+                        if node_type and node_type not in seen:
+                            seen.add(node_type); entries.append(entry)
+                            if len(entries) >= 40:
+                                break
+                    if len(entries) >= 40:
+                        break
+                result["catalog_entries"] = entries
+            except Exception:
+                result["catalog_entries"] = []
+        return result
+
+    def preview_adoption(
+        self, project_id: str, workflow_id: str, *, session_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        self._project(project_id); self._session(session_id, project_id)
+        if self.get_policy(project_id, session_id=session_id)["mode"] == "off":
+            raise N8nGovernanceError("N8N_AGENT_DISABLED", "n8n Agent access is disabled.", status_code=403)
+        self._require_broker_ready()
+        snapshot = self._assert_workflow_not_protected(str(workflow_id or "").strip())
+        with database.get_db_conn() as conn:
+            owner = conn.execute(
+                "SELECT project_id FROM n8n_agent_workflow_bindings WHERE workflow_id=?", (workflow_id,)
+            ).fetchone()
+        if owner:
+            raise N8nGovernanceError("N8N_WORKFLOW_ALREADY_MANAGED", "The workflow is already managed.", status_code=409)
+        authoring = self._authoring()
+        workflow = (snapshot or {}).get("workflow")
+        if not isinstance(workflow, Mapping):
+            raise N8nGovernanceError("N8N_WORKFLOW_LOOKUP_FAILED", "The workflow graph could not be loaded.", status_code=503)
+        result = _graph_result_dict(authoring.adopt(workflow))
+        return {
+            "workflow_id": workflow_id, "workflow_name": snapshot.get("name"),
+            "active": snapshot.get("active") is True,
+            "status": result.get("status"),
+            "expected_digest": _workflow_snapshot_digest(snapshot),
+            "graph_preview": result.get("graph_preview"),
+            "validation_status": result.get("validation_status"),
+            "catalog_digest": result.get("catalog_digest"),
+            "graph_digest": result.get("graph_digest"),
+            "issues": result.get("issues") or [], "questions": result.get("questions") or [],
+        }
+
+    def adopt_workflow(
+        self, project_id: str, workflow_id: str, *, session_id: Optional[str],
+        expected_digest: str, confirmation: str,
+    ) -> dict[str, Any]:
+        preview = self.preview_adoption(project_id, workflow_id, session_id=session_id)
+        if not secrets.compare_digest(str(preview["expected_digest"]), str(expected_digest or "")):
+            raise N8nGovernanceError("N8N_WORKFLOW_STALE", "The workflow changed before adoption.", status_code=409)
+        if not secrets.compare_digest(str(preview["workflow_name"]), str(confirmation or "")):
+            raise N8nGovernanceError("N8N_ADOPTION_CONFIRMATION_REQUIRED", "Type the exact workflow name to adopt it.", status_code=409)
+        if preview.get("status") != "graph_ready":
+            raise N8nGovernanceError("N8N_WORKFLOW_ADOPTION_BLOCKED", "The workflow did not pass graph validation.", status_code=409)
+        now = _iso()
+        with database.get_db_conn() as conn:
+            try:
+                conn.execute(
+                    "INSERT INTO n8n_agent_workflow_bindings(workflow_id,project_id,workflow_name,created_at,updated_at) VALUES(?,?,?,?,?)",
+                    (workflow_id, project_id, preview["workflow_name"], now, now),
+                )
+            except Exception as exc:
+                raise N8nGovernanceError("N8N_WORKFLOW_ALREADY_MANAGED", "The workflow is already managed.", status_code=409) from exc
+        adoption_id = f"n8nadopt_{uuid.uuid4().hex}"
+        self._audit(adoption_id, project_id, "workflow_adopted", expected_digest, {
+            "workflow_id": workflow_id, "workflow_name": preview["workflow_name"],
+            "catalog_digest": preview.get("catalog_digest"), "graph_digest": preview.get("graph_digest"),
+        }, session_id=session_id)
+        return {**preview, "managed": True}
+
     def list_workflows(self, project_id: str, *, session_id: Optional[str] = None) -> dict[str, Any]:
         self._project(project_id)
         self._session(session_id, project_id)
@@ -1032,6 +1412,63 @@ class N8nAgentGovernanceService:
                 status_code=403,
             )
         payload = _safe_json(value.get("payload") or {})
+        materialization: Optional[dict[str, Any]] = None
+        if self.graph_authoring is not None:
+            if origin == "planner":
+                materialization = _safe_json(value.get("materialization") or {})
+            else:
+                # Browser callers use the same semantic compiler. Supplying a
+                # raw `workflow` object is not a privileged bypass.
+                materialization = self.materialize_planned_choice(
+                    project_id=project_id, session_id=session_id or "",
+                    operation=operation, semantic=payload, source=origin,
+                )
+            if materialization.get("status") != "graph_ready":
+                code = "N8N_GRAPH_NEEDS_INPUT" if materialization.get("status") == "needs_input" else "N8N_GRAPH_BLOCKED"
+                raise N8nGovernanceError(
+                    code,
+                    "The semantic workflow is not ready for review.",
+                    status_code=409,
+                )
+            operation_payload = materialization.get("operation_payload")
+            payload = _safe_json(operation_payload if isinstance(operation_payload, Mapping) else {})
+            if operation in {"create_draft", "update_draft"}:
+                if not isinstance(materialization.get("workflow"), Mapping):
+                    raise N8nGovernanceError("N8N_GRAPH_AUTHORING_INVALID", "Compiled workflow is missing.", status_code=502)
+                payload["workflow"] = _sanitize_proposed_workflow(materialization["workflow"])
+            supplied_catalog = str(materialization.get("catalog_digest") or "")
+            if not WORKFLOW_DIGEST_RE.fullmatch(supplied_catalog) or not secrets.compare_digest(
+                supplied_catalog, self._catalog_digest()
+            ):
+                raise N8nGovernanceError("N8N_NODE_CATALOG_STALE", "The pinned node catalog changed; materialize again.", status_code=409)
+            supplied_graph = str(materialization.get("graph_digest") or "")
+            materialized_workflow = materialization.get("workflow")
+            observed_graph = str(self._authoring().workflow_digest(materialized_workflow)) if isinstance(materialized_workflow, Mapping) else ""
+            if (
+                not WORKFLOW_DIGEST_RE.fullmatch(supplied_graph)
+                or not WORKFLOW_DIGEST_RE.fullmatch(observed_graph)
+                or not secrets.compare_digest(supplied_graph, observed_graph)
+            ):
+                raise N8nGovernanceError("N8N_GRAPH_STALE", "The compiled graph changed; materialize again.", status_code=409)
+            binding_claims = materialization.get("binding_claims") or []
+            if not isinstance(binding_claims, list) or any(not isinstance(item, Mapping) for item in binding_claims):
+                raise N8nGovernanceError("N8N_GRAPH_BINDING_INVALID", "Graph binding claims are invalid.", status_code=502)
+            if binding_claims and not callable(self.graph_binding_finalizer):
+                raise N8nGovernanceError(
+                    "N8N_GRAPH_BINDING_FINALIZER_UNAVAILABLE",
+                    "The protected Agent binding service is unavailable.",
+                    status_code=503,
+                )
+            if binding_claims:
+                payload["_binding_claims"] = _safe_json(binding_claims, limit=64_000)
+        elif operation in {"create_draft", "update_draft"} and not self._allow_legacy_raw_workflows_for_tests:
+            # Failing to initialize the pinned catalog must disable graph
+            # mutation, not silently re-enable the old raw JSON path.
+            raise N8nGovernanceError(
+                "N8N_GRAPH_AUTHORING_UNAVAILABLE",
+                "The n8n graph authoring service is unavailable.",
+                status_code=503,
+            )
         asserted_name = str(payload.get("workflow_name") or "")[:255]
         if _is_protected_workflow_name(asserted_name):
             raise N8nGovernanceError(
@@ -1047,9 +1484,21 @@ class N8nAgentGovernanceService:
             raise N8nGovernanceError("N8N_WORKFLOW_PROTECTED", "This Workbench workflow is protected.", status_code=403)
         workflow_id = str(payload.get("workflow_id") or "").strip()
         before_snapshot, base_digest = self._load_target_snapshot(project_id, operation, payload)
+        if materialization is not None:
+            supplied_base = str(materialization.get("base_digest") or "")
+            if not WORKFLOW_DIGEST_RE.fullmatch(supplied_base) or not secrets.compare_digest(supplied_base, base_digest):
+                raise N8nGovernanceError("N8N_WORKFLOW_STALE", "The target workflow changed after materialization.", status_code=409)
         # Ignore the caller/model supplied diff.  Review facts are computed
         # exclusively from the sanitized proposal and exact server snapshot.
         diff = _canonical_workflow_diff(operation, payload, before_snapshot)
+        if materialization is not None:
+            diff["graph"] = {
+                "catalog_digest": materialization["catalog_digest"],
+                "base_digest": base_digest,
+                "after_digest": materialization["graph_digest"],
+                "preview": materialization.get("graph_preview"),
+                "validation_status": materialization.get("validation_status"),
+            }
         after_facts = diff.get("after") if isinstance(diff.get("after"), Mapping) else {}
         payload["credential_aliases"] = list(after_facts.get("credential_aliases") or [])
         payload["external_targets"] = list(after_facts.get("external_targets") or [])
@@ -1060,9 +1509,19 @@ class N8nAgentGovernanceService:
             raise N8nGovernanceError("N8N_HIGH_RISK_FORBIDDEN", "High-risk nodes are forbidden in restricted mode.", status_code=403)
         risk = _risk(operation, payload, high_risk)
         operation_id = f"n8nop_{uuid.uuid4().hex}"
-        immutable = {"project_id": project_id, "session_id": session_id, "run_id": run_id, "operation": operation, "payload": payload, "diff": diff, "risk": risk, "origin": origin, "base_digest": base_digest}
+        immutable = {
+            "project_id": project_id, "session_id": session_id, "run_id": run_id,
+            "operation": operation, "payload": payload, "diff": diff, "risk": risk,
+            "origin": origin, "base_digest": base_digest,
+            "catalog_digest": (materialization or {}).get("catalog_digest"),
+            "after_graph_digest": (materialization or {}).get("graph_digest"),
+            "plan_digest": value.get("plan_digest") if origin == "planner" else None,
+        }
         digest = _digest(immutable)
-        direct = not force_approval and policy["mode"] == "restricted" and operation in SAFE_DRAFT_OPERATIONS and not high_risk
+        direct = (
+            self.graph_authoring is None and not force_approval and policy["mode"] == "restricted"
+            and operation in SAFE_DRAFT_OPERATIONS and not high_risk
+        )
         status = "approved" if direct else "pending"
         now = _now()
         with database.get_db_conn() as conn:
@@ -1081,10 +1540,14 @@ class N8nAgentGovernanceService:
             row = conn.execute("SELECT * FROM n8n_agent_operations WHERE id=?", (operation_id,)).fetchone()
         if not row or (project_id is not None and row["project_id"] != project_id):
             raise N8nGovernanceError("N8N_OPERATION_NOT_FOUND", "The n8n operation was not found.", status_code=404)
+        diff = _loads(row["diff_json"], {})
+        graph = diff.get("graph") if isinstance(diff, Mapping) and isinstance(diff.get("graph"), Mapping) else {}
         return {
             "id": row["id"], "project_id": row["project_id"], "session_id": row["session_id"], "run_id": row["run_id"],
             "operation": row["operation"], "workflow_id": row["workflow_id"], "workflow_name": row["workflow_name"],
-            "diff": _loads(row["diff_json"], {}), "risk": _loads(row["risk_json"], {}), "digest": row["digest"],
+            "diff": diff, "risk": _loads(row["risk_json"], {}), "digest": row["digest"],
+            "graph_preview": graph.get("preview"), "validation_status": graph.get("validation_status"),
+            "catalog_digest": graph.get("catalog_digest"), "graph_digest": graph.get("after_digest"),
             "base_digest": row["base_digest"], "high_risk": bool(row["high_risk"]), "status": row["status"],
             "approval_stage": row["approval_stage"], "created_at": row["created_at"], "updated_at": row["updated_at"],
             "expires_at": row["expires_at"], "result": _loads(row["result_json"], None), "error_code": row["error_code"],
@@ -1097,8 +1560,19 @@ class N8nAgentGovernanceService:
             rows = conn.execute("SELECT id FROM n8n_agent_operations WHERE project_id=? ORDER BY created_at DESC LIMIT ?", (project_id, max(1, min(limit, 250)))).fetchall()
         return [self.get_operation(row["id"], project_id=project_id) for row in rows]
 
-    def decide(self, operation_id: str, *, project_id: str, expected_digest: str, approved: bool, confirmation: Optional[str] = None) -> dict[str, Any]:
+    def decide(
+        self, operation_id: str, *, project_id: str, session_id: Any = _UNSET,
+        expected_digest: str, approved: bool, confirmation: Optional[str] = None,
+    ) -> dict[str, Any]:
         current = self.get_operation(operation_id, project_id=project_id)
+        if session_id is not _UNSET and not secrets.compare_digest(
+            str(current.get("session_id") or ""), str(session_id or "")
+        ):
+            raise N8nGovernanceError(
+                "N8N_APPROVAL_SCOPE_MISMATCH",
+                "The approval Session does not match the operation.",
+                status_code=409,
+            )
         if current["status"] not in {"pending", "pending_second_approval"}:
             raise N8nGovernanceError("N8N_APPROVAL_CONFLICT", "The operation is no longer awaiting approval.", status_code=409)
         if not secrets.compare_digest(current["digest"], str(expected_digest or "")):
@@ -1147,6 +1621,23 @@ class N8nAgentGovernanceService:
                 raise N8nGovernanceError("N8N_SECURITY_AUDIT_FAILED", "The n8n security audit could not be verified.", status_code=409)
             report_digest = _security_audit_digest(report)
             self._audit(operation_id, project_id, "security_review_completed", current["digest"], {"verified": True, "report_digest": report_digest})
+        with database.get_db_conn() as conn:
+            approved_claim = conn.execute(
+                """UPDATE n8n_agent_operations SET status='approved',updated_at=?
+                   WHERE id=? AND project_id=? AND digest=? AND status=?""",
+                (_iso(), operation_id, project_id, current["digest"], current["status"]),
+            )
+            if approved_claim.rowcount != 1:
+                raise N8nGovernanceError(
+                    "N8N_APPROVAL_CONFLICT",
+                    "The operation changed before approval could be recorded.",
+                    status_code=409,
+                )
+        self._audit(
+            operation_id, project_id, "approved", current["digest"],
+            {"operation": current["operation"], "approval_stage": current["approval_stage"]},
+            session_id=current.get("session_id"), run_id=current.get("run_id"), actor="local_user",
+        )
         return self._execute(operation_id)
 
     def _execute(self, operation_id: str) -> dict[str, Any]:
@@ -1173,7 +1664,7 @@ class N8nAgentGovernanceService:
                 UPDATE n8n_agent_operations
                    SET status='executing',updated_at=?
                  WHERE id=?
-                   AND status IN ('approved','pending','pending_second_approval')
+                   AND status='approved'
                 """,
                 (_iso(), operation_id),
             )
@@ -1196,8 +1687,117 @@ class N8nAgentGovernanceService:
                 for key, value in dict(result or {}).items()
                 if key in {"id", "name", "active", "createdAt", "updatedAt"}
             }
-            if current["operation"] == "create_draft":
+            graph_review = current.get("diff", {}).get("graph") if isinstance(current.get("diff"), Mapping) else None
+            if self.graph_authoring is not None and current["operation"] in {"create_draft", "update_draft"}:
+                exact_id = str((result or {}).get("id") or workflow_id).strip()
+                if not exact_id:
+                    raise N8nGovernanceError("N8N_BROKER_INVALID_RESPONSE", "n8n did not return the workflow identity.", status_code=502)
+                exact = self.broker.get_workflow(exact_id)
+                observed_workflow = exact.get("workflow") if isinstance(exact, Mapping) else None
+                expected_graph = str((graph_review or {}).get("after_digest") or "")
+                observed_graph = (
+                    str(self._authoring().workflow_digest(observed_workflow))
+                    if isinstance(observed_workflow, Mapping) else ""
+                )
+                if (
+                    not WORKFLOW_DIGEST_RE.fullmatch(expected_graph)
+                    or not WORKFLOW_DIGEST_RE.fullmatch(observed_graph)
+                    or not secrets.compare_digest(expected_graph, observed_graph)
+                ):
+                    raise N8nGovernanceError(
+                        "N8N_GRAPH_RECONCILIATION_FAILED",
+                        "n8n did not persist the exact reviewed graph.",
+                        status_code=409,
+                    )
+                if current["operation"] == "create_draft" and exact.get("active") is True:
+                    raise N8nGovernanceError(
+                        "N8N_DRAFT_ACTIVATION_CONFLICT",
+                        "The created workflow was unexpectedly active.",
+                        status_code=409,
+                    )
+                public_result["graph_digest"] = observed_graph
+                editor_url = getattr(self.broker, "editor_url", None)
+                if callable(editor_url):
+                    public_result["editor_url"] = editor_url(exact_id)
+                if current["operation"] == "create_draft":
+                    # The bridge finalizer verifies workflow ownership, so the
+                    # exact reconciled draft must be Project-bound first.
+                    self._bind_created_workflow(current["project_id"], result or {}, payload)
+                binding_claims = payload.get("_binding_claims") or []
+                if binding_claims:
+                    if not callable(self.graph_binding_finalizer):
+                        raise N8nGovernanceError(
+                            "N8N_GRAPH_BINDING_FINALIZER_UNAVAILABLE",
+                            "The protected Agent binding service is unavailable.",
+                            status_code=503,
+                        )
+                    finalized = self.graph_binding_finalizer(
+                        json.loads(_canonical(binding_claims)),
+                        {
+                            "project_id": current["project_id"], "session_id": current.get("session_id"),
+                            "run_id": current.get("run_id"), "workflow_id": exact_id,
+                            "workflow_revision": exact.get("version_id") or exact.get("updated_at"),
+                            "graph_digest": observed_graph,
+                        },
+                    )
+                    if not isinstance(finalized, list):
+                        raise N8nGovernanceError(
+                            "N8N_GRAPH_BINDING_FINALIZATION_FAILED",
+                            "The protected Agent bindings were not finalized.",
+                            status_code=409,
+                        )
+                    public_result["binding_count"] = len(finalized)
+            if current["operation"] == "create_draft" and self.graph_authoring is None:
                 self._bind_created_workflow(current["project_id"], result or {}, payload)
+            if (
+                self.graph_authoring is not None
+                and current["operation"] in {"activate", "publish"}
+                and callable(self.graph_binding_activator)
+            ):
+                exact = self.broker.get_workflow(workflow_id)
+                workflow_revision = str(
+                    exact.get("active_version_id")
+                    or exact.get("version_id")
+                    or ""
+                ).strip()
+                if exact.get("active") is not True or not workflow_revision:
+                    raise N8nGovernanceError(
+                        "N8N_WORKFLOW_ACTIVATION_RECONCILIATION_FAILED",
+                        "n8n did not expose the exact active workflow revision.",
+                        status_code=409,
+                    )
+                activated = self.graph_binding_activator(
+                    {
+                        "project_id": current["project_id"],
+                        "session_id": current.get("session_id"),
+                        "run_id": current.get("run_id"),
+                        "workflow_id": workflow_id,
+                        "workflow_revision": workflow_revision,
+                        "workflow": exact.get("workflow"),
+                    }
+                )
+                if not isinstance(activated, list):
+                    raise N8nGovernanceError(
+                        "N8N_AGENT_BINDING_ACTIVATION_FAILED",
+                        "The protected Agent bindings could not be activated.",
+                        status_code=409,
+                    )
+                public_result["binding_count"] = len(activated)
+            mutated_workflow_id = (
+                str((result or {}).get("id") or "").strip()
+                if current["operation"] == "create_draft"
+                else workflow_id
+            )
+            if mutated_workflow_id and callable(self.workflow_change_callback):
+                self.workflow_change_callback(
+                    {
+                        "project_id": current["project_id"],
+                        "session_id": current.get("session_id"),
+                        "run_id": current.get("run_id"),
+                        "workflow_id": mutated_workflow_id,
+                        "operation": current["operation"],
+                    }
+                )
             with database.get_db_conn() as conn:
                 conn.execute("UPDATE n8n_agent_operations SET status='completed',result_json=?,updated_at=? WHERE id=?", (_canonical(public_result), _iso(), operation_id))
                 if current["operation"] == "delete" and workflow_id:

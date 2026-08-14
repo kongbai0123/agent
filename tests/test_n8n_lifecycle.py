@@ -319,6 +319,239 @@ class N8nWorkflowTemplateTests(unittest.TestCase):
                 json.dumps(workflow),
             )
 
+    def test_protected_agent_templates_validate_bind_and_poll_signed_apis(self):
+        expected = {
+            "workbench-agent-bridge-v1.json": {
+                n8n_lifecycle.AGENT_TASK_SUBMIT_URL,
+                n8n_lifecycle.AGENT_TASK_STATUS_URL,
+            },
+            "workbench-approval-gate-v1.json": {
+                n8n_lifecycle.RUNTIME_APPROVAL_SUBMIT_URL,
+                n8n_lifecycle.RUNTIME_APPROVAL_STATUS_URL,
+            },
+        }
+        for name, expected_urls in expected.items():
+            with self.subTest(name=name):
+                workflow = self._load(name)
+                result = n8n_lifecycle.validate_agent_workflow_template(workflow)
+                self.assertTrue(result["valid"])
+                self.assertTrue(result["protected"])
+                self.assertFalse(result["active"])
+                self.assertEqual(
+                    {node["parameters"]["url"] for node in workflow["nodes"]
+                     if node["type"] == "n8n-nodes-base.httpRequest"},
+                    expected_urls,
+                )
+                self.assertEqual(
+                    {node["type"] for node in workflow["nodes"]},
+                    n8n_lifecycle.AGENT_TEMPLATE_NODE_TYPES,
+                )
+                serialized = json.dumps(workflow)
+                self.assertIn('"X-N8N-Profile"', serialized)
+                self.assertIn(n8n_lifecycle.AGENT_RUNTIME_PROFILE, serialized)
+                self.assertNotIn("n8n-nodes-base.code", serialized)
+                self.assertNotIn("n8n-nodes-base.executeCommand", serialized)
+                self.assertNotIn("community", serialized.casefold())
+                bound = n8n_lifecycle.bind_agent_workflow_credential(
+                    workflow, workbench_hmac_credential_id="agentHmacCredential1"
+                )
+                self.assertFalse(bound["active"])
+                n8n_lifecycle.validate_agent_workflow_template(
+                    bound, require_placeholders=False
+                )
+                self.assertNotIn(
+                    n8n_lifecycle.WORKBENCH_HMAC_CREDENTIAL_PLACEHOLDER,
+                    json.dumps(bound),
+                )
+
+        agent = self._load("workbench-agent-bridge-v1.json")
+        self.assertEqual(
+            agent["connections"]["Agent Task Still Pending"]["main"][0][0]["node"],
+            "Wait for Agent Task",
+        )
+        approval = self._load("workbench-approval-gate-v1.json")
+        self.assertEqual(
+            approval["connections"]["Approval Still Pending"]["main"][0][0]["node"],
+            "Wait for Approval",
+        )
+        self.assertEqual(
+            next(node for node in approval["nodes"] if node["name"] == "Return Approved Input")
+            ["parameters"]["jsonOutput"],
+            "={{$('When Called').item.json.input.payload}}",
+        )
+
+    def test_protected_agent_templates_fail_closed_on_drift_or_bypass(self):
+        agent = self._load("workbench-agent-bridge-v1.json")
+        mutations = []
+
+        active = copy.deepcopy(agent)
+        active["active"] = True
+        mutations.append(("activated", active))
+
+        redirected = copy.deepcopy(agent)
+        next(node for node in redirected["nodes"] if node["name"] == "Submit Agent Task")[
+            "parameters"
+        ]["url"] = "https://example.com/agent"
+        mutations.append(("redirected", redirected))
+
+        code = copy.deepcopy(agent)
+        code["nodes"][1]["type"] = "n8n-nodes-base.code"
+        mutations.append(("code", code))
+
+        missing_signature = copy.deepcopy(agent)
+        next(node for node in missing_signature["nodes"] if node["name"] == "Submit Agent Task")[
+            "parameters"
+        ]["headerParameters"]["parameters"].pop()
+        mutations.append(("missing_signature_profile", missing_signature))
+
+        approval = self._load("workbench-approval-gate-v1.json")
+        bypass = copy.deepcopy(approval)
+        bypass["connections"]["Approval Is Pending"]["main"][0][0]["node"] = (
+            "Return Approved Input"
+        )
+        mutations.append(("approval_bypass", bypass))
+
+        for name, workflow in mutations:
+            with self.subTest(name=name):
+                with self.assertRaises(n8n_lifecycle.N8nTemplateError):
+                    n8n_lifecycle.validate_agent_workflow_template(workflow)
+
+    def test_agent_bridge_database_readiness_is_read_only_and_published(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = Path(temporary) / "runtime"
+            paths = n8n_lifecycle.ManagedN8nPaths.from_runtime_root(runtime)
+            paths.n8n_dir.mkdir(parents=True)
+            database_path = paths.n8n_dir / "database.sqlite"
+            connection = sqlite3.connect(database_path)
+            connection.executescript(
+                """
+                CREATE TABLE workflow_entity (
+                    id TEXT PRIMARY KEY, name TEXT, active INTEGER, isArchived INTEGER,
+                    settings TEXT, staticData TEXT, pinData TEXT, activeVersionId TEXT
+                );
+                CREATE TABLE workflow_published_version (
+                    workflowId TEXT PRIMARY KEY, publishedVersionId TEXT
+                );
+                CREATE TABLE workflow_history (
+                    versionId TEXT PRIMARY KEY, nodes TEXT, connections TEXT
+                );
+                CREATE TABLE credentials_entity (
+                    id TEXT PRIMARY KEY, type TEXT, data TEXT
+                );
+                """
+            )
+            connection.execute(
+                "INSERT INTO credentials_entity VALUES (?,?,?)",
+                ("agentHmacCredential1", "crypto", "encrypted-credential-data"),
+            )
+            names = (
+                "workbench-agent-bridge-v1.json",
+                "workbench-approval-gate-v1.json",
+            )
+            for index, name in enumerate(names):
+                workflow = n8n_lifecycle.bind_agent_workflow_credential(
+                    self._load(name),
+                    workbench_hmac_credential_id="agentHmacCredential1",
+                )
+                for node in workflow["nodes"]:
+                    if node["type"] == "n8n-nodes-base.wait":
+                        node["webhookId"] = f"server-wait-{index}"
+                workflow_id = f"agent-workflow-{index}"
+                version_id = f"agent-version-{index}"
+                connection.execute(
+                    "INSERT INTO workflow_entity VALUES (?,?,?,?,?,?,?,?)",
+                    (
+                        workflow_id, workflow["name"], 1, 0,
+                        json.dumps(workflow["settings"]),
+                        json.dumps(workflow["staticData"]),
+                        # n8n 2.32.5 represents publication as activation.
+                        # These bridges have only Execute Workflow Triggers,
+                        # so publishing cannot start them autonomously.
+                        json.dumps(workflow["pinData"]), version_id,
+                    ),
+                )
+                connection.execute(
+                    "INSERT INTO workflow_published_version VALUES (?,?)",
+                    (workflow_id, version_id),
+                )
+                connection.execute(
+                    "INSERT INTO workflow_history VALUES (?,?,?)",
+                    (
+                        version_id, json.dumps(workflow["nodes"]),
+                        json.dumps(workflow["connections"]),
+                    ),
+                )
+            connection.commit()
+            before = database_path.read_bytes()
+            report = n8n_lifecycle.inspect_agent_bridge_workflows_readiness(
+                paths, database_path=database_path
+            )
+            self.assertTrue(report["ready"], report)
+            self.assertTrue(
+                n8n_lifecycle.agent_bridge_workflows_ready(
+                    paths, database_path=database_path
+                )
+            )
+            self.assertEqual(before, database_path.read_bytes())
+            self.assertNotIn("agentHmacCredential1", json.dumps(report))
+            self.assertEqual(
+                report["workflows"][n8n_lifecycle.AGENT_BRIDGE_TEMPLATE_ID]["workflow_id"],
+                "agent-workflow-0",
+            )
+            self.assertEqual(
+                report["workflows"][n8n_lifecycle.APPROVAL_GATE_TEMPLATE_ID]["workflow_id"],
+                "agent-workflow-1",
+            )
+
+            # Both protected workflows must use the same configured HMAC
+            # credential even though the opaque credential ID is never
+            # included in the readiness response.
+            connection.execute(
+                "INSERT INTO credentials_entity VALUES (?,?,?)",
+                ("secondAgentHmac", "crypto", "other-encrypted-credential-data"),
+            )
+            approval = n8n_lifecycle.bind_agent_workflow_credential(
+                self._load("workbench-approval-gate-v1.json"),
+                workbench_hmac_credential_id="secondAgentHmac",
+            )
+            connection.execute(
+                "UPDATE workflow_history SET nodes=? WHERE versionId=?",
+                (json.dumps(approval["nodes"]), "agent-version-1"),
+            )
+            connection.commit()
+            mismatched = n8n_lifecycle.inspect_agent_bridge_workflows_readiness(
+                paths, database_path=database_path
+            )
+            self.assertFalse(mismatched["ready"])
+            self.assertIn(
+                "agent_hmac_credential_binding_invalid", mismatched["blockers"]
+            )
+            self.assertNotIn("secondAgentHmac", json.dumps(mismatched))
+
+            restored = n8n_lifecycle.bind_agent_workflow_credential(
+                self._load("workbench-approval-gate-v1.json"),
+                workbench_hmac_credential_id="agentHmacCredential1",
+            )
+            connection.execute(
+                "UPDATE workflow_history SET nodes=? WHERE versionId=?",
+                (json.dumps(restored["nodes"]), "agent-version-1"),
+            )
+
+            connection.execute(
+                "UPDATE workflow_entity SET active=0, activeVersionId=NULL WHERE name=?",
+                (n8n_lifecycle.AGENT_BRIDGE_WORKFLOW_NAME,),
+            )
+            connection.commit()
+            report = n8n_lifecycle.inspect_agent_bridge_workflows_readiness(
+                paths, database_path=database_path
+            )
+            self.assertFalse(report["ready"])
+            self.assertIn(
+                f"{n8n_lifecycle.AGENT_BRIDGE_TEMPLATE_ID}_must_remain_published",
+                report["blockers"],
+            )
+            connection.close()
+
     def test_templates_reject_activation_arbitrary_url_and_code(self):
         workflow = self._load("workbench-gmail-inbound-v1.json")
         activated = copy.deepcopy(workflow)

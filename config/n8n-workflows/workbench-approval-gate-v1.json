@@ -1,0 +1,154 @@
+{
+  "templateId": "workbench-approval-gate-v1",
+  "name": "Workbench Approval Gate v1",
+  "active": false,
+  "nodes": [
+    {
+      "parameters": {"inputSource": "workflowInputs", "workflowInputs": {"values": [
+        {"name": "approval_binding_id", "type": "string"},
+        {"name": "manifest_digest", "type": "string"},
+        {"name": "approval_token", "type": "string"},
+        {"name": "workflow_id", "type": "string"},
+        {"name": "workflow_revision", "type": "string"},
+        {"name": "node_id", "type": "string"},
+        {"name": "request_id", "type": "string"},
+        {"name": "input", "type": "any"}
+      ]}},
+      "id": "approval-gate-trigger", "name": "When Called", "type": "n8n-nodes-base.executeWorkflowTrigger", "typeVersion": 1.2, "position": [0, 0]
+    },
+    {
+      "parameters": {"mode": "manual", "assignments": {"assignments": [
+        {"id": "approval-submit-body", "name": "request_body", "type": "string", "value": "={{JSON.stringify({request_id:String($json.request_id||'').slice(0,128),workflow_id:String($json.workflow_id||'').slice(0,128),workflow_revision:String($json.workflow_revision||'').slice(0,128),node_id:String($json.approval_token||'').slice(0,128),credential_alias:String($json.input?.credential_alias||'').slice(0,63),target_kind:String($json.input?.target_kind||'').slice(0,16),target:String($json.input?.target||'').slice(0,2048),action:String($json.input?.action||'').slice(0,32),run_key:String($json.request_id||'').slice(0,128),task_id:$json.input?.task_id?String($json.input.task_id).slice(0,128):null})}}"},
+        {"id": "approval-submit-path", "name": "request_path", "type": "string", "value": "/api/integrations/n8n/v1/agent/runtime-actions"},
+        {"id": "approval-submit-time", "name": "timestamp", "type": "string", "value": "={{Math.floor(Date.now()/1000).toString()}}"}
+      ]}, "includeOtherFields": false, "options": {}},
+      "id": "approval-gate-prepare-submit", "name": "Prepare Runtime Approval", "type": "n8n-nodes-base.set", "typeVersion": 3.4, "position": [240, 0]
+    },
+    {
+      "parameters": {"action": "hash", "binaryData": false, "type": "SHA256", "value": "={{$json.request_body}}", "dataPropertyName": "body_sha256", "encoding": "hex"},
+      "id": "approval-gate-submit-hash", "name": "Hash Approval Body", "type": "n8n-nodes-base.crypto", "typeVersion": 2, "position": [480, 0]
+    },
+    {
+      "parameters": {"action": "generate", "dataPropertyName": "nonce", "encodingType": "hex", "stringLength": 32},
+      "id": "approval-gate-submit-nonce", "name": "Generate Approval Nonce", "type": "n8n-nodes-base.crypto", "typeVersion": 2, "position": [720, 0]
+    },
+    {
+      "parameters": {"mode": "manual", "assignments": {"assignments": [
+        {"id": "approval-submit-canonical", "name": "canonical", "type": "string", "value": "={{'POST\\n'+$json.request_path+'\\n'+$json.timestamp+'\\n'+$json.nonce+'\\n'+$json.body_sha256}}"}
+      ]}, "includeOtherFields": true, "options": {}},
+      "id": "approval-gate-submit-canonical", "name": "Build Approval Canonical", "type": "n8n-nodes-base.set", "typeVersion": 3.4, "position": [960, 0]
+    },
+    {
+      "parameters": {"action": "hmac", "binaryData": false, "type": "SHA256", "value": "={{$json.canonical}}", "dataPropertyName": "signature", "encoding": "hex"},
+      "id": "approval-gate-submit-sign", "name": "Sign Approval Request", "type": "n8n-nodes-base.crypto", "typeVersion": 2, "position": [1200, 0],
+      "credentials": {"crypto": {"id": "__WORKBENCH_HMAC_CREDENTIAL_ID__", "name": "Workbench HMAC"}}
+    },
+    {
+      "parameters": {"method": "POST", "url": "http://127.0.0.1:8000/api/integrations/n8n/v1/agent/runtime-actions", "authentication": "none", "sendHeaders": true, "headerParameters": {"parameters": [
+        {"name": "X-N8N-Timestamp", "value": "={{$json.timestamp}}"},
+        {"name": "X-N8N-Nonce", "value": "={{$json.nonce}}"},
+        {"name": "X-N8N-Signature", "value": "={{$json.signature}}"},
+        {"name": "X-N8N-Profile", "value": "agent-runtime"}
+      ]}, "sendBody": true, "contentType": "raw", "rawContentType": "application/json", "body": "={{$json.request_body}}", "options": {"timeout": 10000, "response": {"response": {"fullResponse": true, "neverError": true, "responseFormat": "json"}}}},
+      "id": "approval-gate-submit-http", "name": "Request Runtime Approval", "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.2, "position": [1440, 0], "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {"conditions": {"options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 2}, "conditions": [
+        {"id": "approval-submit-accepted-condition", "leftValue": "={{Number($json.statusCode||0)===202 && Boolean($json.body?.approval_id)}}", "rightValue": true, "operator": {"type": "boolean", "operation": "true", "singleValue": true}}
+      ], "combinator": "and"}, "options": {}},
+      "id": "approval-gate-submit-accepted", "name": "Approval Request Accepted", "type": "n8n-nodes-base.if", "typeVersion": 2.2, "position": [1680, 0]
+    },
+    {
+      "parameters": {"conditions": {"options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 2}, "conditions": [
+        {"id": "approval-submit-granted-condition", "leftValue": "={{['approved','approved_by_grant'].includes(String($json.body?.status||''))}}", "rightValue": true, "operator": {"type": "boolean", "operation": "true", "singleValue": true}}
+      ], "combinator": "and"}, "options": {}},
+      "id": "approval-gate-submit-granted", "name": "Approval Already Granted", "type": "n8n-nodes-base.if", "typeVersion": 2.2, "position": [1920, -80]
+    },
+    {
+      "parameters": {"mode": "raw", "jsonOutput": "={{$('When Called').item.json.input.payload}}", "includeOtherFields": false, "options": {}},
+      "id": "approval-gate-return", "name": "Return Approved Input", "type": "n8n-nodes-base.set", "typeVersion": 3.4, "position": [2400, -220]
+    },
+    {
+      "parameters": {"conditions": {"options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 2}, "conditions": [
+        {"id": "approval-submit-pending-condition", "leftValue": "={{String($json.body?.status||'')==='pending'}}", "rightValue": true, "operator": {"type": "boolean", "operation": "true", "singleValue": true}}
+      ], "combinator": "and"}, "options": {}},
+      "id": "approval-gate-submit-pending", "name": "Approval Is Pending", "type": "n8n-nodes-base.if", "typeVersion": 2.2, "position": [2160, 20]
+    },
+    {
+      "parameters": {"resume": "timeInterval", "amount": 10, "unit": "seconds", "options": {}},
+      "id": "approval-gate-wait", "name": "Wait for Approval", "type": "n8n-nodes-base.wait", "typeVersion": 1.1, "position": [2400, 20]
+    },
+    {
+      "parameters": {"mode": "manual", "assignments": {"assignments": [
+        {"id": "approval-status-body", "name": "request_body", "type": "string", "value": "={{JSON.stringify({workflow_id:String($('When Called').item.json.workflow_id||'').slice(0,128)})}}"},
+        {"id": "approval-status-path", "name": "request_path", "type": "string", "value": "={{'/api/integrations/n8n/v1/agent/runtime-actions/'+String($('Request Runtime Approval').item.json.body.approval_id||'').slice(0,128)+'/status'}}"},
+        {"id": "approval-status-time", "name": "timestamp", "type": "string", "value": "={{Math.floor(Date.now()/1000).toString()}}"}
+      ]}, "includeOtherFields": false, "options": {}},
+      "id": "approval-gate-prepare-status", "name": "Prepare Approval Status", "type": "n8n-nodes-base.set", "typeVersion": 3.4, "position": [2640, 20]
+    },
+    {
+      "parameters": {"action": "hash", "binaryData": false, "type": "SHA256", "value": "={{$json.request_body}}", "dataPropertyName": "body_sha256", "encoding": "hex"},
+      "id": "approval-gate-status-hash", "name": "Hash Approval Status Body", "type": "n8n-nodes-base.crypto", "typeVersion": 2, "position": [2880, 20]
+    },
+    {
+      "parameters": {"action": "generate", "dataPropertyName": "nonce", "encodingType": "hex", "stringLength": 32},
+      "id": "approval-gate-status-nonce", "name": "Generate Approval Status Nonce", "type": "n8n-nodes-base.crypto", "typeVersion": 2, "position": [3120, 20]
+    },
+    {
+      "parameters": {"mode": "manual", "assignments": {"assignments": [
+        {"id": "approval-status-canonical", "name": "canonical", "type": "string", "value": "={{'POST\\n'+$json.request_path+'\\n'+$json.timestamp+'\\n'+$json.nonce+'\\n'+$json.body_sha256}}"}
+      ]}, "includeOtherFields": true, "options": {}},
+      "id": "approval-gate-status-canonical", "name": "Build Approval Status Canonical", "type": "n8n-nodes-base.set", "typeVersion": 3.4, "position": [3360, 20]
+    },
+    {
+      "parameters": {"action": "hmac", "binaryData": false, "type": "SHA256", "value": "={{$json.canonical}}", "dataPropertyName": "signature", "encoding": "hex"},
+      "id": "approval-gate-status-sign", "name": "Sign Approval Status", "type": "n8n-nodes-base.crypto", "typeVersion": 2, "position": [3600, 20],
+      "credentials": {"crypto": {"id": "__WORKBENCH_HMAC_CREDENTIAL_ID__", "name": "Workbench HMAC"}}
+    },
+    {
+      "parameters": {"method": "POST", "url": "=http://127.0.0.1:8000/api/integrations/n8n/v1/agent/runtime-actions/{{$('Request Runtime Approval').item.json.body.approval_id}}/status", "authentication": "none", "sendHeaders": true, "headerParameters": {"parameters": [
+        {"name": "X-N8N-Timestamp", "value": "={{$json.timestamp}}"},
+        {"name": "X-N8N-Nonce", "value": "={{$json.nonce}}"},
+        {"name": "X-N8N-Signature", "value": "={{$json.signature}}"},
+        {"name": "X-N8N-Profile", "value": "agent-runtime"}
+      ]}, "sendBody": true, "contentType": "raw", "rawContentType": "application/json", "body": "={{$json.request_body}}", "options": {"timeout": 10000, "response": {"response": {"fullResponse": true, "neverError": true, "responseFormat": "json"}}}},
+      "id": "approval-gate-status-http", "name": "Get Approval Status", "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.2, "position": [3840, 20], "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {"conditions": {"options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 2}, "conditions": [
+        {"id": "approval-status-granted-condition", "leftValue": "={{Number($json.statusCode||0)===200 && ['approved','approved_by_grant'].includes(String($json.body?.status||''))}}", "rightValue": true, "operator": {"type": "boolean", "operation": "true", "singleValue": true}}
+      ], "combinator": "and"}, "options": {}},
+      "id": "approval-gate-status-granted", "name": "Approval Granted", "type": "n8n-nodes-base.if", "typeVersion": 2.2, "position": [4080, 20]
+    },
+    {
+      "parameters": {"conditions": {"options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 2}, "conditions": [
+        {"id": "approval-status-pending-condition", "leftValue": "={{String($json.body?.status||'')==='pending'||Boolean($json.error)||Number($json.statusCode||0)>=500}}", "rightValue": true, "operator": {"type": "boolean", "operation": "true", "singleValue": true}}
+      ], "combinator": "and"}, "options": {}},
+      "id": "approval-gate-status-pending", "name": "Approval Still Pending", "type": "n8n-nodes-base.if", "typeVersion": 2.2, "position": [4320, 100]
+    }
+  ],
+  "connections": {
+    "When Called": {"main": [[{"node": "Prepare Runtime Approval", "type": "main", "index": 0}]]},
+    "Prepare Runtime Approval": {"main": [[{"node": "Hash Approval Body", "type": "main", "index": 0}]]},
+    "Hash Approval Body": {"main": [[{"node": "Generate Approval Nonce", "type": "main", "index": 0}]]},
+    "Generate Approval Nonce": {"main": [[{"node": "Build Approval Canonical", "type": "main", "index": 0}]]},
+    "Build Approval Canonical": {"main": [[{"node": "Sign Approval Request", "type": "main", "index": 0}]]},
+    "Sign Approval Request": {"main": [[{"node": "Request Runtime Approval", "type": "main", "index": 0}]]},
+    "Request Runtime Approval": {"main": [[{"node": "Approval Request Accepted", "type": "main", "index": 0}]]},
+    "Approval Request Accepted": {"main": [[{"node": "Approval Already Granted", "type": "main", "index": 0}], []]},
+    "Approval Already Granted": {"main": [[{"node": "Return Approved Input", "type": "main", "index": 0}], [{"node": "Approval Is Pending", "type": "main", "index": 0}]]},
+    "Approval Is Pending": {"main": [[{"node": "Wait for Approval", "type": "main", "index": 0}], []]},
+    "Wait for Approval": {"main": [[{"node": "Prepare Approval Status", "type": "main", "index": 0}]]},
+    "Prepare Approval Status": {"main": [[{"node": "Hash Approval Status Body", "type": "main", "index": 0}]]},
+    "Hash Approval Status Body": {"main": [[{"node": "Generate Approval Status Nonce", "type": "main", "index": 0}]]},
+    "Generate Approval Status Nonce": {"main": [[{"node": "Build Approval Status Canonical", "type": "main", "index": 0}]]},
+    "Build Approval Status Canonical": {"main": [[{"node": "Sign Approval Status", "type": "main", "index": 0}]]},
+    "Sign Approval Status": {"main": [[{"node": "Get Approval Status", "type": "main", "index": 0}]]},
+    "Get Approval Status": {"main": [[{"node": "Approval Granted", "type": "main", "index": 0}]]},
+    "Approval Granted": {"main": [[{"node": "Return Approved Input", "type": "main", "index": 0}], [{"node": "Approval Still Pending", "type": "main", "index": 0}]]},
+    "Approval Still Pending": {"main": [[{"node": "Wait for Approval", "type": "main", "index": 0}], []]}
+  },
+  "settings": {"executionOrder": "v1"},
+  "staticData": null,
+  "pinData": {}
+}

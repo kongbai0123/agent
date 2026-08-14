@@ -15,6 +15,7 @@ import json
 import os
 import re
 import secrets
+import sqlite3
 import stat
 import threading
 import time
@@ -35,6 +36,7 @@ from api.routes.chat import router as chat_router
 from api.routes.hermes import build_hermes_router
 from api.routes.models import build_models_router
 from api.routes.n8n_agent import build_n8n_agent_router
+from api.routes.n8n_agent_tasks import build_n8n_agent_tasks_router
 from api.routes.n8n_gmail import build_n8n_gmail_router
 from api.routes.n8n_runtime import build_n8n_runtime_router
 from api.routes.project_skills import build_project_skills_router
@@ -87,11 +89,19 @@ from n8n_gmail_delivery import N8nDeliveryDispatcher
 from n8n_gmail_secrets import N8nGmailSecretStore
 from n8n_gmail_service import FIXED_TEST_RECIPIENT, GmailIntegrationError, N8nGmailService
 from n8n_agent_governance import N8nAgentGovernanceService, N8nApiBroker
+from n8n_agent_model_runtime import N8nAgentModelRuntime
 from n8n_agent_planner import N8nPlanModelGenerator, N8nPlanningService
 from n8n_agent_secrets import N8nAgentSecretStore
+from n8n_agent_task_runtime import N8nAgentTaskRuntime
+from n8n_graph_authoring import LazyGraphAuthoringEngine
 from n8n_lifecycle import (
+    AGENT_BRIDGE_TEMPLATE_ID,
+    AGENT_BRIDGE_WORKFLOW_NAME,
+    APPROVAL_GATE_TEMPLATE_ID,
+    APPROVAL_GATE_WORKFLOW_NAME,
     ManagedN8nLifecycle,
     gmail_workflows_ready,
+    inspect_agent_bridge_workflows_readiness,
     inspect_gmail_workflows_readiness,
 )
 from hermes_factory import (
@@ -129,7 +139,7 @@ from workspace import (
 )
 
 
-APP_VERSION = "0.7.0-n8n-agent-governance-beta.1"
+APP_VERSION = "0.8.0-n8n-graph-authoring-beta.1"
 SETTINGS_PATH = str(
     Path(
         os.environ.get("WORKBENCH_SETTINGS_PATH")
@@ -141,6 +151,7 @@ hermes_health_supervisor: Optional[HermesHealthSupervisor] = None
 hermes_rollout_gate: Optional[HermesRolloutGate] = None
 n8n_lifecycle: Optional[ManagedN8nLifecycle] = None
 n8n_gmail_service: Optional[N8nGmailService] = None
+n8n_agent_task_runtime: Optional[N8nAgentTaskRuntime] = None
 n8n_background_tasks: set[asyncio.Task[Any]] = set()
 
 
@@ -991,6 +1002,46 @@ def _schedule_n8n_runtime_start(lifecycle: Any) -> None:
     task.add_done_callback(n8n_background_tasks.discard)
 
 
+def _schedule_n8n_agent_task_recovery(runtime: N8nAgentTaskRuntime) -> None:
+    """Resume durable, already-authenticated Agent tasks off the startup path."""
+
+    async def run() -> None:
+        try:
+            while await asyncio.to_thread(runtime.process_next_task) is not None:
+                pass
+        except Exception as exc:  # task state contains the bounded safe error
+            print(f"[N8N] Agent task recovery stopped: {type(exc).__name__}")
+
+    task = asyncio.create_task(run(), name="n8n-agent-task-recovery")
+    n8n_background_tasks.add(task)
+    task.add_done_callback(n8n_background_tasks.discard)
+
+
+def _revoke_n8n_runtime_grants(reason: str = "n8n_stopped") -> None:
+    """Fail closed when n8n stops without exposing private approval state."""
+
+    runtime = n8n_agent_task_runtime
+    if runtime is None:
+        return
+    try:
+        with database.get_db_conn() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT project_id FROM n8n_agent_runtime_grants "
+                "WHERE status='active'"
+            ).fetchall()
+        for row in rows:
+            runtime.notify_policy_changed(str(row["project_id"]), reason=reason)
+    except Exception as exc:
+        # Grant checks remain fail closed on boot/policy epoch.  This hook is
+        # best effort so an integration problem cannot take down core chat.
+        print(f"[N8N] Runtime grant revocation incomplete: {type(exc).__name__}")
+
+
+def _on_managed_n8n_stop() -> None:
+    n8n_agent_governance.downgrade_smart_policies("n8n_stopped")
+    _revoke_n8n_runtime_grants("n8n_stopped")
+
+
 @asynccontextmanager
 async def app_lifespan(_app: FastAPI):
     try:
@@ -1025,6 +1076,9 @@ async def app_lifespan(_app: FastAPI):
             mail_service.purge_retention()
         except Exception as exc:  # content remains encrypted and durable
             print(f"[N8N] Recovery scan failed: {type(exc).__name__}")
+    task_runtime = n8n_agent_task_runtime
+    if task_runtime is not None:
+        _schedule_n8n_agent_task_recovery(task_runtime)
     try:
         yield
     finally:
@@ -1038,6 +1092,7 @@ async def app_lifespan(_app: FastAPI):
             try:
                 state = await asyncio.to_thread(lifecycle.status)
                 if state.get("state") in {"ready", "starting", "degraded"}:
+                    _on_managed_n8n_stop()
                     await asyncio.to_thread(lifecycle.stop)
             except Exception as exc:  # ownership checks remain authoritative
                 print(f"[N8N] Managed shutdown incomplete: {type(exc).__name__}")
@@ -1152,9 +1207,407 @@ project_skills_router = build_project_skills_router(
     session_access_guard=guard_integration_session,
 )
 
+
+def _resolve_n8n_agent_skill(
+    project_id: str, slug: str, sha256: str
+) -> Dict[str, Any]:
+    """Load one immutable Project Skill snapshot for the tool-free runtime."""
+
+    snapshot = project_skill_store.get_version(project_id, slug, sha256)
+    return {
+        "slug": str(snapshot["slug"]),
+        "sha256": str(snapshot["sha256"]),
+        "instructions": str(snapshot["instructions"]),
+    }
+
+
+def _configured_n8n_protected_workflows() -> Dict[str, Dict[str, str]]:
+    """Read reviewed bridge identities without probing n8n during startup."""
+
+    configured: Dict[str, Dict[str, str]] = {}
+    for node_type, variables, name in (
+        (
+            "workbench.agent",
+            ("WORKBENCH_N8N_AGENT_BRIDGE_WORKFLOW_ID",),
+            AGENT_BRIDGE_WORKFLOW_NAME,
+        ),
+        (
+            "workbench.approval",
+            (
+                "WORKBENCH_N8N_APPROVAL_GATE_WORKFLOW_ID",
+                "WORKBENCH_N8N_APPROVAL_BRIDGE_WORKFLOW_ID",
+            ),
+            APPROVAL_GATE_WORKFLOW_NAME,
+        ),
+    ):
+        workflow_id = next(
+            (
+                str(os.environ.get(variable) or "").strip()
+                for variable in variables
+                if str(os.environ.get(variable) or "").strip()
+            ),
+            "",
+        )
+        if re.fullmatch(r"[A-Za-z0-9_-]{1,128}", workflow_id):
+            configured[node_type] = {"workflow_id": workflow_id, "name": name}
+    return configured
+
+
 n8n_lifecycle = ManagedN8nLifecycle()
 n8n_secret_store = N8nGmailSecretStore()
 n8n_agent_secret_store = N8nAgentSecretStore()
+
+
+def _inspect_configured_n8n_agent_bridges() -> Dict[str, Any]:
+    """Lazily attest exact callable bridges and configured workflow IDs."""
+
+    try:
+        raw = inspect_agent_bridge_workflows_readiness(n8n_lifecycle.paths)
+    except Exception:
+        raw = {
+            "ready": False,
+            "code": "agent_bridge_workflows_not_ready",
+            "blockers": ["agent_bridge_read_failed"],
+            "workflows": {},
+        }
+    blockers = [
+        str(item)[:128]
+        for item in raw.get("blockers") or []
+        if isinstance(item, str)
+    ]
+    configured = _configured_n8n_protected_workflows()
+    expected = {
+        "workbench.agent": AGENT_BRIDGE_TEMPLATE_ID,
+        "workbench.approval": APPROVAL_GATE_TEMPLATE_ID,
+    }
+    safe_workflows: Dict[str, Dict[str, Any]] = {}
+    for node_type, template_id in expected.items():
+        item = (raw.get("workflows") or {}).get(template_id)
+        item = item if isinstance(item, dict) else {}
+        attested_id = str(item.get("workflow_id") or "").strip()
+        configured_id = str(
+            (configured.get(node_type) or {}).get("workflow_id") or ""
+        ).strip()
+        safe_workflows[template_id] = {
+            "workflow_id": attested_id or None,
+            "present": item.get("present") is True,
+            "published": item.get("published") is True,
+            "active": item.get("active") is True,
+            "valid": item.get("valid") is True,
+            "protected": True,
+        }
+        if not configured_id:
+            blockers.append(f"{template_id}_configured_id_missing")
+        elif not attested_id or not secrets.compare_digest(configured_id, attested_id):
+            blockers.append(f"{template_id}_configured_id_mismatch")
+
+    # The compiler captured these identities at process construction.  An
+    # environment change requires a Workbench restart, never a live retarget.
+    engine = globals().get("n8n_graph_authoring")
+    protected = getattr(engine, "protected_workflows", {}) if engine is not None else {}
+    if isinstance(protected, dict):
+        for node_type, template_id in expected.items():
+            compiled_id = str(
+                (protected.get(node_type) or {}).get("workflow_id") or ""
+            ).strip() if isinstance(protected.get(node_type), dict) else ""
+            configured_id = str(
+                (configured.get(node_type) or {}).get("workflow_id") or ""
+            ).strip()
+            if compiled_id and configured_id and not secrets.compare_digest(
+                compiled_id, configured_id
+            ):
+                blockers.append(f"{template_id}_compiler_id_stale")
+
+    blockers = list(dict.fromkeys(blockers))
+    ready = raw.get("ready") is True and not blockers
+    return {
+        "ready": ready,
+        "code": "ready" if ready else "agent_bridge_workflows_not_ready",
+        "blockers": blockers,
+        "workflows": safe_workflows,
+        "credential_bindings": {
+            "hmac_bound": (raw.get("credential_bindings") or {}).get("hmac_bound") is True,
+            "hmac_configured": (raw.get("credential_bindings") or {}).get("hmac_configured") is True,
+        },
+    }
+
+
+def _require_configured_n8n_agent_bridges() -> Dict[str, Any]:
+    report = _inspect_configured_n8n_agent_bridges()
+    if report.get("ready") is not True:
+        raise RuntimeError("The reviewed Workbench Agent bridge workflows are not ready.")
+    return report
+
+
+def _resolve_managed_n8n_credential(credential_id: str) -> Dict[str, Any]:
+    """Return bounded credential metadata from the managed read-only DB."""
+
+    opaque_id = str(credential_id or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,255}", opaque_id):
+        raise KeyError("invalid n8n credential id")
+    root = n8n_lifecycle.paths.n8n_dir.resolve()
+    candidate = n8n_lifecycle.paths.n8n_dir / "database.sqlite"
+    try:
+        resolved = candidate.resolve(strict=True)
+        resolved.relative_to(root)
+    except (OSError, ValueError) as exc:
+        raise KeyError("managed n8n database is unavailable") from exc
+    if not resolved.is_file():
+        raise KeyError("managed n8n database is unavailable")
+    uri = f"file:{resolved.as_posix()}?mode=ro"
+    try:
+        connection = sqlite3.connect(uri, uri=True, timeout=2.0)
+        connection.row_factory = sqlite3.Row
+        try:
+            connection.execute("PRAGMA query_only = ON")
+            connection.execute("PRAGMA trusted_schema = OFF")
+            row = connection.execute(
+                """
+                SELECT id, name, type,
+                       CASE WHEN data IS NOT NULL AND length(data) >= 16
+                            THEN 1 ELSE 0 END AS configured
+                FROM credentials_entity WHERE id=?
+                """,
+                (opaque_id,),
+            ).fetchone()
+        finally:
+            connection.close()
+    except sqlite3.Error as exc:
+        raise KeyError("n8n credential metadata is unavailable") from exc
+    if row is None or str(row["id"]) != opaque_id:
+        raise KeyError("n8n credential was not found")
+    return {
+        "id": opaque_id,
+        "name": str(row["name"] or "")[:255],
+        "type": str(row["type"] or "")[:128],
+        "status": "ready" if int(row["configured"] or 0) == 1 else "degraded",
+    }
+
+
+def _resolve_live_managed_n8n_workflow_revision(workflow_id: str) -> Dict[str, Any]:
+    """Read the exact active n8n version from the managed DB, never from Agent input."""
+
+    opaque_id = str(workflow_id or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", opaque_id):
+        raise KeyError("invalid n8n workflow id")
+    root = n8n_lifecycle.paths.n8n_dir.resolve()
+    candidate = n8n_lifecycle.paths.n8n_dir / "database.sqlite"
+    try:
+        resolved = candidate.resolve(strict=True)
+        resolved.relative_to(root)
+    except (OSError, ValueError) as exc:
+        raise KeyError("managed n8n database is unavailable") from exc
+    if not resolved.is_file():
+        raise KeyError("managed n8n database is unavailable")
+    uri = f"file:{resolved.as_posix()}?mode=ro"
+    try:
+        connection = sqlite3.connect(uri, uri=True, timeout=2.0)
+        connection.row_factory = sqlite3.Row
+        try:
+            connection.execute("PRAGMA query_only = ON")
+            connection.execute("PRAGMA trusted_schema = OFF")
+            row = connection.execute(
+                "SELECT id, active, activeVersionId FROM workflow_entity WHERE id=?",
+                (opaque_id,),
+            ).fetchone()
+        finally:
+            connection.close()
+    except sqlite3.Error as exc:
+        raise KeyError("n8n workflow revision metadata is unavailable") from exc
+    if row is None or str(row["id"]) != opaque_id:
+        raise KeyError("n8n workflow was not found")
+    active_version_id = str(row["activeVersionId"] or "").strip()
+    if bool(row["active"]) and not re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", active_version_id
+    ):
+        raise KeyError("n8n active workflow revision is unavailable")
+    return {
+        "active": bool(row["active"]),
+        "active_version_id": active_version_id,
+    }
+
+
+def _resolve_live_n8n_agent_policy(project_id: str) -> Dict[str, Any]:
+    """Resolve policy at decision time so the Agent cannot retain elevation."""
+
+    return n8n_agent_governance.get_policy(project_id)
+
+
+n8n_agent_task_runtime = N8nAgentTaskRuntime(
+    cipher=AesGcmContentCipher(n8n_agent_secret_store.content_key),
+    hmac_secret_provider=n8n_secret_store.inbound_hmac_verifier_key,
+    generator=N8nAgentModelRuntime(settings_loader=load_settings),
+    skill_resolver=_resolve_n8n_agent_skill,
+    credential_resolver=_resolve_managed_n8n_credential,
+    policy_resolver=_resolve_live_n8n_agent_policy,
+    workflow_revision_resolver=_resolve_live_managed_n8n_workflow_revision,
+)
+
+
+def _resolve_n8n_graph_credential(
+    alias: str, expected_type: str, context: Dict[str, Any]
+) -> Dict[str, Any]:
+    project_id = str(context.get("project_id") or "").strip()
+    return n8n_agent_task_runtime.credential_alias_resolver(
+        project_id, alias, expected_type
+    )
+
+
+n8n_graph_authoring = LazyGraphAuthoringEngine(
+    credential_resolver=_resolve_n8n_graph_credential,
+    protected_workflows=_configured_n8n_protected_workflows(),
+    binding_resolver=n8n_agent_task_runtime.binding_resolver,
+)
+
+
+def _finalize_n8n_graph_bindings(
+    claims: List[Dict[str, Any]], context: Dict[str, Any]
+) -> List[Dict[str, Any]]:
+    _require_configured_n8n_agent_bridges()
+    return n8n_agent_task_runtime.finalize_bindings(
+        str(context.get("workflow_id") or ""),
+        str(context.get("workflow_revision") or ""),
+        claims,
+        str(context.get("project_id") or ""),
+        session_id=str(context.get("session_id") or "").strip() or None,
+    )
+
+
+def _activate_n8n_graph_bindings(
+    context: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """Activate only Agent bindings present in the reconciled active graph."""
+
+    _require_configured_n8n_agent_bridges()
+
+    project_id = str(context.get("project_id") or "").strip()
+    workflow_id = str(context.get("workflow_id") or "").strip()
+    workflow_revision = str(context.get("workflow_revision") or "").strip()
+    workflow = context.get("workflow")
+    if not isinstance(workflow, dict):
+        raise RuntimeError("The reconciled active workflow is unavailable.")
+
+    graph_bindings: Dict[str, tuple[str, str]] = {}
+    protected_agent = n8n_graph_authoring.protected_workflows.get("workbench.agent")
+    protected_agent_id = (
+        str(protected_agent.get("workflow_id") or "").strip()
+        if isinstance(protected_agent, dict)
+        else ""
+    )
+    candidate_bindings: Dict[str, tuple[str, str, str]] = {}
+    nodes = workflow.get("nodes")
+    for node in nodes if isinstance(nodes, list) else []:
+        if (
+            not isinstance(node, dict)
+            or node.get("type") != "n8n-nodes-base.executeWorkflow"
+        ):
+            continue
+        node_id = str(node.get("id") or "").strip()
+        parameters = node.get("parameters")
+        workflow_target = parameters.get("workflowId") if isinstance(parameters, dict) else None
+        target_id = (
+            str(workflow_target.get("value") or "").strip()
+            if isinstance(workflow_target, dict)
+            else ""
+        )
+        inputs = parameters.get("workflowInputs") if isinstance(parameters, dict) else None
+        values = inputs.get("value") if isinstance(inputs, dict) else None
+        binding_id = str(values.get("agent_binding_id") or "").strip() if isinstance(values, dict) else ""
+        compiled_revision = (
+            str(values.get("workflow_revision") or "").strip()
+            if isinstance(values, dict)
+            else ""
+        )
+        if node_id and binding_id:
+            candidate_bindings[node_id] = (
+                binding_id,
+                target_id,
+                compiled_revision,
+            )
+        if (
+            protected_agent_id
+            and node_id
+            and binding_id
+            and target_id == protected_agent_id
+        ):
+            graph_bindings[node_id] = (binding_id, compiled_revision)
+
+    workflow_bindings = [
+        binding
+        for binding in n8n_agent_task_runtime.list_bindings(project_id)
+        if (
+            str(binding.get("project_id") or "") == project_id
+            and str(binding.get("workflow_id") or "") == workflow_id
+        )
+    ]
+    known_binding_ids = {
+        str(binding.get("agent_binding_id") or "") for binding in workflow_bindings
+    }
+    if any(
+        binding_id in known_binding_ids and target_id != protected_agent_id
+        for binding_id, target_id, _revision in candidate_bindings.values()
+    ):
+        raise RuntimeError("An Agent binding targets an unverified bridge workflow.")
+    selected = [
+        str(binding["agent_binding_id"])
+        for binding in workflow_bindings
+        if graph_bindings.get(str(binding.get("node_id") or ""))
+        == (
+            str(binding.get("agent_binding_id") or ""),
+            str(binding.get("workflow_revision") or ""),
+        )
+    ]
+    selected_pairs = {
+        (
+            str(binding.get("node_id") or ""),
+            (
+                str(binding.get("agent_binding_id") or ""),
+                str(binding.get("workflow_revision") or ""),
+            ),
+        )
+        for binding in workflow_bindings
+        if str(binding.get("agent_binding_id") or "") in selected
+    }
+    if set(graph_bindings.items()) != selected_pairs:
+        raise RuntimeError("The active workflow contains an unknown Agent binding.")
+    if not selected:
+        for binding in workflow_bindings:
+            if binding.get("active") is True:
+                n8n_agent_task_runtime.deactivate_binding(
+                    str(binding["agent_binding_id"]), project_id=project_id
+                )
+        return []
+    return n8n_agent_task_runtime.activate_bindings(
+        workflow_id, workflow_revision, selected, project_id
+    )
+
+
+def _on_n8n_agent_policy_change(project_id: str, reason: str) -> None:
+    n8n_agent_task_runtime.notify_policy_changed(project_id, reason=reason)
+
+
+def _on_n8n_agent_workflow_change(context: Dict[str, Any]) -> None:
+    """Revoke grants and disable bindings invalidated by graph lifecycle changes."""
+
+    project_id = str(context.get("project_id") or "").strip()
+    workflow_id = str(context.get("workflow_id") or "").strip()
+    operation = str(context.get("operation") or "").strip()
+    if operation in {"update_draft", "deactivate", "delete"}:
+        bindings = n8n_agent_task_runtime.list_bindings(project_id)
+        for binding in bindings:
+            if (
+                str(binding.get("project_id") or "") == project_id
+                and str(binding.get("workflow_id") or "") == workflow_id
+                and binding.get("active") is True
+            ):
+                n8n_agent_task_runtime.deactivate_binding(
+                    str(binding["agent_binding_id"]), project_id=project_id
+                )
+    n8n_agent_task_runtime.notify_workflow_changed(
+        project_id, workflow_id, reason=f"workflow_{operation or 'changed'}"
+    )
+
+
 _stored_n8n_mail_profile = database.get_n8n_gmail_profile() or {}
 _stored_n8n_recipient = str(
     _stored_n8n_mail_profile.get("fixed_recipient") or ""
@@ -1174,7 +1627,7 @@ _n8n_recipient_is_configured = bool(
 )
 n8n_gmail_service = N8nGmailService(
     cipher=AesGcmContentCipher(n8n_secret_store.content_key),
-    hmac_secret_provider=n8n_secret_store.inbound_hmac_key,
+    hmac_secret_provider=n8n_secret_store.inbound_hmac_verifier_key,
     outbound_secret_provider=n8n_secret_store.outbound_webhook_key,
     draft_generator=EmailDraftRuntime(
         settings_loader=load_settings,
@@ -1195,10 +1648,69 @@ n8n_agent_governance = N8nAgentGovernanceService(
     # High-risk nodes remain fail-closed until the separate disposable runner
     # has its own attestation implementation.
     high_risk_runner_ready=lambda: False,
+    graph_authoring=n8n_graph_authoring,
+    graph_binding_finalizer=_finalize_n8n_graph_bindings,
+    graph_binding_activator=_activate_n8n_graph_bindings,
+    policy_change_callback=_on_n8n_agent_policy_change,
+    workflow_change_callback=_on_n8n_agent_workflow_change,
 )
+
+
+def _n8n_agent_planning_context(
+    project_id: str, *, session_id: str
+) -> Dict[str, Any]:
+    """Expose only safe Project aliases and active Skill snapshot summaries."""
+
+    aliases: List[Dict[str, Any]] = []
+    try:
+        aliases = [
+            {
+                "alias": str(item.get("alias") or "")[:128],
+                "credential_type": str(item.get("credential_type") or "")[:128],
+                "status": str(item.get("status") or "unknown")[:32],
+            }
+            for item in n8n_agent_task_runtime.list_credential_aliases(project_id)
+            if isinstance(item, dict)
+        ][:100]
+    except Exception:
+        aliases = []
+
+    skills: List[Dict[str, Any]] = []
+    try:
+        catalog = project_skill_runtime.catalog_for_session(session_id)
+        if str(catalog.get("project_id") or "") == project_id:
+            skills = [
+                {
+                    "slug": str(item.get("slug") or "")[:63],
+                    "name": str(item.get("name") or "")[:80],
+                    "description": str(item.get("description") or "")[:500],
+                    "version": str(item.get("version") or "")[:64],
+                    "sha256": str(item.get("sha256") or "")[:64],
+                    "active": item.get("active") is True,
+                }
+                for item in catalog.get("skills") or []
+                if isinstance(item, dict)
+            ][:100]
+    except Exception:
+        skills = []
+
+    settings = load_settings() or {}
+    return {
+        "default_model": str(settings.get("default_chat_model") or "")[:255],
+        "credential_aliases": aliases,
+        "project_skills": skills,
+    }
+
+
 n8n_agent_planner = N8nPlanningService(
     governance_service=n8n_agent_governance,
-    generator=N8nPlanModelGenerator(settings_loader=load_settings),
+    generator=N8nPlanModelGenerator(
+        settings_loader=load_settings,
+        catalog_search=n8n_agent_governance.search_node_catalog,
+    ),
+    graph_authoring=n8n_graph_authoring,
+    protected_workflow_guard=_inspect_configured_n8n_agent_bridges,
+    planning_context_provider=_n8n_agent_planning_context,
 )
 
 projects_router = build_projects_router(
@@ -1230,6 +1742,11 @@ n8n_agent_router = build_n8n_agent_router(
     require_local=require_local_workbench,
     error_payload=error_payload,
 )
+n8n_agent_tasks_router = build_n8n_agent_tasks_router(
+    runtime=n8n_agent_task_runtime,
+    require_local=require_local_workbench,
+    error_payload=error_payload,
+)
 n8n_runtime_router = build_n8n_runtime_router(
     lifecycle=n8n_lifecycle,
     require_local=require_local_workbench,
@@ -1237,7 +1754,7 @@ n8n_runtime_router = build_n8n_runtime_router(
     workflow_ready=lambda: gmail_workflows_ready(n8n_lifecycle.paths),
     workflow_status=lambda: inspect_gmail_workflows_readiness(n8n_lifecycle.paths),
     mail_status=n8n_gmail_service.public_event_snapshot,
-    on_stop=lambda: n8n_agent_governance.downgrade_smart_policies("n8n_stopped"),
+    on_stop=_on_managed_n8n_stop,
 )
 
 sessions_router = build_sessions_router(
@@ -1289,6 +1806,7 @@ for domain_router in (
     hermes_router,
     n8n_gmail_router,
     n8n_agent_router,
+    n8n_agent_tasks_router,
     n8n_runtime_router,
     run_results_router,
     settings_router,

@@ -36,6 +36,7 @@ def test_governance_routes_are_project_scoped_and_secret_safe(tmp_path, monkeypa
     service = N8nAgentGovernanceService(
         broker=Broker(), cipher=AesGcmContentCipher(lambda: b"k" * 32),
         n8n_running=lambda: True,
+        _allow_legacy_raw_workflows_for_tests=True,
     )
     secrets = Secrets()
     app = FastAPI()
@@ -64,8 +65,13 @@ def test_governance_routes_are_project_scoped_and_secret_safe(tmp_path, monkeypa
     operation = created.json()
     hidden = client.get(f"/api/integrations/n8n/operation-requests/{operation['id']}", params={"project_id": "p2"})
     assert hidden.status_code == 404
+    missing_scope = client.post(f"/api/integrations/n8n/operation-requests/{operation['id']}/approve", json={
+        "project_id": "p1", "expected_digest": operation["digest"], "confirmation": None,
+    })
+    assert missing_scope.status_code == 422
     stale = client.post(f"/api/integrations/n8n/operation-requests/{operation['id']}/approve", json={
-        "project_id": "p1", "expected_digest": "0" * 64, "confirmation": None,
+        "project_id": "p1", "session_id": None,
+        "expected_digest": "0" * 64, "confirmation": None,
     })
     assert stale.status_code == 409
 
@@ -78,7 +84,10 @@ def test_governance_routes_are_project_scoped_and_secret_safe(tmp_path, monkeypa
 def test_normal_operation_rejects_embedded_secret(tmp_path, monkeypatch):
     monkeypatch.setattr(database, "DB_PATH", str(tmp_path / "db.sqlite"))
     database.init_db(); database.create_project("p1", "P1", str(tmp_path / "p1"))
-    service = N8nAgentGovernanceService(broker=Broker(), cipher=AesGcmContentCipher(lambda: b"k" * 32), n8n_running=lambda: True)
+    service = N8nAgentGovernanceService(
+        broker=Broker(), cipher=AesGcmContentCipher(lambda: b"k" * 32),
+        n8n_running=lambda: True, _allow_legacy_raw_workflows_for_tests=True,
+    )
     app = FastAPI(); app.include_router(build_n8n_agent_router(service=service, secret_store=Secrets(), require_local=lambda _r: None, error_payload=lambda code, message, **kwargs: {"code": code, "message": message}))
     response = TestClient(app).post("/api/integrations/n8n/operation-requests", json={
         "project_id": "p1", "operation": "create_draft", "payload": {"password": "bad"}, "diff": {},

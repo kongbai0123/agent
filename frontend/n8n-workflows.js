@@ -842,41 +842,87 @@
         }
     }
 
-    async function createCompose(event) {
-        event.preventDefault();
+    async function createComposeDraft({ instruction, subject = '', model = '' } = {}) {
+        const content = string(instruction).trim();
+        state.dom.composeInstruction.value = content;
         if (!composeAllowed()) {
-            state.deps.showToast?.('Mail Profile 尚未啟用、已變更或安全契約不完整，已停止建立草稿。', 'error');
             syncComposeGate();
-            return;
+            return {
+                status: 'blocked',
+                message: 'Mail Profile 尚未啟用、已變更或安全契約不完整；目前未建立或寄送郵件。',
+            };
         }
-        const subject = state.dom.composeSubject.value.trim();
-        const instruction = state.dom.composeInstruction.value.trim();
-        const model = state.dom.composeModel.value || null;
-        if (!instruction) return;
+        if (!content) return { status: 'blocked', message: '缺少郵件工作指示。' };
+
+        const mentionedRecipients = (content.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi) || [])
+            .map(value => value.toLowerCase());
+        if (mentionedRecipients.some(value => value !== state.profile.recipient)) {
+            return {
+                status: 'blocked',
+                message: `V1 只允許固定收件者 ${state.profile.recipient}；目前未建立或寄送郵件。`,
+            };
+        }
+
         state.dom.composeCreate.disabled = true;
+        let payload;
         try {
             const composePayload = {
-                instruction,
+                instruction: content,
                 ...(subject ? { subject } : {}),
                 ...(model ? { model } : {}),
             };
-            const payload = await request('/api/integrations/n8n/mail/compose', {
+            payload = await request('/api/integrations/n8n/mail/compose', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(composePayload),
             });
-            state.dom.composeSubject.value = '';
-            state.dom.composeInstruction.value = '';
-            state.dom.composeModel.value = '';
-            await refreshRuns({ quiet: true });
-            const runId = runIdOf(payload.run || payload.mail_run || payload);
-            state.deps.showToast?.('新郵件草稿已建立，請在右上檢查器核准。', 'success');
-            if (runId) await openRun(runId);
         } catch (error) {
-            state.deps.showToast?.(`無法建立郵件草稿：${error.message}`, 'error');
+            return { status: 'blocked', message: `無法建立郵件草稿：${error.message}` };
         } finally {
             syncComposeGate();
         }
+
+        // The POST is the authoritative creation boundary.  A later refresh
+        // or Inspector rendering failure must not invite a duplicate retry.
+        state.dom.composeSubject.value = '';
+        state.dom.composeInstruction.value = '';
+        state.dom.composeModel.value = '';
+        const runId = runIdOf(payload.run || payload.mail_run || payload);
+        await refreshRuns({ quiet: true });
+        if (runId) {
+            try { await openRun(runId); }
+            catch (error) { state.deps.showToast?.(`草稿已建立，但檢查器載入失敗：${error.message}`, 'warning'); }
+        }
+        return { status: 'draft_created', runId };
+    }
+
+    async function createCompose(event) {
+        event.preventDefault();
+        const result = await createComposeDraft({
+            subject: state.dom.composeSubject.value.trim(),
+            instruction: state.dom.composeInstruction.value.trim(),
+            model: state.dom.composeModel.value || '',
+        });
+        if (result.status !== 'draft_created') {
+            state.deps.showToast?.(result.message, 'error');
+            return;
+        }
+        state.dom.composeSubject.value = '';
+        state.dom.composeInstruction.value = '';
+        state.dom.composeModel.value = '';
+        state.deps.showToast?.('新郵件草稿已建立，請在右上檢查器核准。', 'success');
+    }
+
+    async function createComposeFromChat(options = {}) {
+        const instruction = string(options.instruction).trim();
+        state.dom.composeSubject.value = '';
+        state.dom.composeInstruction.value = instruction;
+        state.dom.composeModel.value = '';
+        const result = await createComposeDraft({ instruction });
+        if (result.status === 'draft_created') {
+            state.dom.composeInstruction.value = '';
+        }
+        return result;
     }
 
     async function serviceAction(action, button) {
@@ -982,12 +1028,13 @@
         state.dom.title.setAttribute('tabindex', '-1');
         state.dom.title.focus();
         startBackgroundSync();
-        void (async () => {
+        const ready = (async () => {
             await ensureServiceForWorkspace();
             await Promise.allSettled([refreshProfile(), refreshRuns()]);
             state.deps.createIcons?.();
         })();
         void window.workbenchN8nGovernance?.refreshAll?.();
+        return ready;
     }
 
     function startBackgroundSync() {
@@ -1078,6 +1125,7 @@
         open,
         close,
         openRun,
+        createComposeFromChat,
         useChatInspectorContext,
         refreshAll,
         refreshProjects: () => renderProjects(state.profile?.projectId || ''),

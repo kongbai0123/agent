@@ -2,6 +2,8 @@
 
 Windows 本機優先的 AI 聊天工作台。現行版本以 Basic Chat 為主體，並提供可選的 Hermes sidecar、專案隔離的 Project Skills、附件、Session、輸出面板，以及受治理的本機 n8n／Gmail 整合。
 
+目前開發版本：`0.8.0-n8n-graph-authoring-beta.1`
+
 ## 目前功能
 
 - Ollama 與 OpenAI-compatible 模型連線
@@ -13,7 +15,10 @@ Windows 本機優先的 AI 聊天工作台。現行版本以 Basic Chat 為主�
 - Hermes 生產化監控、熔斷、回退與 Canary → 5% → 25% → 50% → 全量 rollout
 - Hermes Project Skills 工具限 Docker、單一專案、唯讀政策
 - Sidebar「流程」提供受管理的本機 n8n 生命週期、Gmail 草稿與人工核准
-- Agent 可先提出 n8n 操作方案、風險、預期結果與權限需求；使用者核准不可變 Diff 後才由 Broker 執行
+- Agent 可先提出 2–3 個 n8n 架構，再由固定版本 Node Catalog 與伺服器端編譯器配對、設定及連接官方內建節點
+- 選定方案必須先 materialize 成通過驗證的節點圖；更新既有流程使用語意 Patch，不由模型整份覆蓋 Workflow JSON
+- 右側檢查器顯示節點／連線 Diff、分支、Credential alias、外部目標、風險及不可變 digest；使用者核准後才由 Broker 建立未啟用草稿
+- 受保護的 Workbench Agent Bridge、Credential alias 與執行時核准邊界已完成；模型看不到 n8n Credential ID 或 Secret
 - n8n API Key、Gmail OAuth 與郵件密文只保存在本機安全邊界，不會提供給模型
 - 執行資料、對話、附件、資料庫、模型與本機設定不納入 Git
 
@@ -71,7 +76,11 @@ Hermes 是可選服務。預設關閉；未安裝、健康檢查失敗、能力�
 
 n8n 是獨立的本機 loopback 服務。Workbench 不會讓 Agent 直接取得 n8n API Key、Gmail OAuth Token 或管理介面權限；Agent 只建立 Project／Session 綁定的結構化提案，伺服器重新計算 Workflow 快照、Diff、風險與 digest，人工核准後才由 Broker 執行。Gmail V1 的固定收件者由本機 `WORKBENCH_N8N_GMAIL_RECIPIENT` 提供，不寫入公開原始碼；未設定時郵件整合會安全停用。
 
-預設採限制權限。高風險節點、任意 Workflow 執行與 Credential 管理在對應隔離／Project ownership 尚未就緒時 fail closed。系統管理的 Gmail Workflows 永遠受保護。安裝、設定、操作與故障處理請參閱 [n8n Agent 治理手冊](docs/N8N_AGENT_GOVERNANCE.md)。
+`0.8.0-n8n-graph-authoring-beta.1` 已完成 Node Catalog、Workflow Spec 編譯、materialize、語意 Patch、伺服器權威 Diff、受保護 Agent／Approval Bridge、Project-scoped Credential alias、Agent task runtime 與執行時核准。建立草稿、發布、啟用及每次外部寫入仍是不同的核准邊界。
+
+兩個 Bridge 範本只會以受保護 JSON 與驗證器隨版本提供；Workbench／Launcher 不會自動匯入或發布。正式使用前仍須由受控部署流程綁定 HMAC Credential、匯入並發布兩個只有 Execute Workflow Trigger 的受保護子流程，設定其 Workflow ID 並完成 canary。n8n `2.32.5` 以 `active` 表示已發布；這些子流程沒有排程或 Webhook，不會自行啟動。使用者建立的流程草稿仍保持未啟用，直到另行核准發布。
+
+預設採限制權限。Code、Execute Command、檔案系統、Community／Custom Node 及缺少隔離 Runner 的高風險節點均 fail closed；系統管理的 Gmail 與 Bridge Workflows 永遠受保護。安裝、部署、操作與故障處理請參閱 [n8n Agent 治理手冊](docs/N8N_AGENT_GOVERNANCE.md)。
 
 ## 驗證
 

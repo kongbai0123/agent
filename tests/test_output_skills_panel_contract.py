@@ -55,7 +55,7 @@ def test_floating_output_uses_its_own_vertical_tab_toggle():
     assert "if (toggle && state.activeTab === name && state.expanded)" in RUN_INSPECTOR_JS
     for key in ("ArrowDown", "ArrowUp", "Home", "End", "Enter"):
         assert key in RUN_INSPECTOR_JS
-    assert "app.js?v=0.7.0-n8n-agent-governance-beta.1" in INDEX_HTML
+    assert "app.js?v=0.8.0-n8n-graph-authoring-beta.1" in INDEX_HTML
     assert "run-inspector.js?v=1.0.0" in INDEX_HTML
 
 
@@ -205,3 +205,36 @@ def test_output_panel_has_compact_and_responsive_layout_contracts():
     assert "setOutputFloatingPanelOpen(false);" in _function_slice(
         APP_JS, "function openInspector", "function renderContextPane"
     )
+
+
+def test_open_output_panel_reserves_chat_without_widening_the_reading_column():
+    desktop = STYLE_CSS[
+        STYLE_CSS.index("/* Run Inspector: reserve the reading surface instead of covering chat."):
+        STYLE_CSS.index("/* A side-by-side inspector would leave an unusably narrow reading column")
+    ]
+    assert "@media (min-width: 901px)" in desktop
+    assert "main.chat-container:not([hidden])" in desktop
+    assert "min-width: 0" in desktop
+    assert "margin-right: 62px" in desktop
+    assert "margin-right: calc(clamp(320px, 24vw, 380px) + 62px)" in desktop
+
+    # The inspector may reduce available space, but must not enlarge the
+    # established answer or composer reading widths on wide screens.
+    assert "body.basic-chat-mode .message {\n    max-width: 820px" in STYLE_CSS
+    assert "body.basic-chat-mode .message.assistant .message-content-wrapper {\n    width: calc(100% - 46px);\n    max-width: 760px" in STYLE_CSS
+    assert ".chat-form {\n    max-width: 800px" in STYLE_CSS
+
+
+def test_compact_output_panel_docks_above_chat_instead_of_covering_it():
+    compact = STYLE_CSS[
+        STYLE_CSS.index("/* A side-by-side inspector would leave an unusably narrow reading column"):
+        STYLE_CSS.index("/* --- Project-organized task sidebar --- */")
+    ]
+    assert "@media (max-width: 900px)" in compact
+    assert "margin-right: 54px" in compact
+    assert "margin-top: calc(clamp(216px, 42vh, 360px) + 40px)" in compact
+    assert "height: clamp(216px, 42vh, 360px)" in compact
+    assert "max-height: none" in compact
+    assert "@media (max-width: 640px)" in compact
+    assert "margin-top: calc(clamp(216px, 40vh, 300px) + 32px)" in compact
+    assert "height: clamp(216px, 40vh, 300px)" in compact

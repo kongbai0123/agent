@@ -46,7 +46,10 @@ PUBLIC_API_PATHS = frozenset(
 # token because the n8n service authenticates every request with a separate,
 # route-level HMAC/one-time-token contract.  Keeping the prefix exact prevents
 # an integration credential from becoming a general Workbench API credential.
-SERVICE_AUTH_API_PREFIXES = ("/api/integrations/n8n/v1/gmail/",)
+SERVICE_AUTH_API_PREFIXES = (
+    "/api/integrations/n8n/v1/gmail/",
+    "/api/integrations/n8n/v1/agent/",
+)
 
 TOKEN_FILENAME = "workbench-session-token"
 SESSION_COOKIE_NAME = "workbench_session"

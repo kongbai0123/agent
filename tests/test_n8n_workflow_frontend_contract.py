@@ -85,8 +85,8 @@ def test_reply_and_compose_editing_respect_locked_fields():
     assert "...(subject ? { subject } : {})" in compose
     assert "...(model ? { model } : {})" in compose
     assert "body: JSON.stringify(composePayload)" in compose
-    assert "if (!instruction) return" in compose
-    assert "recipient" not in compose
+    assert "if (!content) return { status: 'blocked'" in compose
+    assert "recipient:" not in compose
     assert "project_id" not in compose
     assert "thread" not in compose
     assert "attachments" not in compose
@@ -146,6 +146,20 @@ def test_workflow_workspace_starts_n8n_on_demand_only_after_safe_status_probe():
     assert "request('/api/integrations/n8n/start', { method: 'POST' })" in ensure
     open_workspace = _slice(WORKFLOW_JS, "function open()", "function startBackgroundSync")
     assert "await ensureServiceForWorkspace()" in open_workspace
+    assert "const ready = (async () =>" in open_workspace
+    assert "return ready" in open_workspace
+
+
+def test_chat_email_handoff_creates_only_a_fixed_recipient_draft_before_approval():
+    compose = _slice(WORKFLOW_JS, "async function createComposeDraft", "async function serviceAction")
+    assert "mentionedRecipients" in compose
+    assert "value !== state.profile.recipient" in compose
+    assert "request('/api/integrations/n8n/mail/compose'" in compose
+    assert "recipient:" not in compose
+    assert "status: 'draft_created'" in compose
+    assert "send" not in compose.lower()
+    assert "approve" not in compose.lower()
+    assert "createComposeFromChat" in WORKFLOW_JS
 
 
 def test_background_events_only_refresh_badges_and_never_hijack_chat():

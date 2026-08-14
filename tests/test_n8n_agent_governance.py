@@ -80,6 +80,7 @@ def governed(tmp_path, monkeypatch):
         n8n_running=lambda: running["value"],
         high_risk_runner_ready=lambda: runner["value"],
         boot_id="boot-a",
+        _allow_legacy_raw_workflows_for_tests=True,
     )
     with database.get_db_conn() as conn:
         conn.executemany(
@@ -106,6 +107,42 @@ def proposal(**changes):
     }
     value.update(changes)
     return value
+
+
+def test_runtime_callbacks_receive_policy_and_workflow_changes(governed):
+    _, broker, running, runner = governed
+    policy_changes = []
+    workflow_changes = []
+    service = N8nAgentGovernanceService(
+        broker=broker,
+        cipher=AesGcmContentCipher(lambda: b"k" * 32),
+        n8n_running=lambda: running["value"],
+        high_risk_runner_ready=lambda: runner["value"],
+        boot_id="boot-callbacks",
+        policy_change_callback=lambda project_id, reason: policy_changes.append(
+            (project_id, reason)
+        ),
+        workflow_change_callback=lambda context: workflow_changes.append(dict(context)),
+        _allow_legacy_raw_workflows_for_tests=True,
+    )
+
+    service.set_policy(
+        "project_a",
+        {"mode": "restricted", "elevation_policy": "smart"},
+    )
+    assert policy_changes == [("project_a", "policy_changed")]
+
+    operation = service.create_operation(proposal())
+    assert operation["status"] == "completed"
+    assert workflow_changes == [
+        {
+            "project_id": "project_a",
+            "session_id": "session_a",
+            "run_id": None,
+            "workflow_id": "created",
+            "operation": "create_draft",
+        }
+    ]
 
 
 def test_broker_normalizes_empty_n8n_audit_as_verified_clean(monkeypatch):
@@ -137,6 +174,32 @@ def test_default_restricted_executes_only_safe_draft(governed):
     assert error.value.code == "N8N_HIGH_RISK_FORBIDDEN"
 
 
+@pytest.mark.parametrize(
+    "node_type",
+    [
+        "@n8n/n8n-nodes-langchain.agent",
+        "@n8n/n8n-nodes-langchain.agentTool",
+        "@n8n/n8n-nodes-langchain.toolExecutor",
+        "n8n-nodes-base.messageAnAgent",
+    ],
+)
+def test_restricted_rejects_native_agent_and_hidden_tool_nodes(governed, node_type):
+    service, broker, _, _ = governed
+    with pytest.raises(N8nGovernanceError) as error:
+        service.create_operation(
+            proposal(
+                payload={
+                    "workflow": {
+                        "name": "Hidden Tool",
+                        "nodes": [{"type": node_type}],
+                    }
+                }
+            )
+        )
+    assert error.value.code == "N8N_HIGH_RISK_FORBIDDEN"
+    assert broker.calls == []
+
+
 def test_planner_safe_draft_requires_approval_before_broker_execution(governed):
     service, broker, _, _ = governed
     operation = service.create_planned_operation(proposal(origin="browser-forgery-is-ignored"))
@@ -157,6 +220,8 @@ def test_planner_safe_draft_requires_approval_before_broker_execution(governed):
 def test_execute_atomically_claims_operation_at_most_once(governed):
     service, broker, _, _ = governed
     operation = service.create_planned_operation(proposal())
+    with database.get_db_conn() as conn:
+        conn.execute("UPDATE n8n_agent_operations SET status='approved' WHERE id=?", (operation["id"],))
     start = threading.Barrier(3)
     completed = []
     failures = []
@@ -284,9 +349,12 @@ def test_diff_is_server_canonical_and_ignores_model_diff(governed):
     ))
     assert operation["diff"]["source"] == "server"
     assert "forged" not in operation["diff"]
-    assert operation["diff"]["nodes"]["added"] == [{
-        "id": "http-1", "name": "Call API", "type": "n8n-nodes-base.httpRequest",
-    }]
+    added = operation["diff"]["nodes"]["added"]
+    assert [(item["id"], item["name"], item["type"]) for item in added] == [
+        ("http-1", "Call API", "n8n-nodes-base.httpRequest"),
+    ]
+    assert added[0]["parameter_keys"] == ["url"]
+    assert len(added[0]["parameter_digest"]) == 64
     assert operation["diff"]["external_targets"]["after"] == [
         "https://api.example.com", "service:httprequest",
     ]
@@ -343,9 +411,11 @@ def test_update_diff_uses_exact_before_and_sanitized_after(governed):
     assert operation["diff"]["before"]["nodes"] == [{
         "id": "old", "name": "Old", "type": "n8n-nodes-base.set",
     }]
-    assert operation["diff"]["after"]["nodes"] == [{
-        "id": "new", "name": "New", "type": "n8n-nodes-base.if",
-    }]
+    after = operation["diff"]["after"]["nodes"]
+    assert [(item["id"], item["name"], item["type"]) for item in after] == [
+        ("new", "New", "n8n-nodes-base.if"),
+    ]
+    assert after[0]["parameter_keys"] == []
     assert [item["id"] for item in operation["diff"]["nodes"]["removed"]] == ["old"]
     assert [item["id"] for item in operation["diff"]["nodes"]["added"]] == ["new"]
 
@@ -665,6 +735,10 @@ def test_protected_workflow_and_secret_in_normal_payload_are_rejected(governed):
     with pytest.raises(N8nGovernanceError) as protected:
         service.create_operation(proposal(payload={"workflow_name": "workbench-gmail-inbound-v1"}))
     assert protected.value.code == "N8N_WORKFLOW_PROTECTED"
+    for protected_name in ("Workbench Agent Bridge v1", "Workbench Approval Gate v1"):
+        with pytest.raises(N8nGovernanceError) as protected_bridge:
+            service.create_operation(proposal(payload={"workflow_name": protected_name}))
+        assert protected_bridge.value.code == "N8N_WORKFLOW_PROTECTED"
     with pytest.raises(N8nGovernanceError) as secret:
         service.create_operation(proposal(payload={"api_key": "do-not-store"}))
     assert secret.value.code == "N8N_SECRET_IN_PROPOSAL"

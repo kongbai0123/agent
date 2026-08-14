@@ -17,7 +17,7 @@
     <link rel="stylesheet" href="katex.min.css">
     <script src="katex.min.js"></script>
     <script src="auto-render.min.js"></script>
-    <link rel="stylesheet" href="style.css?v=0.7.0-n8n-agent-governance-beta.1">
+    <link rel="stylesheet" href="style.css?v=0.8.0-n8n-graph-authoring-beta.1">
 </head>
 <body class="basic-chat-mode">
     <div class="app-container workbench-shell">
@@ -331,11 +331,16 @@
                     <section class="workflow-card n8n-plan-mode" aria-labelledby="n8n-plan-title">
                         <div class="workflow-card-head">
                             <div>
-                                <span class="workflow-eyebrow">PLAN MODE</span>
+                                <span class="workflow-eyebrow">TWO-STAGE PLAN</span>
                                 <h2 id="n8n-plan-title">Agent n8n 操作助理</h2>
-                                <p>規劃與問題是執行前的安全層；Agent 會先說明方案、結果、風險與權限，再建立可執行的待核准提案。</p>
+                                <p>先選擇 2–3 個輕量架構之一，再產生唯一節點圖。Graph Compiler 驗證及人工核准前不會操作 n8n。</p>
                             </div>
                             <span class="workflow-status-pill" id="n8n-plan-state" role="status" aria-live="polite">尚未開始</span>
+                        </div>
+                        <div id="n8n-plan-provenance" class="n8n-plan-provenance" aria-label="規劃模型來源" hidden>
+                            <span id="n8n-plan-primary-model"></span>
+                            <span id="n8n-plan-structured-mode"></span>
+                            <span id="n8n-plan-repair-model" hidden></span>
                         </div>
                         <div class="n8n-plan-layout">
                             <div class="n8n-plan-conversation">
@@ -382,6 +387,39 @@
                                 </section>
                             </aside>
                         </div>
+                        <section id="n8n-plan-graph-stage" class="n8n-plan-graph-stage" aria-labelledby="n8n-plan-graph-title" hidden>
+                            <div class="n8n-plan-graph-head">
+                                <div>
+                                    <span class="workflow-eyebrow">STAGE 2 · NODE GRAPH</span>
+                                    <h3 id="n8n-plan-graph-title">產生並驗證唯一節點圖</h3>
+                                    <p id="n8n-plan-graph-message">選定架構後，由伺服器配對節點、參數與連線；這一步不會建立或執行 n8n Workflow。</p>
+                                </div>
+                                <button type="button" class="btn btn-secondary" id="n8n-plan-materialize">產生並驗證唯一節點圖</button>
+                            </div>
+                            <div id="n8n-plan-graph-preview" class="n8n-plan-graph-preview" hidden>
+                                <dl class="n8n-plan-graph-metrics">
+                                    <div><dt>驗證狀態</dt><dd id="n8n-plan-validation-status">—</dd></div>
+                                    <div><dt>節點</dt><dd id="n8n-plan-node-count">0</dd></div>
+                                    <div><dt>連線</dt><dd id="n8n-plan-edge-count">0</dd></div>
+                                </dl>
+                                <div class="n8n-plan-graph-columns">
+                                    <section><h4>節點配對</h4><ol id="n8n-plan-graph-nodes" class="n8n-graph-list"></ol></section>
+                                    <section><h4>連線與分支</h4><ol id="n8n-plan-graph-edges" class="n8n-graph-list"></ol></section>
+                                </div>
+                                <section id="n8n-plan-graph-questions-wrap" class="n8n-plan-graph-alert is-question" hidden>
+                                    <h4>需要你補充</h4>
+                                    <ul id="n8n-plan-graph-questions"></ul>
+                                </section>
+                                <section id="n8n-plan-graph-issues-wrap" class="n8n-plan-graph-alert" hidden>
+                                    <h4>驗證發現</h4>
+                                    <ul id="n8n-plan-graph-issues"></ul>
+                                </section>
+                                <div class="n8n-plan-digests">
+                                    <span>Catalog <code id="n8n-plan-catalog-digest">—</code></span>
+                                    <span>Graph <code id="n8n-plan-graph-digest">—</code></span>
+                                </div>
+                            </div>
+                        </section>
                         <div id="n8n-plan-proposal-confirm" class="n8n-plan-proposal-confirm" hidden>
                             <div>
                                 <strong>建立操作提案前確認</strong>
@@ -419,10 +457,74 @@
                             <div class="workflow-actions workflow-actions-end"><span class="workflow-save-state" id="n8n-agent-policy-message" aria-live="polite"></span><button type="submit" class="btn btn-primary" id="n8n-agent-policy-save">儲存 Agent 權限</button></div>
                         </form>
                         <details class="n8n-agent-api-key-panel"><summary>設定 Workbench 專用 n8n API Key</summary><form id="n8n-agent-api-key-form" class="workflow-form"><label><span>API Key</span><input type="password" id="n8n-agent-api-key" autocomplete="new-password" required minlength="16"><small>只會以 DPAPI 保存；不會出現在 Prompt、Log 或稽核。</small></label><div class="workflow-actions workflow-actions-end"><button class="btn btn-secondary" type="submit">安全儲存</button></div></form></details>
+                        <details class="n8n-node-catalog-panel">
+                            <summary>搜尋已驗證的內建節點</summary>
+                            <form id="n8n-node-catalog-form" class="n8n-inline-form">
+                                <label for="n8n-node-catalog-query"><span>節點名稱或用途</span><input id="n8n-node-catalog-query" maxlength="255" placeholder="例如 Gmail、Switch、Merge"></label>
+                                <button type="submit" class="btn btn-secondary">搜尋目錄</button>
+                            </form>
+                            <p id="n8n-node-catalog-meta" class="run-inspector-meta" aria-live="polite">只搜尋固定版本的官方內建節點；不包含 Community／Custom Node。</p>
+                            <div id="n8n-node-catalog-results" class="n8n-node-catalog-results" aria-live="polite"></div>
+                        </details>
                     </section>
 
+                    <div class="workflow-grid n8n-agent-runtime-grid">
+                        <section class="workflow-card" aria-labelledby="n8n-credential-aliases-title">
+                            <div class="workflow-card-head">
+                                <div>
+                                    <h2 id="n8n-credential-aliases-title">Credential 別名</h2>
+                                    <p>Agent 只會看到 Project 專用別名、類型與連線狀態，不會看到 Credential ID 或 Secret。</p>
+                                </div>
+                                <span id="n8n-credential-aliases-count" class="workflow-run-count">0 筆</span>
+                            </div>
+                            <form id="n8n-credential-alias-form" class="workflow-form n8n-credential-alias-form">
+                                <label>
+                                    <span>別名</span>
+                                    <input id="n8n-credential-alias-name" required maxlength="63" pattern="[a-z][a-z0-9._-]{0,62}" placeholder="例如 gmail-send">
+                                    <small>使用小寫英數、句點、底線或連字號；同一 Project 內唯一。</small>
+                                </label>
+                                <label>
+                                    <span>n8n Credential ID（安全輸入）</span>
+                                    <input type="password" id="n8n-credential-alias-id" required maxlength="255" autocomplete="new-password">
+                                    <small>只在送出時交給安全代理；畫面、回應、Inspector 與稽核都不會顯示。</small>
+                                </label>
+                                <div class="workflow-actions workflow-actions-end"><button type="submit" class="btn btn-secondary">採用／更新別名</button></div>
+                            </form>
+                            <div id="n8n-credential-aliases-list" class="mail-run-list" aria-live="polite"><div class="workflow-empty">尚無 Credential 別名。</div></div>
+                        </section>
+
+                        <section class="workflow-card" aria-labelledby="n8n-runtime-approvals-title">
+                            <div class="workflow-card-head">
+                                <div>
+                                    <h2 id="n8n-runtime-approvals-title">執行時核准</h2>
+                                    <p>寄信、刪除及外部寫入預設逐次暫停；點選項目後在右上檢查器決定。</p>
+                                </div>
+                                <span id="n8n-runtime-approvals-count" class="workflow-run-count">0 待處理</span>
+                            </div>
+                            <div id="n8n-runtime-approvals-list" class="mail-run-list" aria-live="polite"><div class="workflow-empty">尚無執行時核准。</div></div>
+                        </section>
+                    </div>
+
                     <div class="workflow-grid n8n-agent-lists">
-                        <section class="workflow-card" aria-labelledby="n8n-managed-workflows-title"><div class="workflow-card-head"><div><h2 id="n8n-managed-workflows-title">受治理的 Workflows</h2><p>系統 Gmail 流程受到保護，Agent 不可修改。</p></div><span id="n8n-managed-workflows-count" class="workflow-run-count">0 筆</span></div><div id="n8n-managed-workflows-list" class="mail-run-list" aria-live="polite"><div class="workflow-empty">尚未載入。</div></div></section>
+                        <section class="workflow-card" aria-labelledby="n8n-managed-workflows-title">
+                            <div class="workflow-card-head"><div><h2 id="n8n-managed-workflows-title">受治理的 Workflows</h2><p>系統 Gmail 流程受到保護，Agent 不可修改。</p></div><span id="n8n-managed-workflows-count" class="workflow-run-count">0 筆</span></div>
+                            <div id="n8n-managed-workflows-list" class="mail-run-list" aria-live="polite"><div class="workflow-empty">尚未載入。</div></div>
+                            <details class="n8n-workflow-adopt-panel">
+                                <summary>採用既有 n8n Workflow</summary>
+                                <form id="n8n-workflow-adopt-preview-form" class="n8n-inline-form">
+                                    <label for="n8n-workflow-adopt-id"><span>Workflow ID</span><input id="n8n-workflow-adopt-id" maxlength="128" required placeholder="先從 n8n 畫面複製 ID"></label>
+                                    <button type="submit" class="btn btn-secondary">安全預覽</button>
+                                </form>
+                                <section id="n8n-workflow-adopt-preview" class="n8n-workflow-adopt-preview" hidden>
+                                    <p id="n8n-workflow-adopt-summary"></p>
+                                    <ul id="n8n-workflow-adopt-issues"></ul>
+                                    <form id="n8n-workflow-adopt-confirm-form" class="workflow-form">
+                                        <label for="n8n-workflow-adopt-confirmation"><span>輸入完整 Workflow 名稱確認</span><input id="n8n-workflow-adopt-confirmation" maxlength="255" required autocomplete="off"></label>
+                                        <button type="submit" class="btn btn-primary" id="n8n-workflow-adopt-confirm" disabled>確認採用</button>
+                                    </form>
+                                </section>
+                            </details>
+                        </section>
                         <section class="workflow-card" aria-labelledby="n8n-operation-requests-title"><div class="workflow-card-head"><div><h2 id="n8n-operation-requests-title">操作與待核准</h2><p>點選操作可在右上檢查器查看 Diff、風險並核准。</p></div><span id="n8n-operation-requests-count" class="workflow-run-count">0 筆</span></div><div id="n8n-operation-requests-list" class="mail-run-list" aria-live="polite"><div class="workflow-empty">尚無操作。</div></div></section>
                     </div>
 
@@ -1765,9 +1867,9 @@
     <script src="basic-chat-mode.js?v=1.0.2-sidebar-contract"></script>
     <script src="project-skills-sidebar.js?v=1.2.1-add-menu-a11y"></script>
     <script src="run-inspector.js?v=1.0.0"></script>
-    <script src="n8n-workflows.js?v=0.7.0-n8n-agent-governance-beta.1"></script>
-    <script src="n8n-agent-governance.js?v=0.7.0-n8n-agent-governance-beta.1"></script>
+    <script src="n8n-workflows.js?v=0.8.0-n8n-graph-authoring-beta.1"></script>
+    <script src="n8n-agent-governance.js?v=0.8.0-n8n-graph-authoring-beta.1"></script>
     <script src="hermes-settings.js?v=1.1.2-hover-help-dom"></script>
-    <script src="app.js?v=0.7.0-n8n-agent-governance-beta.1"></script>
+    <script src="app.js?v=0.8.0-n8n-graph-authoring-beta.1"></script>
 </body>
 </html>

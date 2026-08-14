@@ -1,5 +1,51 @@
 # Local AI Workbench 改版紀錄
 
+## 2026-08-14 — `0.8.0-n8n-graph-authoring-beta.1`
+
+### 已完成
+
+- 新增固定版本 Node Catalog，綁定 n8n `2.32.5`、`n8n-nodes-base 2.32.3`、package lock 與 Catalog digest；可搜尋全部已安裝的官方內建節點，排除 Community／Custom Node。
+- Agent 改為產生語意化 `workflow_spec.v1`，不再直接猜整份 n8n JSON。伺服器端編譯器負責節點 ID、唯一名稱、`typeVersion`、位置及 `connections`，並驗證必要參數、Credential 類型、輸入／輸出埠、IF／Switch／Merge 分支、孤立節點、循環與資料欄位對應。
+- Planner 正式拆成兩階段：Stage 1 僅提供 2–3 個不含 Workflow Spec 的輕量架構；Stage 2 才為選定方案生成唯一語意 Spec 並交給 Graph Compiler。每階段最多首次加兩次修復，資料不足會回到 `needs_input`。
+- 新 Plan 使用 `workbench.n8n.two-stage.v1`、鎖定 provider／protocol／model，並以 revision＋digest CAS 與 `materializing` lease 防止併發重複生成；舊 Plan 不自動轉換，必須重新規劃。
+- 更新既有 Workflow 改用 `add／update／remove／connect／disconnect` 語意 Patch；手動 Workflow 必須先以完整名稱確認採用。Diff 由伺服器依權威快照產生，顯示節點、參數、連線、分支、Credential alias 與外部目標。
+- Proposal 與核准 digest 同時綁定 Catalog、原 Workflow 及編譯後節點圖。核准後只建立未啟用草稿；重新 GET 的 graph digest 不一致、n8n 有手動修改或核准內容改變時均 fail closed。
+- 新增受保護 `Workbench Agent Bridge v1` 與 `Workbench Approval Gate v1` 範本。兩者只使用 n8n 內建節點與簽章 loopback API；Agent task 使用無工具模型、Project Skills 快照、有界結構化輸出及加密持久化。
+- 新增 Project-scoped Credential alias。Credential ID 只由本機安全表單提交並加密保存，不會出現在回應；Agent 與一般讀取 API 只看到別名、類型與連線狀態，OAuth Token、API Key 與 Secret 不進模型、Log、SSE、Audit 或 Inspector。
+- 新增執行時核准：每次 Email、刪除、HTTP／資料庫外部寫入均綁定精確 Workflow revision、節點、操作、Credential alias、目標 digest 與 request digest。預設為單次核准；最長 60 分鐘的限時許可只在非 Session 的 `full_audit` 且 runtime ready 時成立。
+- 權限降級、Workflow revision 改變、Credential alias 更新／撤銷、n8n 停止或 Workbench 重啟會撤銷未使用核准與限時許可。發布／啟用仍需 Security Audit；隔離 Runner 未就緒時高風險節點不可發布或執行。
+- 「流程」工作區新增 Catalog 搜尋、節點圖預覽、問題／風險、materialize、Credential alias、執行時核准及既有 Workflow 採用介面；成功建立草稿後可開啟對應 n8n 畫布檢視。
+
+### 部署狀態與安全邊界
+
+- 兩個 Bridge 範本及其嚴格驗證、HMAC 綁定與 readiness 檢查已完成，但不會由 Workbench／Launcher 自動匯入或發布。
+- 正式 canary 前仍須以受控流程綁定 n8n HMAC Credential、匯入並發布兩個僅含 Execute Workflow Trigger 的子流程，設定 `WORKBENCH_N8N_AGENT_BRIDGE_WORKFLOW_ID` 與 `WORKBENCH_N8N_APPROVAL_GATE_WORKFLOW_ID`，再重新啟動 Workbench 驗證 readiness。n8n `2.32.5` 以 `active` 表示已發布；這兩個受保護子流程沒有排程或 Webhook，不會自行啟動。
+- 此 beta 的 Bridge 範本目前固定呼叫 `127.0.0.1:8000`；部署時必須確認 Workbench 使用該受管理埠。若 Launcher 改用其他埠，Bridge 應保持未啟用，不能以手動修改受保護範本繞過驗證。
+- 本次只建立與驗證程式、範本及未啟用草稿路徑；沒有啟用 n8n Workflow，也沒有寄出任何郵件。
+
+### 驗證
+
+- Node Catalog／編譯器、Planner materialize／Patch、Broker Diff／digest、Agent task runtime、Credential alias、執行時核准、Bridge 範本及前端契約均有離線測試覆蓋。
+- 實際通過數以本版最終驗證報告為準；驗證不會啟用 Workflow 或執行外部寫入。
+
+---
+
+## 2026-08-13 — `0.7.0-n8n-agent-governance-beta.2`
+
+### 主要更新
+
+- 右上浮動檢查器不再覆蓋聊天內容：桌面保留 16px 安全間距，訊息與輸入框維持既有最大寬度，只在可用空間不足時縮窄；窄螢幕改由聊天在檢查器下方開始。
+- 一般聊天中的明確 n8n 操作要求會轉入既有受治理 Planner；寄信要求則使用固定收件者的 Gmail Draft Runtime，只建立待核准草稿。兩者都不再交給沒有 n8n 工具的一般模型回覆。
+- 交接仍維持 Project／Session scope、不可變 digest、明確提案確認與人工核准；Agent 不取得 n8n API Key，也不能直接呼叫 Broker 或提升權限。
+- n8n 按需啟動完成後才取得 Planner readiness，避免啟動競態誤報；尚未設定 API Key、未選 Project／Session或服務未就緒時均清楚 fail closed。
+
+### 驗證
+
+- `python -m pytest tests -q`：865 passed、3 skipped。
+- 前端 JavaScript、PowerShell、Inspector／n8n Planner 契約及 Git diff 檢查通過。
+
+---
+
 ## 2026-08-13 — `0.7.0-n8n-agent-governance-beta.1`
 
 ### 主要更新

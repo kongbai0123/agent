@@ -1,9 +1,12 @@
+import json
 from pathlib import Path
+import subprocess
 
 
 ROOT = Path(__file__).resolve().parents[1]
 HTML = (ROOT / "frontend" / "index.html").read_text(encoding="utf-8")
 JS = (ROOT / "frontend" / "n8n-agent-governance.js").read_text(encoding="utf-8")
+APP_JS = (ROOT / "frontend" / "app.js").read_text(encoding="utf-8")
 CSS = (ROOT / "frontend" / "style.css").read_text(encoding="utf-8")
 
 
@@ -14,13 +17,124 @@ def test_workflow_center_has_policy_workflows_operations_and_audits():
         'id="n8n-agent-audits-list"', 'id="n8n-agent-api-key-form"',
     ):
         assert marker in HTML
-    assert "n8n-agent-governance.js?v=0.7.0-n8n-agent-governance-beta.1" in HTML
+    assert "n8n-agent-governance.js?v=0.8.0-n8n-graph-authoring-beta.1" in HTML
+
+
+def test_project_scoped_credential_alias_ui_never_renders_credential_id():
+    for marker in (
+        'id="n8n-credential-alias-form"', 'id="n8n-credential-alias-name"',
+        'type="password" id="n8n-credential-alias-id"',
+        'id="n8n-credential-aliases-list"', 'id="n8n-credential-aliases-count"',
+    ):
+        assert marker in HTML
+    assert "/api/integrations/n8n/credential-aliases" in JS
+    assert "/refresh?project_id=${query(scopedProject)}" in JS
+    assert "credential_id: credentialId" in JS
+    assert "state.dom.credentialAliasId.value = '';" in JS
+    rendered = JS[JS.index("function credentialAliasRow"):JS.index("function runtimeApprovalRow")]
+    assert "credential_id" not in rendered.lower()
+    assert "metadata_digest" not in rendered.lower()
+    assert "credential.credential_type" in rendered
+    assert "credential.display_name" in rendered
+
+
+def test_runtime_approvals_are_exact_digest_locked_and_inspector_driven():
+    for marker in (
+        'id="n8n-runtime-approvals-title"', 'id="n8n-runtime-approvals-list"',
+        'id="n8n-runtime-approvals-count"',
+    ):
+        assert marker in HTML
+    inspector = JS[JS.index("function showRuntimeApproval"):JS.index("async function decideRuntimeApproval")]
+    for exact_field in (
+        "approval.workflow_id", "approval.workflow_revision", "approval.node_id",
+        "approval.credential_alias", "approval.target", "approval.action",
+        "approval.request_digest",
+    ):
+        assert exact_field in inspector
+    assert "duration.value = '0'" in inspector
+    assert "duration.min = '0'" in inspector
+    assert "duration.max = '60'" in inspector
+    assert "state.policy?.mode === 'full_audit'" in inspector
+    assert "限制權限模式固定為 0" in inspector
+    decision = JS[JS.index("async function decideRuntimeApproval"):JS.index("async function decide(")]
+    assert "/api/integrations/n8n/runtime-approvals/" in decision
+    assert "expected_digest: approval.request_digest" in decision
+    assert "duration_minutes:" in decision
+    assert "projectId() !== scopedProject" in decision
+
+
+def test_project_switch_clears_scoped_runtime_state_and_rejects_stale_responses():
+    reset = JS[JS.index("function resetProjectScopedRuntime"):JS.index("async function adoptCredentialAlias")]
+    assert "state.requestId += 1" in reset
+    assert "state.credentialAliases = []" in reset
+    assert "state.runtimeApprovals = []" in reset
+    assert "state.dom.credentialAliasId.value = ''" in reset
+    assert "state.inspectorScope = ''" in reset
+    assert "resetProjectScopedRuntime(); resetPlanner()" in JS
+    assert "requestId !== state.requestId || projectId() !== id" in JS
+    assert "credential-aliases?project_id=${query(id)}" in JS
+    assert "runtime-approvals?project_id=${query(id)}&limit=100" in JS
+
+
+def test_runtime_decision_behavior_uses_full_audit_minutes_and_drops_stale_ui_updates():
+    start = JS.index("async function decideRuntimeApproval")
+    end = JS.index("\n    async function decide(", start)
+    function_source = JS[start:end]
+    script = f"""
+const results = [];
+let activeProject = 'project-a';
+let staleDuringRequest = false;
+let refreshes = 0;
+let inspectorUpdates = 0;
+let toasts = 0;
+const state = {{
+  inspectorScope: 'runtime:project-a',
+  policy: {{mode: 'full_audit'}},
+  deps: {{showToast: () => {{ toasts += 1; }}}}
+}};
+const projectId = () => activeProject;
+const query = value => encodeURIComponent(String(value || ''));
+const api = async (path, options) => {{
+  const body = JSON.parse(options.body);
+  results.push({{path, body}});
+  if (staleDuringRequest) activeProject = 'project-b';
+  return {{approval_id: 'approval-1', project_id: 'project-a', status: 'approved'}};
+}};
+const refreshAll = async () => {{ refreshes += 1; }};
+const showRuntimeApproval = () => {{ inspectorUpdates += 1; }};
+{function_source}
+(async () => {{
+  const approval = {{approval_id: 'approval-1', project_id: 'project-a', request_digest: 'a'.repeat(64)}};
+  await decideRuntimeApproval(approval, true, 15);
+  staleDuringRequest = true;
+  activeProject = 'project-a';
+  state.inspectorScope = 'runtime:project-a';
+  await decideRuntimeApproval(approval, false, 0);
+  process.stdout.write(JSON.stringify({{results, refreshes, inspectorUpdates, toasts}}));
+}})();
+"""
+    completed = subprocess.run(
+        ["node", "-"], input=script, text=True, encoding="utf-8",
+        capture_output=True, check=True,
+    )
+    result = json.loads(completed.stdout)
+    assert result["results"][0]["path"].endswith("/approval-1/approve")
+    assert result["results"][0]["body"] == {
+        "project_id": "project-a", "expected_digest": "a" * 64, "duration_minutes": 15,
+    }
+    assert result["results"][1]["path"].endswith("/approval-1/reject")
+    assert result["results"][1]["body"]["duration_minutes"] == 0
+    assert result["refreshes"] == 1
+    assert result["inspectorUpdates"] == 1
+    assert result["toasts"] == 1
 
 
 def test_workflow_center_has_project_scoped_agent_plan_mode():
     for marker in (
         'id="n8n-plan-form"', 'id="n8n-plan-messages"', 'id="n8n-plan-options"',
         'id="n8n-plan-session"',
+        'id="n8n-plan-provenance"', 'id="n8n-plan-primary-model"',
+        'id="n8n-plan-structured-mode"', 'id="n8n-plan-repair-model"',
         'id="n8n-plan-risks"', 'id="n8n-plan-outcomes"', 'id="n8n-plan-permissions"',
         'id="n8n-plan-proposal-ack"', 'id="n8n-plan-propose"',
     ):
@@ -31,17 +145,91 @@ def test_workflow_center_has_project_scoped_agent_plan_mode():
     assert "session.project_id === project" in JS
     assert "expected_digest: plan.digest, explicit_confirmation: true" in JS
     assert "Agent n8n 操作助理" in HTML
-    assert "規劃與問題是執行前的安全層" in HTML
+    assert "先選擇 2–3 個輕量架構之一" in HTML
     assert "核准後 Broker 才會依提案內容實際操作 n8n" in HTML
 
 
 def test_plan_mode_requires_explicit_confirmation_and_only_two_or_three_choices():
-    assert "choices.slice(0, 3)" in JS
-    assert "choices.length < 2" in JS
+    assert "rawChoices.length < 2 || rawChoices.length > 3" in JS
+    assert "return choices.length === rawChoices.length ? choices : []" in JS
+    assert "id: 'clarify'" not in JS
+    assert "option-${index + 1}" not in JS
     assert "!state.dom.planProposalAck.checked" in JS
     assert "核准後 Broker 才會執行" in JS
     assert "textContent" in JS
     assert ".innerHTML" not in JS
+
+
+def test_plan_generation_provenance_is_safe_and_read_only():
+    assert "generation_provenance" in JS
+    assert "primaryModel" in JS
+    assert "structuredMode" in JS
+    assert "formatRepaired" in JS
+    assert "repairModel" in JS
+    assert "json_schema" in JS and "guided_json" in JS and "json_object" in JS
+    assert "state.dom.planProvenance.hidden = !provenance?.primaryModel" in JS
+    assert "state.dom.planRepairModel.hidden = !provenance.formatRepaired" in JS
+    assert "textContent" in JS
+    assert ".innerHTML" not in JS
+
+
+def test_selected_architecture_requires_explicit_server_materialization_before_proposal():
+    for marker in (
+        'id="n8n-plan-graph-stage"', 'id="n8n-plan-materialize"',
+        'id="n8n-plan-graph-preview"', 'id="n8n-plan-graph-nodes"',
+        'id="n8n-plan-graph-edges"', 'id="n8n-plan-graph-questions"',
+        'id="n8n-plan-catalog-digest"', 'id="n8n-plan-graph-digest"',
+    ):
+        assert marker in HTML
+    assert "/materialize`" in JS
+    assert "expected_digest: plan.digest" in JS
+    assert "status === 'graph_ready'" in JS
+    assert "validationStatus === 'ready'" in JS
+    assert "readyToPropose: blockers.length === 0 && status === 'graph_ready'" in JS
+    assert "這一步不會建立或執行 n8n Workflow" in HTML
+    assert "產生並驗證唯一節點圖" in JS
+    assert "n8n-plan-option-description" in JS
+    assert "n8n-plan-option-badge" in JS
+    assert "n8n-plan-option-risk" in JS
+    assert "n8n-plan-option-permission" in JS
+    assert "workbench.n8n.two-stage.v1" in JS
+
+
+def test_graph_preview_and_inspector_show_only_safe_structured_facts():
+    assert "graphNodeText" in JS
+    assert "graphEdgeText" in JS
+    assert "graphBranchLabel" in JS
+    assert "renderAuthoritativeDiff" in JS
+    assert "變更節點／參數" in JS
+    assert "Credential 別名（變更後）" in JS
+    assert "JSON.stringify(operation.result" not in JS
+    assert "JSON.stringify(operation.diff" not in JS
+    assert "parameter_digest" in JS
+    assert "shortDigest" in JS
+
+
+def test_completed_draft_only_opens_verified_loopback_editor_from_user_gesture():
+    assert "function safeLoopbackEditorUrl" in JS
+    assert "parsed.protocol !== 'http:'" in JS
+    assert "parsed.port !== '5678'" in JS
+    assert "parsed.username || parsed.password || parsed.search || parsed.hash" in JS
+    assert "open.addEventListener('click'" in JS
+    assert "window.open(editorUrl, '_blank', 'noopener,noreferrer')" in JS
+
+
+def test_catalog_search_and_exact_workflow_adoption_are_explicit():
+    for marker in (
+        'id="n8n-node-catalog-form"', 'id="n8n-node-catalog-results"',
+        'id="n8n-workflow-adopt-preview-form"', 'id="n8n-workflow-adopt-confirm-form"',
+        'id="n8n-workflow-adopt-confirmation"',
+    ):
+        assert marker in HTML
+    assert "/api/integrations/n8n/node-catalog" in JS
+    assert "/adoption-preview?project_id=" in JS
+    assert "/adopt`" in JS
+    assert "exact !== String(preview.workflow_name || '')" in JS
+    assert "expected_digest: preview.expected_digest" in JS
+    assert "不包含 Community／Custom Node" in HTML
 
 
 def test_plan_followups_are_digest_locked_and_missing_digest_restarts_safely():
@@ -63,6 +251,7 @@ def test_frontend_is_fail_closed_and_uses_safe_dom():
     assert "textContent" in JS
     assert ".innerHTML" not in JS
     assert "expected_digest" in JS
+    assert "session_id: operation.session_id || null" in JS
     assert "explicit_ack" in JS
     assert "pending_second_approval" in JS
     assert "window.prompt" in JS
@@ -85,3 +274,110 @@ def test_styles_keep_twelve_pixel_minimum_and_responsive_layout():
     assert ".n8n-plan-layout" in CSS
     assert ".n8n-plan-options" in CSS
     assert ".n8n-plan-message" in CSS
+    assert ".n8n-plan-provenance" in CSS
+    assert ".n8n-plan-graph-stage" in CSS
+    assert ".n8n-plan-graph-columns { grid-template-columns: 1fr; }" in CSS
+    assert ".n8n-node-catalog-results { grid-template-columns: 1fr; }" in CSS
+
+
+def test_explicit_chat_operation_routes_to_governed_planner_before_general_chat():
+    detector_start = APP_JS.index("function isExplicitN8nOperationIntent")
+    router_start = APP_JS.index("async function routeExplicitN8nOperationToPlanner")
+    submit_start = APP_JS.index("async function handleChatSubmit")
+    chat_fetch = APP_JS.index("apiFetch(`${API_BASE}/api/chat`", submit_start)
+    route_call = APP_JS.index("await routeExplicitN8nOperationToPlanner(sendQuestion)", submit_start)
+
+    assert detector_start < router_start < submit_start < route_call < chat_fetch
+    assert "await window.workbenchN8nWorkflows?.open?.();" in APP_JS[router_start:submit_start]
+    assert "isExplicitN8nMailOperation(question)" in APP_JS[router_start:submit_start]
+    assert "!isExplicitN8nWorkflowAuthoringIntent(question)" in APP_JS[router_start:submit_start]
+    assert "createComposeFromChat" in APP_JS[router_start:submit_start]
+    assert "尚未寄送" in APP_JS[router_start:submit_start]
+    assert "planner.startPlanFromChat" in APP_JS[router_start:submit_start]
+    assert "projectId: activeProjectId || ''" in APP_JS[router_start:submit_start]
+    assert "sessionId: currentSessionId || ''" in APP_JS[router_start:submit_start]
+    assert "未送到一般聊天，也未操作 n8n" in APP_JS[router_start:submit_start]
+
+
+def test_chat_handoff_preserves_scope_and_cannot_skip_planner_approval():
+    handoff = JS[JS.index("async function startPlanFromChat"):JS.index("async function proposePlan")]
+    assert "projectAvailable" in handoff
+    assert "sessionAvailable" in handoff
+    assert "requestedSessionRecord?.project_id" in handoff
+    assert "options.hasAttachments === true" in handoff
+    assert "await sendPlanMessage(content)" in handoff
+    assert "尚未送出規劃，也未操作 n8n" in handoff
+    assert "api_key" not in handoff.lower()
+    assert "proposePlan(" not in handoff
+    assert "approve" not in handoff.lower()
+    assert "broker" not in handoff.lower()
+
+
+def test_chat_n8n_intent_detector_is_conservative_and_operation_only():
+    detector = APP_JS[
+        APP_JS.index("function isExplicitN8nOperationIntent"):
+        APP_JS.index("async function routeExplicitN8nOperationToPlanner")
+    ]
+    cases = [
+        ("幫我控制 agent 進行 n8n，發送測試成功", True),
+        ("請幫我用 n8n 建立 Gmail workflow", True),
+        ("n8n 刪除 workflow abc", True),
+        ("Please use n8n to create a workflow.", True),
+        ("我想要用 n8n 寄送一封信", True),
+        ("請問我的 Agent 是否可以操作 n8n？", False),
+        ("請幫我了解為何 n8n 無法操作", False),
+        ("如何在 n8n 建立 workflow？", False),
+        ("n8n 是什麼？", False),
+        ("請解釋這段 log：```n8n delete workflow```", False),
+        ("請幫我建立一封 email", False),
+    ]
+    script = (
+        detector
+        + "\nconst cases = "
+        + json.dumps([text for text, _expected in cases], ensure_ascii=False)
+        + "; process.stdout.write(JSON.stringify(cases.map(isExplicitN8nOperationIntent)));"
+    )
+    completed = subprocess.run(
+        ["node", "-"],
+        input=script,
+        text=True,
+        encoding="utf-8",
+        capture_output=True,
+        check=True,
+    )
+    assert json.loads(completed.stdout) == [expected for _text, expected in cases]
+
+
+def test_mail_workflow_authoring_uses_graph_planner_not_one_off_compose():
+    detector = APP_JS[
+        APP_JS.index("function isExplicitN8nWorkflowAuthoringIntent"):
+        APP_JS.index("async function routeExplicitN8nOperationToPlanner")
+    ]
+    script = (
+        detector
+        + "\nconst cases = "
+        + json.dumps(
+            [
+                "Use n8n to build a Gmail workflow with Agent and approval nodes.",
+                "請用 n8n 建立寄信流程並配對節點",
+                "Use n8n to send one email now.",
+            ],
+            ensure_ascii=False,
+        )
+        + "; process.stdout.write(JSON.stringify(cases.map(isExplicitN8nWorkflowAuthoringIntent)));"
+    )
+    completed = subprocess.run(
+        ["node", "-"], input=script, text=True, encoding="utf-8",
+        capture_output=True, check=True,
+    )
+    assert json.loads(completed.stdout) == [True, True, False]
+
+
+def test_chat_handoff_does_not_consume_retry_skill_image_or_temporary_context_turns():
+    submit = APP_JS[APP_JS.index("async function handleChatSubmit"):]
+    route_call = submit.index("await routeExplicitN8nOperationToPlanner(sendQuestion)")
+    guard = submit[max(0, route_call - 240):route_call]
+    assert "!retryOfRunId" in guard
+    assert "explicitSkillIds.length === 0" in guard
+    assert "currentImages.length === 0" in guard
+    assert "!temporaryContextText" in guard

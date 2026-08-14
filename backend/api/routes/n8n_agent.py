@@ -35,6 +35,9 @@ class OperationRequest(_Strict):
 
 class OperationDecision(_Strict):
     project_id: str = Field(min_length=1, max_length=128)
+    # Required even when null so the approval is explicitly bound to the
+    # operation's Project-only or Project+Session scope.
+    session_id: Optional[str] = Field(max_length=128)
     expected_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
     confirmation: Optional[str] = Field(default=None, max_length=255)
 
@@ -65,6 +68,20 @@ class PlanProposal(_Strict):
     session_id: str = Field(min_length=1, max_length=128)
     expected_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
     explicit_confirmation: bool
+
+
+class PlanMaterialize(_Strict):
+    project_id: str = Field(min_length=1, max_length=128)
+    session_id: str = Field(min_length=1, max_length=128)
+    expected_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+    model: Optional[str] = Field(default=None, max_length=255)
+
+
+class WorkflowAdoption(_Strict):
+    project_id: str = Field(min_length=1, max_length=128)
+    session_id: Optional[str] = Field(default=None, max_length=128)
+    expected_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+    confirmation: str = Field(min_length=1, max_length=255)
 
 
 def build_n8n_agent_router(
@@ -119,6 +136,38 @@ def build_n8n_agent_router(
         try: return service.list_workflows(project_id, session_id=session_id)
         except Exception as exc: raise failure(exc) from exc
 
+    @router.get("/api/integrations/n8n/node-catalog")
+    def node_catalog(
+        request: Request,
+        project_id: str = Query(min_length=1, max_length=128),
+        session_id: Optional[str] = Query(default=None, max_length=128),
+        query: str = Query(default="", max_length=255),
+        limit: int = Query(default=50, ge=1, le=100),
+    ):
+        local(request)
+        try: return service.search_node_catalog(project_id, session_id=session_id, query=query, limit=limit)
+        except Exception as exc: raise failure(exc) from exc
+
+    @router.post("/api/integrations/n8n/managed-workflows/{workflow_id}/adopt")
+    def adopt_workflow(workflow_id: str, payload: WorkflowAdoption, request: Request):
+        local(request)
+        try:
+            return service.adopt_workflow(
+                payload.project_id, workflow_id, session_id=payload.session_id,
+                expected_digest=payload.expected_digest, confirmation=payload.confirmation,
+            )
+        except Exception as exc: raise failure(exc) from exc
+
+    @router.get("/api/integrations/n8n/managed-workflows/{workflow_id}/adoption-preview")
+    def adoption_preview(
+        workflow_id: str, request: Request,
+        project_id: str = Query(min_length=1, max_length=128),
+        session_id: Optional[str] = Query(default=None, max_length=128),
+    ):
+        local(request)
+        try: return service.preview_adoption(project_id, workflow_id, session_id=session_id)
+        except Exception as exc: raise failure(exc) from exc
+
     @router.get("/api/integrations/n8n/operation-requests")
     def list_operations(request: Request, project_id: str = Query(min_length=1, max_length=128), limit: int = Query(default=100, ge=1, le=250)):
         local(request)
@@ -140,13 +189,13 @@ def build_n8n_agent_router(
     @router.post("/api/integrations/n8n/operation-requests/{operation_id}/approve")
     def approve_operation(operation_id: str, payload: OperationDecision, request: Request):
         local(request)
-        try: return service.decide(operation_id, project_id=payload.project_id, expected_digest=payload.expected_digest, approved=True, confirmation=payload.confirmation)
+        try: return service.decide(operation_id, project_id=payload.project_id, session_id=payload.session_id, expected_digest=payload.expected_digest, approved=True, confirmation=payload.confirmation)
         except Exception as exc: raise failure(exc) from exc
 
     @router.post("/api/integrations/n8n/operation-requests/{operation_id}/reject")
     def reject_operation(operation_id: str, payload: OperationDecision, request: Request):
         local(request)
-        try: return service.decide(operation_id, project_id=payload.project_id, expected_digest=payload.expected_digest, approved=False)
+        try: return service.decide(operation_id, project_id=payload.project_id, session_id=payload.session_id, expected_digest=payload.expected_digest, approved=False)
         except Exception as exc: raise failure(exc) from exc
 
     @router.get("/api/integrations/n8n/audits")
@@ -190,6 +239,14 @@ def build_n8n_agent_router(
         local(request)
         try:
             return planning_service().propose(plan_id, **payload.model_dump())
+        except Exception as exc:
+            raise failure(exc) from exc
+
+    @router.post("/api/integrations/n8n/plans/{plan_id}/materialize")
+    def materialize_plan(plan_id: str, payload: PlanMaterialize, request: Request):
+        local(request)
+        try:
+            return planning_service().materialize(plan_id, **payload.model_dump())
         except Exception as exc:
             raise failure(exc) from exc
 

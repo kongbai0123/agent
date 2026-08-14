@@ -76,6 +76,38 @@ ALLOWED_TEMPLATE_NODE_TYPES = frozenset(
     }
 )
 
+AGENT_BRIDGE_TEMPLATE_ID = "workbench-agent-bridge-v1"
+AGENT_BRIDGE_WORKFLOW_NAME = "Workbench Agent Bridge v1"
+APPROVAL_GATE_TEMPLATE_ID = "workbench-approval-gate-v1"
+APPROVAL_GATE_WORKFLOW_NAME = "Workbench Approval Gate v1"
+AGENT_RUNTIME_PROFILE = "agent-runtime"
+
+AGENT_TASK_SUBMIT_URL = (
+    f"{WORKBENCH_INTEGRATION_BASE_URL}/agent/tasks"
+)
+AGENT_TASK_STATUS_URL = (
+    "=http://127.0.0.1:8000/api/integrations/n8n/v1/agent/tasks/"
+    "{{$('Submit Agent Task').item.json.body.task_id}}/status"
+)
+RUNTIME_APPROVAL_SUBMIT_URL = (
+    f"{WORKBENCH_INTEGRATION_BASE_URL}/agent/runtime-actions"
+)
+RUNTIME_APPROVAL_STATUS_URL = (
+    "=http://127.0.0.1:8000/api/integrations/n8n/v1/agent/runtime-actions/"
+    "{{$('Request Runtime Approval').item.json.body.approval_id}}/status"
+)
+
+AGENT_TEMPLATE_NODE_TYPES = frozenset(
+    {
+        "n8n-nodes-base.crypto",
+        "n8n-nodes-base.executeWorkflowTrigger",
+        "n8n-nodes-base.httpRequest",
+        "n8n-nodes-base.if",
+        "n8n-nodes-base.set",
+        "n8n-nodes-base.wait",
+    }
+)
+
 GMAIL_INBOUND_URL = f"{WORKBENCH_INTEGRATION_BASE_URL}/gmail/events"
 GMAIL_SEND_WEBHOOK_PATH = "workbench-gmail-send-v1"
 WORKBENCH_WORKFLOW_KEY_PLACEHOLDER = "__WORKBENCH_WORKFLOW_KEY__"
@@ -1585,7 +1617,15 @@ def validate_workflow_template(
     *,
     require_placeholders: bool = True,
 ) -> dict[str, Any]:
-    """Validate the reviewed Gmail templates without executing or importing."""
+    """Validate one reviewed managed template without executing or importing."""
+
+    if workflow.get("templateId") in {
+        AGENT_BRIDGE_TEMPLATE_ID,
+        APPROVAL_GATE_TEMPLATE_ID,
+    }:
+        return validate_agent_workflow_template(
+            workflow, require_placeholders=require_placeholders
+        )
 
     payload = dict(workflow)
     serialized = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
@@ -2000,6 +2040,274 @@ def validate_workflow_template(
         "credential_state": "placeholders" if require_placeholders else "bound",
         "active": False,
     }
+
+
+def validate_agent_workflow_template(
+    workflow: Mapping[str, Any],
+    *,
+    require_placeholders: bool = True,
+) -> dict[str, Any]:
+    """Validate the two protected Agent sub-workflows against reviewed bytes.
+
+    These workflows deliberately use a single, reviewed polling cycle.  The
+    cycle lets an n8n parent wait for a tool-free model task or for a human
+    decision without exposing a webhook or installing a custom node.  Exact
+    reference comparison is the authority boundary: adding a node, changing
+    an expression or redirecting one HTTP request fails closed.
+    """
+
+    payload = copy.deepcopy(dict(workflow))
+    required_root = {
+        "templateId", "name", "active", "nodes", "connections",
+        "settings", "staticData", "pinData",
+    }
+    if set(payload) != required_root:
+        raise N8nTemplateError("Protected Agent template root fields were changed.")
+    template_id = payload.get("templateId")
+    expected_names = {
+        AGENT_BRIDGE_TEMPLATE_ID: AGENT_BRIDGE_WORKFLOW_NAME,
+        APPROVAL_GATE_TEMPLATE_ID: APPROVAL_GATE_WORKFLOW_NAME,
+    }
+    if template_id not in expected_names or payload.get("name") != expected_names[template_id]:
+        raise N8nTemplateError("Unknown protected Agent workflow template.")
+    if payload.get("active") is not False:
+        raise N8nTemplateError("Protected Agent workflow templates must remain inactive.")
+    if payload.get("settings") != {"executionOrder": "v1"}:
+        raise N8nTemplateError("Protected Agent workflow settings were changed.")
+    if payload.get("staticData") is not None or payload.get("pinData") != {}:
+        raise N8nTemplateError("Protected Agent templates may not contain static or pinned data.")
+
+    serialized = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    forbidden = (
+        "n8n-nodes-base.code",
+        "n8n-nodes-base.executeCommand",
+        "n8n-nodes-base.localFileTrigger",
+        "n8n-nodes-base.readWriteFile",
+        "n8n-nodes-base.ssh",
+        "community",
+        "$env",
+        "process.env",
+        "require(",
+        "file://",
+    )
+    if any(fragment.casefold() in serialized.casefold() for fragment in forbidden):
+        raise N8nTemplateError("Protected Agent template contains a forbidden capability.")
+
+    nodes = payload.get("nodes")
+    connections = payload.get("connections")
+    if not isinstance(nodes, list) or not nodes or not isinstance(connections, dict):
+        raise N8nTemplateError("Protected Agent nodes and connections are required.")
+    names: set[str] = set()
+    ids: set[str] = set()
+    trigger_count = 0
+    hmac_count = 0
+    expected_urls = (
+        {AGENT_TASK_SUBMIT_URL, AGENT_TASK_STATUS_URL}
+        if template_id == AGENT_BRIDGE_TEMPLATE_ID
+        else {RUNTIME_APPROVAL_SUBMIT_URL, RUNTIME_APPROVAL_STATUS_URL}
+    )
+    actual_urls: set[str] = set()
+    allowed_node_keys = {
+        "parameters", "id", "name", "type", "typeVersion", "position",
+        "credentials", "onError", "webhookId",
+    }
+    for node in nodes:
+        if not isinstance(node, dict) or not set(node).issubset(allowed_node_keys):
+            raise N8nTemplateError("Protected Agent node fields were changed.")
+        node_type = node.get("type")
+        node_name = node.get("name")
+        node_id = node.get("id")
+        if node_type not in AGENT_TEMPLATE_NODE_TYPES:
+            raise N8nTemplateError(f"Protected Agent node type is not allowed: {node_type}")
+        if not isinstance(node_name, str) or not node_name or node_name in names:
+            raise N8nTemplateError("Protected Agent node names must be unique.")
+        if not isinstance(node_id, str) or not node_id or node_id in ids:
+            raise N8nTemplateError("Protected Agent node IDs must be unique.")
+        if not isinstance(node.get("parameters"), dict):
+            raise N8nTemplateError("Protected Agent node parameters must be an object.")
+        webhook_id = node.get("webhookId")
+        if webhook_id is not None and (
+            node_type != "n8n-nodes-base.wait"
+            or not isinstance(webhook_id, str)
+            or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", webhook_id)
+        ):
+            raise N8nTemplateError("Protected Agent webhook identity is invalid.")
+        position = node.get("position")
+        if not (
+            isinstance(position, list) and len(position) == 2
+            and all(isinstance(value, (int, float)) and not isinstance(value, bool) for value in position)
+        ):
+            raise N8nTemplateError("Protected Agent node positions are invalid.")
+        names.add(node_name)
+        ids.add(node_id)
+
+        if node_type == "n8n-nodes-base.executeWorkflowTrigger":
+            trigger_count += 1
+            if node.get("credentials") or node.get("onError"):
+                raise N8nTemplateError("Protected sub-workflow trigger may not contain credentials.")
+        elif node_type == "n8n-nodes-base.crypto":
+            action = node["parameters"].get("action")
+            if action == "hmac":
+                hmac_count += 1
+                if node["parameters"] != {
+                    "action": "hmac", "binaryData": False, "type": "SHA256",
+                    "value": "={{$json.canonical}}", "dataPropertyName": "signature",
+                    "encoding": "hex",
+                }:
+                    raise N8nTemplateError("Protected Agent HMAC settings were changed.")
+                _validate_credential(
+                    node, "crypto", WORKBENCH_HMAC_CREDENTIAL_PLACEHOLDER,
+                    require_placeholders=require_placeholders,
+                )
+            elif action == "hash":
+                if node["parameters"] != {
+                    "action": "hash", "binaryData": False, "type": "SHA256",
+                    "value": "={{$json.request_body}}", "dataPropertyName": "body_sha256",
+                    "encoding": "hex",
+                } or node.get("credentials"):
+                    raise N8nTemplateError("Protected Agent body hash settings were changed.")
+            elif action == "generate":
+                if node["parameters"] != {
+                    "action": "generate", "dataPropertyName": "nonce",
+                    "encodingType": "hex", "stringLength": 32,
+                } or node.get("credentials"):
+                    raise N8nTemplateError("Protected Agent nonce settings were changed.")
+            else:
+                raise N8nTemplateError("Protected Agent Crypto action is not allowed.")
+        elif node_type == "n8n-nodes-base.httpRequest":
+            url = node["parameters"].get("url")
+            if url not in expected_urls:
+                raise N8nTemplateError("Protected Agent HTTP URL is outside the signed API.")
+            actual_urls.add(str(url))
+            _validate_agent_signed_http_node(node)
+        else:
+            if node.get("credentials"):
+                raise N8nTemplateError("Only reviewed HMAC nodes may reference a credential.")
+    if trigger_count != 1 or hmac_count != 2 or actual_urls != expected_urls:
+        raise N8nTemplateError("Protected Agent signed task boundary is incomplete.")
+    _validate_connection_references(connections, names)
+
+    reference_path = REPO_ROOT / "config" / "n8n-workflows" / f"{template_id}.json"
+    reference = load_workflow_template(reference_path)
+    normalized = _normalize_agent_workflow_for_reference(payload)
+    if normalized != reference:
+        raise N8nTemplateError("Protected Agent workflow differs from the reviewed template.")
+    if require_placeholders:
+        if serialized.count(WORKBENCH_HMAC_CREDENTIAL_PLACEHOLDER) != 2:
+            raise N8nTemplateError("Protected Agent HMAC placeholders are missing.")
+    elif WORKBENCH_HMAC_CREDENTIAL_PLACEHOLDER in serialized:
+        raise N8nTemplateError("Protected Agent workflow cannot run with a placeholder credential.")
+    return {
+        "valid": True,
+        "template_id": template_id,
+        "node_count": len(nodes),
+        "credential_state": "placeholders" if require_placeholders else "bound",
+        "active": False,
+        "protected": True,
+    }
+
+
+def _validate_agent_signed_http_node(node: Mapping[str, Any]) -> None:
+    parameters = node.get("parameters") or {}
+    if node.get("credentials"):
+        raise N8nTemplateError("Signed Agent HTTP nodes may not contain an auth secret.")
+    if set(parameters) != {
+        "method", "url", "authentication", "sendHeaders", "headerParameters",
+        "sendBody", "contentType", "rawContentType", "body", "options",
+    }:
+        raise N8nTemplateError("Signed Agent HTTP fields were changed.")
+    if (
+        parameters.get("method") != "POST"
+        or parameters.get("authentication") != "none"
+        or parameters.get("sendHeaders") is not True
+        or parameters.get("sendBody") is not True
+        or parameters.get("contentType") != "raw"
+        or parameters.get("rawContentType") != "application/json"
+        or parameters.get("body") != "={{$json.request_body}}"
+        or node.get("onError") != "continueRegularOutput"
+        or parameters.get("options") != {
+            "timeout": 10000,
+            "response": {"response": {
+                "fullResponse": True, "neverError": True, "responseFormat": "json",
+            }},
+        }
+    ):
+        raise N8nTemplateError("Signed Agent HTTP behavior was changed.")
+    rows = parameters.get("headerParameters", {}).get("parameters")
+    if not isinstance(rows, list):
+        raise N8nTemplateError("Signed Agent HTTP headers are missing.")
+    actual = {
+        str(row.get("name")): str(row.get("value"))
+        for row in rows
+        if isinstance(row, dict) and set(row) == {"name", "value"}
+    }
+    expected = {
+        "X-N8N-Timestamp": "={{$json.timestamp}}",
+        "X-N8N-Nonce": "={{$json.nonce}}",
+        "X-N8N-Signature": "={{$json.signature}}",
+        "X-N8N-Profile": AGENT_RUNTIME_PROFILE,
+    }
+    if actual != expected or len(rows) != len(expected):
+        raise N8nTemplateError("Signed Agent HTTP headers were changed.")
+
+
+def _validate_connection_references(
+    connections: Mapping[str, Any], names: set[str]
+) -> None:
+    """Validate connection DTOs but permit the one exact reviewed polling cycle."""
+
+    if not set(connections).issubset(names):
+        raise N8nTemplateError("Protected Agent connection source is unknown.")
+    for outputs in connections.values():
+        if not isinstance(outputs, dict) or set(outputs) != {"main"}:
+            raise N8nTemplateError("Protected Agent connections must use main outputs only.")
+        branches = outputs.get("main")
+        if not isinstance(branches, list):
+            raise N8nTemplateError("Protected Agent connection branches are invalid.")
+        for branch in branches:
+            if not isinstance(branch, list):
+                raise N8nTemplateError("Protected Agent connection branch is invalid.")
+            for target in branch:
+                if (
+                    not isinstance(target, dict)
+                    or set(target) != {"node", "type", "index"}
+                    or target.get("node") not in names
+                    or target.get("type") != "main"
+                    or target.get("index") != 0
+                ):
+                    raise N8nTemplateError("Protected Agent connection target is invalid.")
+
+
+def _normalize_agent_workflow_for_reference(
+    workflow: Mapping[str, Any],
+) -> dict[str, Any]:
+    normalized = copy.deepcopy(dict(workflow))
+    for node in normalized.get("nodes", []):
+        # n8n assigns this opaque runtime identity when a Wait node is saved;
+        # it is not part of the reviewed behavior or user-authored template.
+        node.pop("webhookId", None)
+        credentials = node.get("credentials") or {}
+        if "crypto" in credentials:
+            credentials["crypto"]["id"] = WORKBENCH_HMAC_CREDENTIAL_PLACEHOLDER
+    return normalized
+
+
+def bind_agent_workflow_credential(
+    workflow: Mapping[str, Any], *, workbench_hmac_credential_id: str
+) -> dict[str, Any]:
+    """Bind only the opaque HMAC credential ID; never install or activate."""
+
+    validate_agent_workflow_template(workflow, require_placeholders=True)
+    credential_id = str(workbench_hmac_credential_id or "")
+    if not _CREDENTIAL_ID.fullmatch(credential_id):
+        raise N8nTemplateError("HMAC credential ID must be an opaque n8n identifier.")
+    bound = copy.deepcopy(dict(workflow))
+    for node in bound["nodes"]:
+        credentials = node.get("credentials") or {}
+        if "crypto" in credentials:
+            credentials["crypto"]["id"] = credential_id
+    validate_agent_workflow_template(bound, require_placeholders=False)
+    return bound
 
 
 def _validate_signed_http_node(node: Mapping[str, Any]) -> None:
@@ -2418,10 +2726,15 @@ def inspect_gmail_workflows_readiness(
                 f"""
                 SELECT w.id, w.name, w.active, w.isArchived, w.settings,
                        w.staticData, w.pinData, w.activeVersionId,
-                       p.publishedVersionId, h.nodes, h.connections
+                       COALESCE(p.publishedVersionId, w.activeVersionId)
+                           AS publishedVersionId,
+                       h.nodes, h.connections
                 FROM workflow_entity AS w
                 LEFT JOIN workflow_published_version AS p ON p.workflowId = w.id
-                LEFT JOIN workflow_history AS h ON h.versionId = p.publishedVersionId
+                LEFT JOIN workflow_history AS h
+                       ON h.versionId = COALESCE(
+                           p.publishedVersionId, w.activeVersionId
+                       )
                 WHERE w.name IN ({placeholders})
                 """,
                 tuple(expected.values()),
@@ -2442,7 +2755,8 @@ def inspect_gmail_workflows_readiness(
                 row = matches[0]
                 active = int(row["active"] or 0) == 1
                 published = bool(row["publishedVersionId"]) and (
-                    str(row["activeVersionId"] or "") == str(row["publishedVersionId"])
+                    str(row["activeVersionId"] or "")
+                    == str(row["publishedVersionId"])
                 )
                 archived = int(row["isArchived"] or 0) == 1
                 valid = False
@@ -2592,6 +2906,186 @@ def _normalize_bound_workflow_for_reference(
     return normalized
 
 
+def inspect_agent_bridge_workflows_readiness(
+    paths: Optional[ManagedN8nPaths] = None,
+    *,
+    database_path: Path | str | None = None,
+) -> dict[str, Any]:
+    """Read-only attestation for the protected Agent and approval bridges.
+
+    The bridge workflows must be exact, published and unarchived.
+
+    In n8n 2.32.5, publication and the ``active`` flag are the same state:
+    unpublishing also removes ``workflow_published_version``. These reviewed
+    bridges therefore remain published/active, but they contain only an
+    Execute Workflow Trigger, so they cannot start autonomously.
+    """
+
+    managed = paths or ManagedN8nPaths.default()
+    candidate = Path(database_path) if database_path else managed.n8n_dir / "database.sqlite"
+    report: dict[str, Any] = {
+        "ready": False,
+        "code": "agent_bridge_workflows_not_ready",
+        "blockers": [],
+        "workflows": {},
+        "credential_bindings": {"hmac_bound": False, "hmac_configured": False},
+        "checked_at": _utc_now(),
+    }
+    blockers: list[str] = report["blockers"]
+    if not _is_relative_to(candidate, managed.n8n_dir) or not _safe_regular_file(
+        candidate, managed.n8n_dir, max_bytes=8 * 1024 * 1024 * 1024
+    ):
+        blockers.append("n8n_database_missing_or_unsafe")
+        return report
+
+    expected = {
+        AGENT_BRIDGE_TEMPLATE_ID: AGENT_BRIDGE_WORKFLOW_NAME,
+        APPROVAL_GATE_TEMPLATE_ID: APPROVAL_GATE_WORKFLOW_NAME,
+    }
+    credential_ids: set[str] = set()
+    uri = f"file:{candidate.resolve().as_posix()}?mode=ro"
+    try:
+        connection = sqlite3.connect(uri, uri=True, timeout=2.0)
+        connection.row_factory = sqlite3.Row
+        try:
+            connection.execute("PRAGMA query_only = ON")
+            connection.execute("PRAGMA trusted_schema = OFF")
+            placeholders = ",".join("?" for _ in expected)
+            rows = connection.execute(
+                f"""
+                SELECT w.id, w.name, w.active, w.isArchived, w.settings,
+                       w.staticData, w.pinData, w.activeVersionId,
+                       COALESCE(p.publishedVersionId, w.activeVersionId)
+                           AS publishedVersionId,
+                       h.nodes, h.connections
+                  FROM workflow_entity AS w
+             LEFT JOIN workflow_published_version AS p ON p.workflowId = w.id
+             LEFT JOIN workflow_history AS h
+                    ON h.versionId = COALESCE(
+                        p.publishedVersionId, w.activeVersionId
+                    )
+                 WHERE w.name IN ({placeholders})
+                """,
+                tuple(expected.values()),
+            ).fetchall()
+            by_name: dict[str, list[sqlite3.Row]] = {}
+            for row in rows:
+                by_name.setdefault(str(row["name"]), []).append(row)
+
+            def decode(value: Any, default: Any) -> Any:
+                if value is None or value == "":
+                    return copy.deepcopy(default)
+                return json.loads(str(value))
+
+            for template_id, name in expected.items():
+                matches = by_name.get(name, [])
+                if len(matches) != 1:
+                    blockers.append(
+                        f"{template_id}_missing" if not matches else f"{template_id}_duplicate"
+                    )
+                    report["workflows"][template_id] = {
+                        "present": bool(matches), "active": False,
+                        "published": False, "valid": False, "protected": True,
+                    }
+                    continue
+                row = matches[0]
+                active = int(row["active"] or 0) == 1
+                archived = int(row["isArchived"] or 0) == 1
+                # n8n 2.32.5 exposes publication as activation. The exact
+                # reviewed bytes are read from the published history version.
+                published = bool(row["publishedVersionId"])
+                workflow_id = str(row["id"] or "").strip()
+                safe_workflow_id = (
+                    workflow_id
+                    if re.fullmatch(r"[A-Za-z0-9_-]{1,128}", workflow_id)
+                    else None
+                )
+                valid = False
+                reason = "validated"
+                try:
+                    workflow = {
+                        "templateId": template_id,
+                        "name": name,
+                        "active": False,
+                        "nodes": decode(row["nodes"], []),
+                        "connections": decode(row["connections"], {}),
+                        "settings": decode(row["settings"], {}),
+                        "staticData": decode(row["staticData"], None),
+                        "pinData": decode(row["pinData"], {}),
+                    }
+                    validate_agent_workflow_template(
+                        workflow, require_placeholders=False
+                    )
+                    valid = True
+                    for node in workflow["nodes"]:
+                        reference = (node.get("credentials") or {}).get("crypto")
+                        if isinstance(reference, dict):
+                            credential_ids.add(str(reference.get("id") or ""))
+                except (N8nTemplateError, TypeError, ValueError, json.JSONDecodeError):
+                    reason = "workflow_policy_invalid"
+                    blockers.append(f"{template_id}_invalid")
+                if not active:
+                    blockers.append(f"{template_id}_must_remain_published")
+                if archived:
+                    blockers.append(f"{template_id}_archived")
+                if not published:
+                    blockers.append(f"{template_id}_not_published")
+                if safe_workflow_id is None:
+                    blockers.append(f"{template_id}_workflow_id_invalid")
+                report["workflows"][template_id] = {
+                    "workflow_id": safe_workflow_id,
+                    "present": True, "active": active, "published": published,
+                    "valid": valid, "protected": True, "reason": reason,
+                }
+
+            credential_ids.discard("")
+            if len(credential_ids) != 1:
+                blockers.append("agent_hmac_credential_binding_invalid")
+            hmac_ready = False
+            if len(credential_ids) == 1:
+                credential_id = next(iter(credential_ids))
+                row = connection.execute(
+                    """SELECT type,
+                              CASE WHEN data IS NOT NULL AND length(data) >= 16
+                                   THEN 1 ELSE 0 END AS configured
+                         FROM credentials_entity WHERE id=?""",
+                    (credential_id,),
+                ).fetchone()
+                hmac_ready = bool(
+                    row and str(row["type"]) == "crypto" and int(row["configured"] or 0) == 1
+                )
+            if not hmac_ready:
+                blockers.append("agent_hmac_credential_missing")
+            report["credential_bindings"] = {
+                "hmac_bound": len(credential_ids) == 1,
+                "hmac_configured": hmac_ready,
+            }
+        finally:
+            connection.close()
+    except (sqlite3.Error, OSError, ValueError, TypeError):
+        blockers.append("n8n_database_read_failed")
+
+    report["blockers"] = list(dict.fromkeys(blockers))
+    report["ready"] = not report["blockers"]
+    report["code"] = "ready" if report["ready"] else "agent_bridge_workflows_not_ready"
+    return report
+
+
+def agent_bridge_workflows_ready(
+    paths: Optional[ManagedN8nPaths] = None,
+    *,
+    database_path: Path | str | None = None,
+) -> bool:
+    """Fail-closed convenience predicate for the protected bridge pair."""
+
+    try:
+        return inspect_agent_bridge_workflows_readiness(
+            paths, database_path=database_path
+        ).get("ready") is True
+    except Exception:
+        return False
+
+
 def gmail_workflows_ready(
     paths: Optional[ManagedN8nPaths] = None,
     *,
@@ -2608,6 +3102,14 @@ def gmail_workflows_ready(
 
 
 __all__ = [
+    "AGENT_BRIDGE_TEMPLATE_ID",
+    "AGENT_BRIDGE_WORKFLOW_NAME",
+    "AGENT_RUNTIME_PROFILE",
+    "AGENT_TEMPLATE_NODE_TYPES",
+    "AGENT_TASK_STATUS_URL",
+    "AGENT_TASK_SUBMIT_URL",
+    "APPROVAL_GATE_TEMPLATE_ID",
+    "APPROVAL_GATE_WORKFLOW_NAME",
     "GMAIL_CREDENTIAL_PLACEHOLDER",
     "GMAIL_DRAFT_SEND_URL",
     "GMAIL_INBOUND_URL",
@@ -2621,6 +3123,8 @@ __all__ = [
     "N8N_SERVICE_ACCOUNT",
     "N8N_VERSION",
     "NODE_VERSION",
+    "RUNTIME_APPROVAL_STATUS_URL",
+    "RUNTIME_APPROVAL_SUBMIT_URL",
     "N8nConfigurationError",
     "N8nLifecycleError",
     "N8nOwnershipError",
@@ -2632,17 +3136,21 @@ __all__ = [
     "WORKBENCH_WORKFLOW_KEY_PLACEHOLDER",
     "WindowsRunAsLauncher",
     "WindowsRunAsProcess",
+    "agent_bridge_workflows_ready",
+    "bind_agent_workflow_credential",
     "bind_workflow_credentials",
     "build_managed_environment",
     "gmail_workflows_ready",
     "inspect_port",
     "inspect_isolation",
+    "inspect_agent_bridge_workflows_readiness",
     "inspect_gmail_workflows_readiness",
     "inspect_stray_user_profile",
     "load_workflow_template",
     "probe_health",
     "read_lifecycle_record",
     "validate_installation",
+    "validate_agent_workflow_template",
     "validate_managed_policy_file",
     "validate_runtime_layout",
     "validate_workflow_template",

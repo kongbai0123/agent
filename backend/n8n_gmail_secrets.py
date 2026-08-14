@@ -141,6 +141,23 @@ class N8nGmailSecretStore:
     def inbound_hmac_key(self) -> bytes:
         return self._key("inbound_hmac_key")
 
+    def inbound_hmac_credential_value(self) -> str:
+        """Return the stable ASCII value provisioned into n8n's Crypto credential.
+
+        The n8n Crypto node treats ``hmacSecret`` as UTF-8 text and does not
+        decode hex or base64.  Keep the DPAPI-protected 256-bit key as the
+        source of truth, but expose its base64url representation only to the
+        local provisioning path and use those exact ASCII bytes for HMAC
+        verification in Workbench.
+        """
+
+        return base64.urlsafe_b64encode(self.inbound_hmac_key()).decode("ascii")
+
+    def inbound_hmac_verifier_key(self) -> bytes:
+        """Return the exact UTF-8 bytes used by n8n's Crypto HMAC node."""
+
+        return self.inbound_hmac_credential_value().encode("ascii")
+
     def outbound_webhook_key(self) -> bytes:
         return self._key("outbound_webhook_key")
 

@@ -1,0 +1,138 @@
+{
+  "templateId": "workbench-agent-bridge-v1",
+  "name": "Workbench Agent Bridge v1",
+  "active": false,
+  "nodes": [
+    {
+      "parameters": {"inputSource": "workflowInputs", "workflowInputs": {"values": [
+        {"name": "agent_binding_id", "type": "string"},
+        {"name": "workflow_id", "type": "string"},
+        {"name": "workflow_revision", "type": "string"},
+        {"name": "node_id", "type": "string"},
+        {"name": "request_id", "type": "string"},
+        {"name": "input", "type": "any"}
+      ]}},
+      "id": "agent-bridge-trigger", "name": "When Called", "type": "n8n-nodes-base.executeWorkflowTrigger", "typeVersion": 1.2, "position": [0, 0]
+    },
+    {
+      "parameters": {"mode": "manual", "assignments": {"assignments": [
+        {"id": "agent-submit-body", "name": "request_body", "type": "string", "value": "={{JSON.stringify({request_id:String($json.request_id||'').slice(0,128),workflow_id:String($json.workflow_id||'').slice(0,128),workflow_revision:String($json.workflow_revision||'').slice(0,128),node_id:String($json.node_id||'').slice(0,128),agent_binding_id:String($json.agent_binding_id||'').slice(0,128),input:$json.input})}}"},
+        {"id": "agent-submit-path", "name": "request_path", "type": "string", "value": "/api/integrations/n8n/v1/agent/tasks"},
+        {"id": "agent-submit-time", "name": "timestamp", "type": "string", "value": "={{Math.floor(Date.now()/1000).toString()}}"}
+      ]}, "includeOtherFields": false, "options": {}},
+      "id": "agent-bridge-prepare-submit", "name": "Prepare Agent Task", "type": "n8n-nodes-base.set", "typeVersion": 3.4, "position": [240, 0]
+    },
+    {
+      "parameters": {"action": "hash", "binaryData": false, "type": "SHA256", "value": "={{$json.request_body}}", "dataPropertyName": "body_sha256", "encoding": "hex"},
+      "id": "agent-bridge-submit-hash", "name": "Hash Agent Task Body", "type": "n8n-nodes-base.crypto", "typeVersion": 2, "position": [480, 0]
+    },
+    {
+      "parameters": {"action": "generate", "dataPropertyName": "nonce", "encodingType": "hex", "stringLength": 32},
+      "id": "agent-bridge-submit-nonce", "name": "Generate Agent Task Nonce", "type": "n8n-nodes-base.crypto", "typeVersion": 2, "position": [720, 0]
+    },
+    {
+      "parameters": {"mode": "manual", "assignments": {"assignments": [
+        {"id": "agent-submit-canonical", "name": "canonical", "type": "string", "value": "={{'POST\\n'+$json.request_path+'\\n'+$json.timestamp+'\\n'+$json.nonce+'\\n'+$json.body_sha256}}"}
+      ]}, "includeOtherFields": true, "options": {}},
+      "id": "agent-bridge-submit-canonical", "name": "Build Agent Task Canonical", "type": "n8n-nodes-base.set", "typeVersion": 3.4, "position": [960, 0]
+    },
+    {
+      "parameters": {"action": "hmac", "binaryData": false, "type": "SHA256", "value": "={{$json.canonical}}", "dataPropertyName": "signature", "encoding": "hex"},
+      "id": "agent-bridge-submit-sign", "name": "Sign Agent Task", "type": "n8n-nodes-base.crypto", "typeVersion": 2, "position": [1200, 0],
+      "credentials": {"crypto": {"id": "__WORKBENCH_HMAC_CREDENTIAL_ID__", "name": "Workbench HMAC"}}
+    },
+    {
+      "parameters": {"method": "POST", "url": "http://127.0.0.1:8000/api/integrations/n8n/v1/agent/tasks", "authentication": "none", "sendHeaders": true, "headerParameters": {"parameters": [
+        {"name": "X-N8N-Timestamp", "value": "={{$json.timestamp}}"},
+        {"name": "X-N8N-Nonce", "value": "={{$json.nonce}}"},
+        {"name": "X-N8N-Signature", "value": "={{$json.signature}}"},
+        {"name": "X-N8N-Profile", "value": "agent-runtime"}
+      ]}, "sendBody": true, "contentType": "raw", "rawContentType": "application/json", "body": "={{$json.request_body}}", "options": {"timeout": 10000, "response": {"response": {"fullResponse": true, "neverError": true, "responseFormat": "json"}}}},
+      "id": "agent-bridge-submit-http", "name": "Submit Agent Task", "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.2, "position": [1440, 0], "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {"conditions": {"options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 2}, "conditions": [
+        {"id": "agent-submit-accepted-condition", "leftValue": "={{Number($json.statusCode||0)===202 && Boolean($json.body?.task_id)}}", "rightValue": true, "operator": {"type": "boolean", "operation": "true", "singleValue": true}}
+      ], "combinator": "and"}, "options": {}},
+      "id": "agent-bridge-submit-accepted", "name": "Agent Task Accepted", "type": "n8n-nodes-base.if", "typeVersion": 2.2, "position": [1680, 0]
+    },
+    {
+      "parameters": {"resume": "timeInterval", "amount": 10, "unit": "seconds", "options": {}},
+      "id": "agent-bridge-wait", "name": "Wait for Agent Task", "type": "n8n-nodes-base.wait", "typeVersion": 1.1, "position": [1920, -80]
+    },
+    {
+      "parameters": {"mode": "manual", "assignments": {"assignments": [
+        {"id": "agent-status-body", "name": "request_body", "type": "string", "value": "={{JSON.stringify({workflow_id:String($('When Called').item.json.workflow_id||'').slice(0,128)})}}"},
+        {"id": "agent-status-path", "name": "request_path", "type": "string", "value": "={{'/api/integrations/n8n/v1/agent/tasks/'+String($('Submit Agent Task').item.json.body.task_id||'').slice(0,128)+'/status'}}"},
+        {"id": "agent-status-time", "name": "timestamp", "type": "string", "value": "={{Math.floor(Date.now()/1000).toString()}}"}
+      ]}, "includeOtherFields": false, "options": {}},
+      "id": "agent-bridge-prepare-status", "name": "Prepare Agent Task Status", "type": "n8n-nodes-base.set", "typeVersion": 3.4, "position": [2160, -80]
+    },
+    {
+      "parameters": {"action": "hash", "binaryData": false, "type": "SHA256", "value": "={{$json.request_body}}", "dataPropertyName": "body_sha256", "encoding": "hex"},
+      "id": "agent-bridge-status-hash", "name": "Hash Agent Status Body", "type": "n8n-nodes-base.crypto", "typeVersion": 2, "position": [2400, -80]
+    },
+    {
+      "parameters": {"action": "generate", "dataPropertyName": "nonce", "encodingType": "hex", "stringLength": 32},
+      "id": "agent-bridge-status-nonce", "name": "Generate Agent Status Nonce", "type": "n8n-nodes-base.crypto", "typeVersion": 2, "position": [2640, -80]
+    },
+    {
+      "parameters": {"mode": "manual", "assignments": {"assignments": [
+        {"id": "agent-status-canonical", "name": "canonical", "type": "string", "value": "={{'POST\\n'+$json.request_path+'\\n'+$json.timestamp+'\\n'+$json.nonce+'\\n'+$json.body_sha256}}"}
+      ]}, "includeOtherFields": true, "options": {}},
+      "id": "agent-bridge-status-canonical", "name": "Build Agent Status Canonical", "type": "n8n-nodes-base.set", "typeVersion": 3.4, "position": [2880, -80]
+    },
+    {
+      "parameters": {"action": "hmac", "binaryData": false, "type": "SHA256", "value": "={{$json.canonical}}", "dataPropertyName": "signature", "encoding": "hex"},
+      "id": "agent-bridge-status-sign", "name": "Sign Agent Status", "type": "n8n-nodes-base.crypto", "typeVersion": 2, "position": [3120, -80],
+      "credentials": {"crypto": {"id": "__WORKBENCH_HMAC_CREDENTIAL_ID__", "name": "Workbench HMAC"}}
+    },
+    {
+      "parameters": {"method": "POST", "url": "=http://127.0.0.1:8000/api/integrations/n8n/v1/agent/tasks/{{$('Submit Agent Task').item.json.body.task_id}}/status", "authentication": "none", "sendHeaders": true, "headerParameters": {"parameters": [
+        {"name": "X-N8N-Timestamp", "value": "={{$json.timestamp}}"},
+        {"name": "X-N8N-Nonce", "value": "={{$json.nonce}}"},
+        {"name": "X-N8N-Signature", "value": "={{$json.signature}}"},
+        {"name": "X-N8N-Profile", "value": "agent-runtime"}
+      ]}, "sendBody": true, "contentType": "raw", "rawContentType": "application/json", "body": "={{$json.request_body}}", "options": {"timeout": 10000, "response": {"response": {"fullResponse": true, "neverError": true, "responseFormat": "json"}}}},
+      "id": "agent-bridge-status-http", "name": "Get Agent Task Status", "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.2, "position": [3360, -80], "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {"conditions": {"options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 2}, "conditions": [
+        {"id": "agent-status-succeeded-condition", "leftValue": "={{Number($json.statusCode||0)===200 && $json.body?.status==='succeeded' && Boolean($json.body?.result)}}", "rightValue": true, "operator": {"type": "boolean", "operation": "true", "singleValue": true}}
+      ], "combinator": "and"}, "options": {}},
+      "id": "agent-bridge-status-succeeded", "name": "Agent Task Succeeded", "type": "n8n-nodes-base.if", "typeVersion": 2.2, "position": [3600, -80]
+    },
+    {
+      "parameters": {"mode": "raw", "jsonOutput": "={{$json.body.result}}", "includeOtherFields": false, "options": {}},
+      "id": "agent-bridge-return", "name": "Return Agent Result", "type": "n8n-nodes-base.set", "typeVersion": 3.4, "position": [3840, -180]
+    },
+    {
+      "parameters": {"conditions": {"options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 2}, "conditions": [
+        {"id": "agent-status-pending-condition", "leftValue": "={{['queued','generating'].includes(String($json.body?.status||''))||Boolean($json.error)||Number($json.statusCode||0)>=500}}", "rightValue": true, "operator": {"type": "boolean", "operation": "true", "singleValue": true}}
+      ], "combinator": "and"}, "options": {}},
+      "id": "agent-bridge-status-pending", "name": "Agent Task Still Pending", "type": "n8n-nodes-base.if", "typeVersion": 2.2, "position": [3840, 20]
+    }
+  ],
+  "connections": {
+    "When Called": {"main": [[{"node": "Prepare Agent Task", "type": "main", "index": 0}]]},
+    "Prepare Agent Task": {"main": [[{"node": "Hash Agent Task Body", "type": "main", "index": 0}]]},
+    "Hash Agent Task Body": {"main": [[{"node": "Generate Agent Task Nonce", "type": "main", "index": 0}]]},
+    "Generate Agent Task Nonce": {"main": [[{"node": "Build Agent Task Canonical", "type": "main", "index": 0}]]},
+    "Build Agent Task Canonical": {"main": [[{"node": "Sign Agent Task", "type": "main", "index": 0}]]},
+    "Sign Agent Task": {"main": [[{"node": "Submit Agent Task", "type": "main", "index": 0}]]},
+    "Submit Agent Task": {"main": [[{"node": "Agent Task Accepted", "type": "main", "index": 0}]]},
+    "Agent Task Accepted": {"main": [[{"node": "Wait for Agent Task", "type": "main", "index": 0}], []]},
+    "Wait for Agent Task": {"main": [[{"node": "Prepare Agent Task Status", "type": "main", "index": 0}]]},
+    "Prepare Agent Task Status": {"main": [[{"node": "Hash Agent Status Body", "type": "main", "index": 0}]]},
+    "Hash Agent Status Body": {"main": [[{"node": "Generate Agent Status Nonce", "type": "main", "index": 0}]]},
+    "Generate Agent Status Nonce": {"main": [[{"node": "Build Agent Status Canonical", "type": "main", "index": 0}]]},
+    "Build Agent Status Canonical": {"main": [[{"node": "Sign Agent Status", "type": "main", "index": 0}]]},
+    "Sign Agent Status": {"main": [[{"node": "Get Agent Task Status", "type": "main", "index": 0}]]},
+    "Get Agent Task Status": {"main": [[{"node": "Agent Task Succeeded", "type": "main", "index": 0}]]},
+    "Agent Task Succeeded": {"main": [[{"node": "Return Agent Result", "type": "main", "index": 0}], [{"node": "Agent Task Still Pending", "type": "main", "index": 0}]]},
+    "Agent Task Still Pending": {"main": [[{"node": "Wait for Agent Task", "type": "main", "index": 0}], []]}
+  },
+  "settings": {"executionOrder": "v1"},
+  "staticData": null,
+  "pinData": {}
+}
