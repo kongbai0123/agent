@@ -17,7 +17,7 @@ def test_workflow_center_has_policy_workflows_operations_and_audits():
         'id="n8n-agent-audits-list"', 'id="n8n-agent-api-key-form"',
     ):
         assert marker in HTML
-    assert "n8n-agent-governance.js?v=0.8.0-n8n-graph-authoring-beta.1" in HTML
+    assert "n8n-agent-governance.js?v=0.8.0-n8n-graph-authoring-beta.3" in HTML
 
 
 def test_project_scoped_credential_alias_ui_never_renders_credential_id():
@@ -76,6 +76,28 @@ def test_project_switch_clears_scoped_runtime_state_and_rejects_stale_responses(
     assert "runtime-approvals?project_id=${query(id)}&limit=100" in JS
 
 
+def test_governance_inspector_uses_project_scoped_owner_leases():
+    owner_helpers = JS[JS.index("function workflowWorkspaceActive"):JS.index("const listOf")]
+    assert "claimContentOwner" in owner_helpers
+    assert "contentOwnerMatches" in owner_helpers
+    assert "state.inspectorLease = null" in owner_helpers
+
+    operation = JS[JS.index("function showOperation"):JS.index("function showRuntimeApproval")]
+    runtime = JS[JS.index("function showRuntimeApproval"):JS.index("async function decideRuntimeApproval")]
+    assert "operation?.project_id !== scopedProject" in operation
+    assert "inspectorOwner('operation', operation.id)" in operation
+    assert "ownsInspector(activeLease)" in operation
+    assert "approval.project_id !== scopedProject" in runtime
+    assert "inspectorOwner('runtime', approval.approval_id)" in runtime
+    assert "ownsInspector(activeLease)" in runtime
+
+    decision = JS[JS.index("async function decideRuntimeApproval"):JS.index("function renderCatalogResults")]
+    assert decision.count("ownsInspector(lease)") >= 4
+    assert "showRuntimeApproval(updated, { lease })" in decision
+    assert "showOperation(updated, { lease })" in decision
+    assert "releaseInspectorContext(); resetProjectScopedRuntime()" in JS
+
+
 def test_runtime_decision_behavior_uses_full_audit_minutes_and_drops_stale_ui_updates():
     start = JS.index("async function decideRuntimeApproval")
     end = JS.index("\n    async function decide(", start)
@@ -89,10 +111,12 @@ let inspectorUpdates = 0;
 let toasts = 0;
 const state = {{
   inspectorScope: 'runtime:project-a',
+  inspectorLease: {{owner: 'runtime:approval-1', generation: 1}},
   policy: {{mode: 'full_audit'}},
   deps: {{showToast: () => {{ toasts += 1; }}}}
 }};
 const projectId = () => activeProject;
+const ownsInspector = lease => lease === state.inspectorLease && activeProject === 'project-a';
 const query = value => encodeURIComponent(String(value || ''));
 const api = async (path, options) => {{
   const body = JSON.parse(options.body);
@@ -320,6 +344,7 @@ def test_chat_n8n_intent_detector_is_conservative_and_operation_only():
     ]
     cases = [
         ("幫我控制 agent 進行 n8n，發送測試成功", True),
+        ("請你幫我操作n8n寄信給recipient@example.test，內容為測試成功", True),
         ("請幫我用 n8n 建立 Gmail workflow", True),
         ("n8n 刪除 workflow abc", True),
         ("Please use n8n to create a workflow.", True),
@@ -361,6 +386,7 @@ def test_mail_workflow_authoring_uses_graph_planner_not_one_off_compose():
                 "Use n8n to build a Gmail workflow with Agent and approval nodes.",
                 "請用 n8n 建立寄信流程並配對節點",
                 "Use n8n to send one email now.",
+                "請你幫我操作n8n寄信給recipient@example.test，內容為測試成功",
             ],
             ensure_ascii=False,
         )
@@ -370,7 +396,28 @@ def test_mail_workflow_authoring_uses_graph_planner_not_one_off_compose():
         ["node", "-"], input=script, text=True, encoding="utf-8",
         capture_output=True, check=True,
     )
-    assert json.loads(completed.stdout) == [True, True, False]
+    assert json.loads(completed.stdout) == [True, True, False, False]
+
+
+def test_exact_one_off_n8n_mail_request_routes_to_compose():
+    detector = APP_JS[
+        APP_JS.index("function isExplicitN8nMailOperation"):
+        APP_JS.index("function isExplicitN8nWorkflowAuthoringIntent")
+    ]
+    script = (
+        detector
+        + "\nprocess.stdout.write(JSON.stringify(isExplicitN8nMailOperation("
+        + json.dumps(
+            "請你幫我操作n8n寄信給recipient@example.test，內容為測試成功",
+            ensure_ascii=False,
+        )
+        + ")));"
+    )
+    completed = subprocess.run(
+        ["node", "-"], input=script, text=True, encoding="utf-8",
+        capture_output=True, check=True,
+    )
+    assert json.loads(completed.stdout) is True
 
 
 def test_chat_handoff_does_not_consume_retry_skill_image_or_temporary_context_turns():

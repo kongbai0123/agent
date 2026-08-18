@@ -13,6 +13,11 @@ import re
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Optional
 
+from model_gateway import (
+    get_model_gateway,
+    model_hook_context,
+    validate_tool_free_model_payload,
+)
 from model_client import post_chat as provider_post_chat
 
 
@@ -195,28 +200,41 @@ class N8nAgentModelRuntime:
                 )
             response: Optional[Any] = None
             try:
-                response = self.post_chat(
-                    settings,
-                    {
-                        "model": model,
-                        "messages": messages,
+                model_payload = {
+                    "model": model,
+                    "messages": messages,
+                    "stream": False,
+                    "options": {"temperature": 0.1, "num_predict": 2400},
+                }
+                with get_model_gateway().post_chat_sync(
+                    context=model_hook_context(
+                        runtime="n8n_agent",
+                        model=model,
+                        project_id=project_id or None,
+                        session_id=security.get("session_id"),
+                        run_id=security.get("run_id"),
+                        metadata={"attempt": attempt + 1},
+                    ),
+                    settings=settings,
+                    payload=model_payload,
+                    post_chat=self.post_chat,
+                    post_chat_kwargs={
                         "stream": False,
-                        "options": {"temperature": 0.1, "num_predict": 2400},
+                        "timeout": (10, 240),
+                        "project_id": project_id or None,
                     },
-                    stream=False,
-                    timeout=(10, 240),
-                    project_id=project_id or None,
-                )
-                if int(getattr(response, "status_code", 500)) >= 400:
-                    raise N8nAgentModelError("N8N_AGENT_MODEL_REJECTED", "The selected model rejected the Agent task.")
-                payload = response.json()
-                text = str((payload.get("message") or {}).get("content") or "")
-                if len(text) > MAX_MODEL_OUTPUT_CHARS:
-                    last_error = "output exceeded the configured limit"
-                    continue
-                result = dict(_parse_object(text))
-                _validate_value(result, schema)
-                return json.loads(_canonical(result))
+                    validator=validate_tool_free_model_payload,
+                ) as gateway_call:
+                    response = gateway_call.response
+                    if int(getattr(response, "status_code", 500)) >= 400:
+                        raise N8nAgentModelError("N8N_AGENT_MODEL_REJECTED", "The selected model rejected the Agent task.")
+                    payload = response.json()
+                    text = str((payload.get("message") or {}).get("content") or "")
+                    if len(text) > MAX_MODEL_OUTPUT_CHARS:
+                        raise ValueError("output exceeded the configured limit")
+                    result = dict(_parse_object(text))
+                    _validate_value(result, schema)
+                    return json.loads(_canonical(result))
             except N8nAgentModelError:
                 raise
             except ValueError as exc:

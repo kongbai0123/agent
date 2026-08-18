@@ -15,6 +15,7 @@
         runs: [],
         selectedRun: null,
         selectedRequestId: 0,
+        inspectorLease: null,
         eventSource: null,
         eventRetryTimer: null,
         eventMailRevision: '',
@@ -32,6 +33,27 @@
     const array = value => Array.isArray(value) ? value : [];
     const string = value => String(value == null ? '' : value);
     const encoded = value => encodeURIComponent(string(value));
+
+    function workflowWorkspaceActive() {
+        return state.initialized && state.dom?.center?.hidden === false;
+    }
+
+    function mailOwner(runId) {
+        return `mail:${string(runId).trim()}`;
+    }
+
+    function claimMailInspector(runId) {
+        if (!workflowWorkspaceActive() || !runId) return null;
+        const lease = window.workbenchRunInspector?.claimContentOwner?.(mailOwner(runId)) || null;
+        state.inspectorLease = lease;
+        return lease;
+    }
+
+    function ownsMailInspector(lease = state.inspectorLease) {
+        return !!lease
+            && workflowWorkspaceActive()
+            && window.workbenchRunInspector?.contentOwnerMatches?.(lease) === true;
+    }
 
     function element(tag, className = '', text = null) {
         const node = document.createElement(tag);
@@ -321,7 +343,7 @@
             badge.textContent = count > 99 ? '99+' : string(count);
         });
         const executionLabel = count > 0
-            ? `執行狀態；${count} 封郵件等待核准，啟用以開啟第一封`
+            ? `執行狀態；另有 ${count} 封郵件等待核准，可從工作流程中心開啟`
             : '執行狀態';
         state.dom.executionTab.setAttribute('aria-label', executionLabel);
         state.dom.executionTab.title = executionLabel;
@@ -618,8 +640,8 @@
         state.deps.createIcons?.();
     }
 
-    function showMailInspector() {
-        if (!state.selectedRun) return;
+    function showMailInspector(lease = state.inspectorLease) {
+        if (!state.selectedRun || !ownsMailInspector(lease)) return;
         state.dom.chatExecution.hidden = true;
         state.dom.chatResults.hidden = true;
         state.dom.mailExecution.hidden = false;
@@ -629,7 +651,9 @@
 
     function useChatInspectorContext({ open = true } = {}) {
         state.selectedRun = null;
+        state.inspectorLease = null;
         ++state.selectedRequestId;
+        window.workbenchRunInspector?.claimContentOwner?.('chat');
         state.dom.chatExecution.hidden = false;
         state.dom.chatResults.hidden = false;
         state.dom.mailExecution.hidden = true;
@@ -719,6 +743,8 @@
     async function loadRun(runId, { openInspector = true } = {}) {
         if (!runId) return;
         const requestId = ++state.selectedRequestId;
+        const lease = openInspector ? claimMailInspector(runId) : state.inspectorLease;
+        if (!lease || lease.owner !== mailOwner(runId) || !ownsMailInspector(lease)) return;
         if (openInspector) {
             state.dom.mailExecution.replaceChildren(empty('載入郵件執行…'));
             state.dom.mailResults.replaceChildren(empty('載入郵件結果…'));
@@ -730,13 +756,20 @@
         }
         try {
             const payload = await request(`/api/integrations/n8n/mail-runs/${encoded(runId)}`);
-            if (requestId !== state.selectedRequestId) return;
-            state.selectedRun = runFrom(payload.run || payload.mail_run || payload);
+            if (requestId !== state.selectedRequestId || !ownsMailInspector(lease)) return;
+            const selectedRun = runFrom(payload.run || payload.mail_run || payload);
+            const authoritativeProject = string(state.profile?.projectId).trim();
+            if (!authoritativeProject || selectedRun.projectId !== authoritativeProject) {
+                useChatInspectorContext({ open: false });
+                state.deps.showToast?.('郵件執行不屬於目前的 Project，已停止顯示。', 'error');
+                return;
+            }
+            state.selectedRun = selectedRun;
             renderMailExecution();
             renderMailResults();
-            showMailInspector();
+            showMailInspector(lease);
         } catch (error) {
-            if (requestId !== state.selectedRequestId) return;
+            if (requestId !== state.selectedRequestId || !ownsMailInspector(lease)) return;
             state.dom.mailExecution.replaceChildren(empty(`無法載入郵件執行：${error.message}`, 'is-error'));
             state.dom.mailResults.replaceChildren(empty('此郵件結果目前無法顯示。', 'is-error'));
         }
@@ -1048,6 +1081,7 @@
 
     function close() {
         state.dom.center.hidden = true;
+        useChatInspectorContext({ open: false });
     }
 
     function init(options = {}) {
@@ -1092,22 +1126,12 @@
         [state.dom.profileProject, state.dom.profileInstruction, state.dom.profileModel,
             state.dom.profileEnabled, state.dom.profileAutoStart]
             .forEach(control => control.addEventListener('input', markProfileDirty));
+        state.dom.profileProject.addEventListener('change', () => useChatInspectorContext({ open: false }));
         state.dom.profileForm.addEventListener('submit', saveProfile);
         state.dom.composeForm.addEventListener('submit', createCompose);
         state.dom.serviceStart.addEventListener('click', () => void serviceAction('start', state.dom.serviceStart));
         state.dom.serviceStop.addEventListener('click', () => void serviceAction('stop', state.dom.serviceStop));
         state.dom.serviceOpen.addEventListener('click', openEditor);
-        const openPendingFromExecution = event => {
-            if (event.type === 'keydown' && !['Enter', ' '].includes(event.key)) return;
-            const pending = state.runs.find(run => PENDING_STATUSES.has(run.status));
-            if (!pending) return;
-            event.preventDefault();
-            event.stopImmediatePropagation();
-            void openRun(pending.id);
-        };
-        state.dom.executionTab.addEventListener('click', openPendingFromExecution, { capture: true });
-        state.dom.executionTab.addEventListener('keydown', openPendingFromExecution, { capture: true });
-
         state.profile = profileFrom({});
         renderProfile();
         renderService();

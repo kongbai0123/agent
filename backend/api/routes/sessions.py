@@ -30,6 +30,9 @@ def build_sessions_router(
     session_change_guard: Optional[
         Callable[[str, str, Optional[Dict[str, Any]]], None]
     ] = None,
+    session_lifecycle_observer: Optional[
+        Callable[[str, Dict[str, Any]], None]
+    ] = None,
 ) -> APIRouter:
     router = APIRouter(tags=["sessions"])
     @router.post("/api/sessions")
@@ -44,6 +47,7 @@ def build_sessions_router(
                 ),
             )
         sid = req.session_id or create_id("sess")
+        existed = database.get_session(sid) is not None
         if req.project_id and not database.get_project(req.project_id):
             raise HTTPException(
                 status_code=404,
@@ -62,6 +66,14 @@ def build_sessions_router(
         )
         ensure_session_folder(sid, req.title or "New chat", req.mode, req.model)
         sync_session_archive(sid)
+        if not existed and session_lifecycle_observer is not None:
+            try:
+                session_lifecycle_observer(
+                    "created",
+                    {"session_id": sid, "project_id": req.project_id, "model": req.model},
+                )
+            except Exception:
+                pass
         return {
             "session_id": sid,
             "id": sid,
@@ -183,12 +195,26 @@ def build_sessions_router(
 
     @router.delete("/api/sessions/{session_id}")
     def api_delete_session(session_id: str):
+        existing = database.get_session(session_id)
         if session_change_guard is not None:
             session_change_guard(session_id, "delete", None)
         sync_session_archive(session_id)
         archived_to = archive_session(session_id)
+        deleted = database.delete_session(session_id)
+        if deleted and existing and session_lifecycle_observer is not None:
+            try:
+                session_lifecycle_observer(
+                    "deleted",
+                    {
+                        "session_id": session_id,
+                        "project_id": existing.get("project_id"),
+                        "model": existing.get("model"),
+                    },
+                )
+            except Exception:
+                pass
         return {
-            "success": database.delete_session(session_id),
+            "success": deleted,
             "archived_to": str(archived_to) if archived_to else None,
         }
 

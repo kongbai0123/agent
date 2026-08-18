@@ -55,8 +55,8 @@ def test_floating_output_uses_its_own_vertical_tab_toggle():
     assert "if (toggle && state.activeTab === name && state.expanded)" in RUN_INSPECTOR_JS
     for key in ("ArrowDown", "ArrowUp", "Home", "End", "Enter"):
         assert key in RUN_INSPECTOR_JS
-    assert "app.js?v=0.8.0-n8n-graph-authoring-beta.1" in INDEX_HTML
-    assert "run-inspector.js?v=1.0.0" in INDEX_HTML
+    assert "app.js?v=0.8.0-n8n-graph-authoring-beta.4" in INDEX_HTML
+    assert "run-inspector.js?v=1.0.2" in INDEX_HTML
 
 
 def test_output_skills_own_the_project_scoped_renderer_and_cache():
@@ -187,16 +187,21 @@ def test_output_panel_has_compact_and_responsive_layout_contracts():
     assert "position: fixed" in floating
     assert "top: 86px" in floating
     assert "right: 0" in floating
-    assert "z-index: 230" in floating
+    assert "z-index: var(--z-floating-inspector)" in floating
     tabs = STYLE_CSS[STYLE_CSS.index(".output-floating-tabs {"):STYLE_CSS.index(".output-floating-tab {")]
     assert "flex-direction: column" in tabs
-    assert "@media (max-width: 900px)" in STYLE_CSS
+    assert "@media (max-width: 1180px)" in STYLE_CSS
     assert ".output-floating-workspace { top: 72px; }" in STYLE_CSS
     assert ".output-floating-panel { width: min(380px, calc(100vw - 58px));" in STYLE_CSS
     assert "@media (max-width: 640px)" in STYLE_CSS
     assert ".output-floating-workspace { top: 64px; }" in STYLE_CSS
     assert ".output-floating-panel { width: calc(100vw - 54px);" in STYLE_CSS
-    assert "html.run-inspector-open .task-progress-center" in STYLE_CSS
+    assert (
+        "html.run-inspector-open:has(#output-floating-workspace:not([hidden]))"
+        ":not(:has(#artifacts-sandbox-panel.active))"
+        ":not(:has(#agent-collaboration-panel:not([hidden]))) .task-progress-center"
+        in STYLE_CSS
+    )
     assert "html.run-inspector-open .output-floating-panel" in STYLE_CSS
     assert "beforeOpen: prepareRunInspectorOpen" in APP_JS
     assert "setOutputFloatingPanelOpen(false);" in _function_slice(
@@ -207,16 +212,57 @@ def test_output_panel_has_compact_and_responsive_layout_contracts():
     )
 
 
+def test_output_panel_tracks_workspace_escape_focus_and_runtime_resize():
+    workspace = _function_slice(
+        APP_JS,
+        "function setPrimaryWorkspace",
+        "function initWorkbench",
+    )
+    assert (
+        "workbenchRunInspector?.setAvailable?.(!extensionMode"
+        in workspace
+    )
+    assert "runInspectorSuspendedWorkspace === primaryWorkspace" in workspace
+    assert "workflowMode && !returningToSuspendedWorkspace" in workspace
+    assert "syncChatDrawerA11y(drawer)" in workspace
+
+    a11y = _function_slice(APP_JS, "function initA11y", "let primaryWorkspace")
+    assert "workbenchRunInspector?.isOpen?.()" in a11y
+    assert (
+        "setOutputFloatingPanelOpen(false, { restoreFocus: true })" in a11y
+    )
+
+    progress = _function_slice(
+        APP_JS,
+        "function syncRightSidebarForViewport",
+        "window.WorkbenchProgress",
+    )
+    assert "window.matchMedia('(max-width: 1180px)').matches" in progress
+    assert "setTaskProgressCollapsed(true)" in progress
+    assert "collapseCompactChatDrawer" in progress
+    assert (
+        "window.addEventListener('resize', syncRightSidebarForViewport"
+        in progress
+    )
+
+    assert "available: true" in RUN_INSPECTOR_JS
+    assert "expandedBeforeUnavailable: true" in RUN_INSPECTOR_JS
+    assert "function setAvailable(available, { focusTarget = null } = {})" in RUN_INSPECTOR_JS
+    assert "dom.workspace.hidden = !state.available" in RUN_INSPECTOR_JS
+    assert "pane.hidden = !selected || !visible" in RUN_INSPECTOR_JS
+    assert "dom.panel.setAttribute('aria-hidden'" in RUN_INSPECTOR_JS
+
+
 def test_open_output_panel_reserves_chat_without_widening_the_reading_column():
     desktop = STYLE_CSS[
-        STYLE_CSS.index("/* Run Inspector: reserve the reading surface instead of covering chat."):
-        STYLE_CSS.index("/* A side-by-side inspector would leave an unusably narrow reading column")
+        STYLE_CSS.index("/* Right-surface workspace contract."):
+        STYLE_CSS.index("/* --- Project-organized task sidebar --- */")
     ]
-    assert "@media (min-width: 901px)" in desktop
-    assert "main.chat-container:not([hidden])" in desktop
+    assert "@media (min-width: 1181px)" in desktop
+    assert ".workbench-body > main:not([hidden])" in desktop
     assert "min-width: 0" in desktop
-    assert "margin-right: 62px" in desktop
-    assert "margin-right: calc(clamp(320px, 24vw, 380px) + 62px)" in desktop
+    assert "padding-right: var(--right-rail-safe-area)" in desktop
+    assert "padding-right: var(--right-inspector-safe-area)" in desktop
 
     # The inspector may reduce available space, but must not enlarge the
     # established answer or composer reading widths on wide screens.
@@ -227,14 +273,62 @@ def test_open_output_panel_reserves_chat_without_widening_the_reading_column():
 
 def test_compact_output_panel_docks_above_chat_instead_of_covering_it():
     compact = STYLE_CSS[
-        STYLE_CSS.index("/* A side-by-side inspector would leave an unusably narrow reading column"):
+        STYLE_CSS.index("/* Right-surface workspace contract."):
         STYLE_CSS.index("/* --- Project-organized task sidebar --- */")
     ]
-    assert "@media (max-width: 900px)" in compact
-    assert "margin-right: 54px" in compact
-    assert "margin-top: calc(clamp(216px, 42vh, 360px) + 40px)" in compact
-    assert "height: clamp(216px, 42vh, 360px)" in compact
-    assert "max-height: none" in compact
+    assert "@media (max-width: 1180px)" in compact
+    assert "padding-right: calc(var(--right-tab-rail-width) + 8px)" in compact
+    assert "var(--right-compact-panel-height) + var(--right-compact-panel-offset)" in compact
+    assert "height: var(--right-compact-panel-height)" in compact
+    assert "max-height: var(--right-compact-panel-height)" in compact
     assert "@media (max-width: 640px)" in compact
-    assert "margin-top: calc(clamp(216px, 40vh, 300px) + 32px)" in compact
-    assert "height: clamp(216px, 40vh, 300px)" in compact
+    assert "--right-compact-panel-max: 300px" in compact
+
+
+def test_compact_right_surfaces_are_mutually_exclusive_and_inert_when_hidden():
+    drawer_helpers = _function_slice(
+        APP_JS,
+        "function syncChatDrawerA11y",
+        "function syncRightSidebarForViewport",
+    )
+    assert "drawer.inert = !expanded" in drawer_helpers
+    assert "drawer.setAttribute('inert', '')" in drawer_helpers
+    assert "rail-chat')?.setAttribute('aria-expanded'" in drawer_helpers
+    assert "classList.remove('active')" not in drawer_helpers
+
+    output_open = _function_slice(
+        APP_JS,
+        "function prepareRunInspectorOpen",
+        "function updateTaskProgress",
+    )
+    assert "collapseCompactChatDrawer()" in output_open
+
+    artifact_open = _function_slice(APP_JS, "function openInspector", "function renderContextPane")
+    agent_open = _function_slice(
+        APP_JS,
+        "function openAgentCollaboration",
+        "function closeAgentCollaboration",
+    )
+    assert "collapseCompactChatDrawer()" in artifact_open
+    assert "collapseCompactChatDrawer()" in agent_open
+
+    workbench = _function_slice(APP_JS, "function initWorkbench", "// Top Bar chips")
+    assert "onWorkspaceClose: () => {" in workbench
+    assert "document.getElementById('rail-chat')?.focus()" in workbench
+    rail_chat = workbench[workbench.index("'rail-chat').addEventListener"):]
+    assert "setOutputFloatingPanelOpen(false)" in rail_chat
+    assert "closeInspectorPanel()" in rail_chat
+    assert "closeAgentCollaboration(true)" in rail_chat
+    assert "syncChatDrawerA11y(drawer)" in rail_chat
+
+    a11y = _function_slice(APP_JS, "function initA11y", "let primaryWorkspace")
+    output_close = a11y.index("setOutputFloatingPanelOpen(false, { restoreFocus: true })")
+    agent_close = a11y.index("closeAgentCollaboration(true)", output_close)
+    artifact_close = a11y.index("closeInspectorPanel()", agent_close)
+    drawer_close = a11y.index("collapseCompactChatDrawer", artifact_close)
+    assert output_close < agent_close < artifact_close < drawer_close
+    assert "railChat?.classList.remove('active')" not in a11y
+
+    assert 'id="rail-chat"' in INDEX_HTML
+    assert 'aria-controls="chat-drawer" aria-expanded="true"' in INDEX_HTML
+    assert 'id="chat-drawer" aria-label="對話清單" aria-hidden="false"' in INDEX_HTML

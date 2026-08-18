@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import ast
 import builtins
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -16,6 +17,14 @@ sys.path.insert(0, str(BACKEND))
 from chat import runtime as chat_runtime
 from basic_chat_services import DisabledRAGEngine, build_rag_service
 from chat_cancellation import ChatRunControl
+from host_tools import HostToolRuntime
+from tool_runtime import (
+    ToolAccess,
+    ToolDefinition,
+    ToolDispatcher,
+    ToolRegistry,
+    ToolScopeState,
+)
 
 
 class FakeDatabase:
@@ -273,6 +282,258 @@ def test_basic_stream_has_no_agent_events_or_tool_payload(monkeypatch):
     assert all("artifacts" not in item["provided"] for item in fake_db.runs)
     assert fake_db.runs[0]["sources"] == assistant["sources"]
     assert fake_db.runs[-1]["sources"] == assistant["sources"]
+
+
+def test_basic_stream_runs_project_scoped_read_tool_before_final_answer(monkeypatch):
+    fake_db = FakeDatabase()
+    monkeypatch.setattr(chat_runtime, "database", fake_db)
+    digest = hashlib.sha256(b"github-test").hexdigest()
+    definition = ToolDefinition(
+        name="github.read_file",
+        description="Read one allowed repository file",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "repository": {"type": "string"},
+                "path": {"type": "string"},
+            },
+            "required": ["repository", "path"],
+            "additionalProperties": False,
+        },
+        access=ToolAccess.READ,
+        handler=lambda call: {"path": call.arguments["path"], "content": "hello"},
+        extension_id="connector.github",
+        manifest_sha256=digest,
+    )
+    registry = ToolRegistry([definition])
+    dispatcher = ToolDispatcher(
+        registry,
+        scope_resolver=lambda _definition, _call: ToolScopeState(
+            installed=True,
+            trusted=True,
+            enabled=True,
+            healthy=True,
+            resource_allowed=True,
+            manifest_sha256=digest,
+        ),
+    )
+
+    class ReadOnlyApprovals:
+        def event_queue(self, _run_id):
+            return asyncio.Queue()
+
+        async def approval_callback(self, _request):
+            raise AssertionError("read tools must not request approval")
+
+        def mark_consumed(self, _approval_id):
+            return None
+
+        def close_run(self, _run_id):
+            return None
+
+    runtime = HostToolRuntime(
+        registry=registry,
+        dispatcher=dispatcher,
+        approval_broker=ReadOnlyApprovals(),
+    )
+    tool_response = FakeResponse([
+        json.dumps({
+            "message": {
+                "content": "",
+                "tool_calls": [{
+                    "id": "call-1",
+                    "function": {
+                        "name": "github.read_file",
+                        "arguments": {"repository": "owner/repo", "path": "README.md"},
+                    },
+                }],
+            },
+            "done": True,
+            "prompt_eval_count": 10,
+            "eval_count": 2,
+            "done_reason": "tool_calls",
+        }).encode("utf-8")
+    ])
+    final_response = FakeResponse([
+        encoded_chunk("The README says hello."),
+        encoded_chunk(done=True, prompt_eval_count=12, eval_count=5, done_reason="stop"),
+    ])
+    captured_payloads = []
+
+    def fake_post_chat(_settings, payload, **_kwargs):
+        captured_payloads.append(payload)
+        return tool_response if len(captured_payloads) == 1 else final_response
+
+    control = ChatRunControl(
+        "run_tools", "sess_basic", "turn_current", "model-a", "chat"
+    )
+    control.start_deadline(60)
+    events = parse_sse(asyncio.run(collect_stream(
+        request=SimpleNamespace(messages=[]),
+        settings={"ollama_url": "http://127.0.0.1:11434", "model_provider": "ollama"},
+        model="model-a",
+        session_id="sess_basic",
+        turn_id="turn_current",
+        run_id="run_tools",
+        prompt_sha256="digest",
+        user_message_id=3,
+        user_query="read the README",
+        temporary_context="",
+        images=[],
+        run_control=control,
+        project_id="project-one",
+        post_chat=fake_post_chat,
+        host_tool_runtime=runtime,
+    )))
+
+    names = [event for event, _payload in events]
+    assert names == ["meta", "tool_start", "tool_end", "token", "metrics", "done"]
+    assert captured_payloads[0]["tools"][0]["function"]["name"] == "github.read_file"
+    assert any(message.get("role") == "tool" for message in captured_payloads[1]["messages"])
+    assert fake_db.messages[-1]["content"] == "The README says hello."
+    assert fake_db.runs[-1]["metrics"]["model_eval"]["tool_calls"] == 1
+
+
+def test_basic_stream_never_retries_an_indeterminate_external_write(monkeypatch):
+    fake_db = FakeDatabase()
+    monkeypatch.setattr(chat_runtime, "database", fake_db)
+    digest = hashlib.sha256(b"github-write-test").hexdigest()
+    executions = []
+
+    def uncertain_write(call):
+        executions.append(dict(call.arguments))
+        raise TimeoutError("connection ended after dispatch")
+
+    definition = ToolDefinition(
+        name="github.create_issue",
+        description="Create one issue after approval",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "repository": {"type": "string"},
+                "title": {"type": "string"},
+            },
+            "required": ["repository", "title"],
+            "additionalProperties": False,
+        },
+        access=ToolAccess.WRITE,
+        handler=uncertain_write,
+        extension_id="connector.github",
+        manifest_sha256=digest,
+        risk_level="external_write",
+    )
+    registry = ToolRegistry([definition])
+    dispatcher = ToolDispatcher(
+        registry,
+        scope_resolver=lambda _definition, _call: ToolScopeState(
+            installed=True,
+            trusted=True,
+            enabled=True,
+            healthy=True,
+            resource_allowed=True,
+            manifest_sha256=digest,
+        ),
+    )
+
+    class AutoApprove:
+        def event_queue(self, _run_id):
+            return asyncio.Queue()
+
+        async def approval_callback(self, _request):
+            return True
+
+        def mark_consumed(self, _approval_id):
+            return None
+
+        def close_run(self, _run_id):
+            return None
+
+    runtime = HostToolRuntime(
+        registry=registry,
+        dispatcher=dispatcher,
+        approval_broker=AutoApprove(),
+    )
+    first_response = FakeResponse([
+        json.dumps({
+            "message": {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "write-1",
+                        "function": {
+                            "name": "github.create_issue",
+                            "arguments": {
+                                "repository": "owner/repo",
+                                "title": "First",
+                            },
+                        },
+                    },
+                    {
+                        "id": "write-2",
+                        "function": {
+                            "name": "github.create_issue",
+                            "arguments": {
+                                "repository": "owner/repo",
+                                "title": "Must not execute",
+                            },
+                        },
+                    },
+                ],
+            },
+            "done": True,
+            "done_reason": "tool_calls",
+        }).encode("utf-8")
+    ])
+    final_response = FakeResponse([
+        encoded_chunk("Please verify GitHub before trying again."),
+        encoded_chunk(done=True, done_reason="stop"),
+    ])
+    captured_payloads = []
+
+    def fake_post_chat(_settings, payload, **_kwargs):
+        captured_payloads.append(payload)
+        return first_response if len(captured_payloads) == 1 else final_response
+
+    control = ChatRunControl(
+        "run_unknown_write", "sess_basic", "turn_current", "model-a", "chat"
+    )
+    control.start_deadline(60)
+    events = parse_sse(asyncio.run(collect_stream(
+        request=SimpleNamespace(messages=[]),
+        settings={"ollama_url": "http://127.0.0.1:11434", "model_provider": "ollama"},
+        model="model-a",
+        session_id="sess_basic",
+        turn_id="turn_current",
+        run_id="run_unknown_write",
+        prompt_sha256="digest",
+        user_message_id=3,
+        user_query="create the issue",
+        temporary_context="",
+        images=[],
+        run_control=control,
+        project_id="project-one",
+        post_chat=fake_post_chat,
+        host_tool_runtime=runtime,
+    )))
+
+    assert executions == [{"repository": "owner/repo", "title": "First"}]
+    assert len(captured_payloads) == 2
+    forced = captured_payloads[1]
+    assert forced["tool_choice"] == "none"
+    assert "tools" not in forced
+    assert "Do not call or retry any tool" in forced["messages"][-1]["content"]
+    tool_results = [
+        json.loads(message["content"])
+        for message in forced["messages"]
+        if message.get("role") == "tool"
+    ]
+    assert [item["code"] for item in tool_results] == [
+        "EXECUTION_UNKNOWN",
+        "TOOL_SKIPPED_AFTER_EXECUTION_UNKNOWN",
+    ]
+    assert any(payload.get("result") == "TOOL_SKIPPED_AFTER_EXECUTION_UNKNOWN" for name, payload in events if name == "tool_end")
+    assert fake_db.messages[-1]["content"] == "Please verify GitHub before trying again."
+    assert fake_db.runs[-1]["metrics"]["model_eval"]["execution_unknown"] is True
 
 
 def test_basic_terminal_event_failure_does_not_reverse_durable_completion(
@@ -593,7 +854,8 @@ def test_frontend_forces_basic_chat_and_hides_collaboration_panel():
     assert "!BASIC_CHAT_MODE && question.startsWith('/skill')" in source
     assert "skill_ids: explicitSkillIds" in source  # accepted for compatibility; backend ignores it
     assert "railAgents.hidden = true;" in basic_mode
-    assert "'rail-knowledge', 'rail-runs', 'rail-artifacts', 'rail-extensions'" in basic_mode
+    assert "'rail-knowledge', 'rail-runs', 'rail-artifacts'" in basic_mode
+    assert "'rail-extensions'" not in basic_mode
     assert "'[data-target=\"tab-settings-agent\"]'" in basic_mode
     assert "'[data-itab=\"safir\"]'" in basic_mode
     assert "basicPaletteActions" in source

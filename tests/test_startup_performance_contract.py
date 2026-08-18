@@ -15,7 +15,12 @@ APP_UI = (ROOT / "frontend" / "app.js").read_text(encoding="utf-8")
 
 
 def test_optional_integrations_do_not_block_asgi_readiness():
-    lifespan = APP[APP.index("async def app_lifespan"):APP.index("ensure_runtime_dirs()")]
+    # The outer lifespan owns process-wide gate cleanup, while the inner
+    # runtime lifespan owns optional integration startup.  Inspect both so
+    # this contract follows the actual startup boundary after that split.
+    lifespan = APP[
+        APP.index("async def _app_runtime_lifespan") : APP.index("ensure_runtime_dirs()")
+    ]
     assert "await supervisor.probe_once()" not in lifespan
     assert "_schedule_n8n_runtime_start(lifecycle)" in lifespan
     assert "await asyncio.to_thread(lifecycle.start)" not in lifespan

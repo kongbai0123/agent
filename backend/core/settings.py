@@ -11,6 +11,7 @@ from typing import Any, Dict, Mapping
 from urllib.parse import urlsplit
 
 from provider_connections import normalize_provider_settings
+from subprocess_env import is_allowed_subprocess_env_name, is_secret_env_name
 
 
 DEFAULT_SETTINGS: Dict[str, Any] = {
@@ -20,6 +21,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "openai_compatible_url": "http://127.0.0.1:1234/v1",
     "openai_api_key_env": "OPENAI_API_KEY",
     "model_providers": [],
+    "mcp_servers": [],
     "model_input_cost_per_million": 0.0,
     "model_output_cost_per_million": 0.0,
     "model_cost_currency": "USD",
@@ -59,6 +61,69 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,79}$")
 _SAFE_CAPABILITY_RE = re.compile(r"^[a-z][a-z0-9_.:-]{0,127}$")
 _PROJECT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+_MCP_ID_RE = re.compile(r"^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$")
+_MCP_SECRET_ALIAS_RE = re.compile(
+    r"^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$"
+)
+_MCP_SHA256_RE = re.compile(r"^[a-f0-9]{64}$")
+_MCP_SHELL_SUFFIXES = frozenset({".bat", ".cmd", ".ps1", ".sh"})
+_MCP_SHELL_EXECUTABLES = frozenset(
+    {
+        "bash",
+        "bash.exe",
+        "cmd",
+        "cmd.exe",
+        "cscript",
+        "cscript.exe",
+        "dash",
+        "fish",
+        "ksh",
+        "powershell",
+        "powershell.exe",
+        "pwsh",
+        "pwsh.exe",
+        "sh",
+        "sh.exe",
+        "wscript",
+        "wscript.exe",
+        "wsl",
+        "wsl.exe",
+        "zsh",
+    }
+)
+_MCP_SERVER_FIELDS = frozenset(
+    {
+        "id",
+        "label",
+        "transport",
+        "executable",
+        "expected_executable_sha256",
+        "argv",
+        "cwd",
+        "allowed_cwd_roots",
+        "environment_keys",
+        "secret_aliases",
+        "tool_policies",
+        "timeout_seconds",
+        "enabled",
+    }
+)
+_MCP_RISK_LEVELS = frozenset(
+    {
+        "read",
+        "external_read",
+        "verify",
+        "write",
+        "external_write",
+        "system",
+        "irreversible",
+    }
+)
+_MCP_READ_RISKS = frozenset({"read", "external_read", "verify"})
+_MCP_TOOL_POLICY_FIELDS = frozenset(
+    {"access", "risk_level", "requires_connection", "requires_resource"}
+)
+_MCP_MAX_SERVERS = 16
 HERMES_PERCENTAGE_LADDER = (5.0, 25.0, 50.0)
 _HERMES_FIXED_ROLLOUT_STAGE = {
     "disabled": 0,
@@ -133,6 +198,289 @@ def _bounded_string_list(
     return result
 
 
+def _mcp_local_path(value: object, *, field: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{field} must be an absolute local path.")
+    text = value.strip()
+    if (
+        not text
+        or len(text) > 1024
+        or any(ord(char) < 32 for char in text)
+        or re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://", text)
+        or text.casefold().startswith("file:")
+        or text.startswith(("\\\\", "//", "\\\\?\\", "\\\\.\\"))
+    ):
+        raise ValueError(f"{field} must be an absolute local path.")
+    path = Path(text).expanduser()
+    if not path.is_absolute():
+        raise ValueError(f"{field} must be an absolute local path.")
+    return os.path.normpath(str(path))
+
+
+def _mcp_path_within(path: str, roots: list[str]) -> bool:
+    try:
+        normalized_path = os.path.normcase(os.path.abspath(path))
+        return any(
+            os.path.commonpath(
+                [normalized_path, os.path.normcase(os.path.abspath(root))]
+            )
+            == os.path.normcase(os.path.abspath(root))
+            for root in roots
+        )
+    except (OSError, ValueError):
+        return False
+
+
+def _mcp_string_array(
+    value: object,
+    *,
+    field: str,
+    maximum_items: int,
+    item_maximum: int,
+) -> list[str]:
+    if value is None:
+        return []
+    if not isinstance(value, list) or len(value) > maximum_items:
+        raise ValueError(f"{field} must be a bounded array of strings.")
+    result: list[str] = []
+    for item in value:
+        if (
+            not isinstance(item, str)
+            or len(item) > item_maximum
+            or "\x00" in item
+            or any(ord(char) < 32 for char in item)
+        ):
+            raise ValueError(f"{field} contains an invalid string.")
+        result.append(item)
+    return result
+
+
+def _normalize_mcp_environment_keys(value: object) -> list[str]:
+    keys = _mcp_string_array(
+        value,
+        field="mcp_servers.environment_keys",
+        maximum_items=64,
+        item_maximum=80,
+    )
+    result: list[str] = []
+    seen: set[str] = set()
+    for key in keys:
+        normalized = key.strip().upper()
+        if (
+            not _ENV_NAME_RE.fullmatch(normalized)
+            or is_secret_env_name(normalized)
+            or not is_allowed_subprocess_env_name(normalized)
+        ):
+            raise ValueError(
+                "mcp_servers.environment_keys accepts only operational allowlisted names."
+            )
+        if normalized not in seen:
+            result.append(normalized)
+            seen.add(normalized)
+    return result
+
+
+def _normalize_mcp_secret_aliases(value: object) -> dict[str, str]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict) or len(value) > 64:
+        raise ValueError("mcp_servers.secret_aliases must be a bounded object.")
+    result: dict[str, str] = {}
+    for raw_name, raw_alias in value.items():
+        if not isinstance(raw_name, str) or not isinstance(raw_alias, str):
+            raise ValueError("mcp_servers.secret_aliases contains an invalid entry.")
+        name = raw_name.strip().upper()
+        alias = raw_alias.strip().casefold()
+        if not _ENV_NAME_RE.fullmatch(name) or not is_secret_env_name(name):
+            raise ValueError(
+                "mcp_servers.secret_aliases keys must be credential environment names."
+            )
+        if (
+            not _MCP_SECRET_ALIAS_RE.fullmatch(alias)
+            or len(alias) > 128
+            or alias.startswith(("sk-", "ghp_", "gho_", "ghu_", "ghs_", "github_pat_"))
+        ):
+            raise ValueError(
+                "mcp_servers.secret_aliases values must be non-secret alias identifiers."
+            )
+        result[name] = alias
+    return result
+
+
+def _normalize_mcp_tool_policies(value: object) -> dict[str, dict[str, Any]]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict) or len(value) > 128:
+        raise ValueError("mcp_servers.tool_policies must be a bounded object.")
+    result: dict[str, dict[str, Any]] = {}
+    for raw_name, raw_policy in value.items():
+        if (
+            not isinstance(raw_name, str)
+            or not raw_name.strip()
+            or len(raw_name) > 128
+            or any(ord(char) < 32 for char in raw_name)
+            or not isinstance(raw_policy, dict)
+        ):
+            raise ValueError("mcp_servers.tool_policies contains an invalid tool.")
+        unknown = set(raw_policy) - _MCP_TOOL_POLICY_FIELDS
+        if unknown:
+            raise ValueError(
+                "mcp_servers.tool_policies contains unknown policy fields."
+            )
+        access = raw_policy.get("access")
+        risk_level = raw_policy.get("risk_level")
+        if access not in {"read", "write"} or risk_level not in _MCP_RISK_LEVELS:
+            raise ValueError("mcp_servers.tool_policies contains an invalid policy.")
+        if access == "write" and risk_level in _MCP_READ_RISKS:
+            raise ValueError(
+                "mcp_servers write tools require a write-class risk level."
+            )
+        requires_connection = raw_policy.get("requires_connection", False)
+        requires_resource = raw_policy.get("requires_resource", False)
+        if type(requires_connection) is not bool or type(requires_resource) is not bool:
+            raise ValueError(
+                "mcp_servers tool policy flags must be booleans."
+            )
+        result[raw_name.strip()] = {
+            "access": access,
+            "risk_level": risk_level,
+            "requires_connection": requires_connection,
+            "requires_resource": requires_resource,
+        }
+    return result
+
+
+def normalize_mcp_servers(value: object) -> list[dict[str, Any]]:
+    """Validate the persistable, non-secret local stdio MCP configuration."""
+
+    if value is None:
+        return []
+    if not isinstance(value, list) or len(value) > _MCP_MAX_SERVERS:
+        raise ValueError(f"mcp_servers must contain at most {_MCP_MAX_SERVERS} entries.")
+    result: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for raw in value:
+        if not isinstance(raw, dict):
+            raise ValueError("Each mcp_servers entry must be an object.")
+        unknown = set(raw) - _MCP_SERVER_FIELDS
+        if unknown:
+            raise ValueError("mcp_servers contains unknown fields.")
+        raw_id = raw.get("id")
+        if not isinstance(raw_id, str):
+            raise ValueError("mcp_servers.id is invalid.")
+        server_id = raw_id.strip().casefold()
+        if (
+            not _MCP_ID_RE.fullmatch(server_id)
+            or len(server_id) > 64
+            or server_id in seen_ids
+        ):
+            raise ValueError("mcp_servers IDs must be unique safe identifiers.")
+        seen_ids.add(server_id)
+
+        raw_label = raw.get("label", server_id)
+        if not isinstance(raw_label, str):
+            raise ValueError("mcp_servers.label is invalid.")
+        label = raw_label.strip()
+        if (
+            not label
+            or len(label) > 80
+            or any(ord(char) < 32 for char in label)
+        ):
+            raise ValueError("mcp_servers.label is invalid.")
+        if raw.get("transport", "stdio") != "stdio":
+            raise ValueError("mcp_servers supports only the local stdio transport.")
+
+        executable = _mcp_local_path(
+            raw.get("executable"),
+            field="mcp_servers.executable",
+        )
+        executable_path = Path(executable)
+        if (
+            executable_path.suffix.casefold() in _MCP_SHELL_SUFFIXES
+            or executable_path.name.casefold() in _MCP_SHELL_EXECUTABLES
+        ):
+            raise ValueError("mcp_servers executable cannot be a shell or script host.")
+        executable_sha256 = raw.get("expected_executable_sha256")
+        if executable_sha256 is not None and (
+            not isinstance(executable_sha256, str)
+            or not _MCP_SHA256_RE.fullmatch(executable_sha256)
+        ):
+            raise ValueError(
+                "mcp_servers.expected_executable_sha256 must be a lowercase SHA-256."
+            )
+
+        argv = _mcp_string_array(
+            raw.get("argv"),
+            field="mcp_servers.argv",
+            maximum_items=64,
+            item_maximum=2048,
+        )
+        raw_roots = raw.get("allowed_cwd_roots")
+        if not isinstance(raw_roots, list) or not raw_roots or len(raw_roots) > 16:
+            raise ValueError(
+                "mcp_servers.allowed_cwd_roots requires 1 to 16 local paths."
+            )
+        roots: list[str] = []
+        seen_roots: set[str] = set()
+        for root in raw_roots:
+            normalized = _mcp_local_path(
+                root,
+                field="mcp_servers.allowed_cwd_roots",
+            )
+            identity = os.path.normcase(normalized)
+            if identity not in seen_roots:
+                roots.append(normalized)
+                seen_roots.add(identity)
+        cwd = raw.get("cwd")
+        normalized_cwd = (
+            _mcp_local_path(cwd, field="mcp_servers.cwd")
+            if cwd is not None
+            else None
+        )
+        if normalized_cwd is not None and not _mcp_path_within(normalized_cwd, roots):
+            raise ValueError("mcp_servers.cwd must be inside an allowed cwd root.")
+
+        environment_keys = _normalize_mcp_environment_keys(
+            raw.get("environment_keys")
+        )
+        secret_aliases = _normalize_mcp_secret_aliases(raw.get("secret_aliases"))
+        if set(environment_keys) & set(secret_aliases):
+            raise ValueError(
+                "mcp_servers environment keys cannot also be secret aliases."
+            )
+        tool_policies = _normalize_mcp_tool_policies(raw.get("tool_policies"))
+        timeout = raw.get("timeout_seconds", 30)
+        if type(timeout) not in {int, float}:
+            raise ValueError("mcp_servers.timeout_seconds must be a number.")
+        timeout_seconds = float(timeout)
+        if not 30 <= timeout_seconds <= 60:
+            raise ValueError(
+                "mcp_servers.timeout_seconds must be between 30 and 60 seconds."
+            )
+        enabled = raw.get("enabled", False)
+        if type(enabled) is not bool:
+            raise ValueError("mcp_servers.enabled must be a boolean.")
+
+        item: dict[str, Any] = {
+            "id": server_id,
+            "label": label,
+            "transport": "stdio",
+            "executable": executable,
+            "argv": argv,
+            "cwd": normalized_cwd,
+            "allowed_cwd_roots": roots,
+            "environment_keys": environment_keys,
+            "secret_aliases": secret_aliases,
+            "tool_policies": tool_policies,
+            "timeout_seconds": timeout_seconds,
+            "enabled": enabled,
+        }
+        if executable_sha256 is not None:
+            item["expected_executable_sha256"] = executable_sha256
+        result.append(item)
+    return result
+
+
 def settings_path() -> Path:
     return Path(
         os.environ.get("WORKBENCH_SETTINGS_PATH")
@@ -161,7 +509,17 @@ def load_settings() -> Dict[str, Any]:
         raw = json.loads(path.read_text(encoding="utf-8-sig"))
         if not isinstance(raw, dict):
             return dict(DEFAULT_SETTINGS)
-        return _known_settings(raw)
+        settings = _known_settings(raw)
+        try:
+            settings["mcp_servers"] = normalize_mcp_servers(
+                raw.get("mcp_servers")
+            )
+        except ValueError:
+            # A tampered or legacy executable command must not be revived.
+            # Keep the rest of the user's settings available and fail closed
+            # only for the optional MCP process list.
+            settings["mcp_servers"] = []
+        return settings
     except (OSError, UnicodeError, json.JSONDecodeError):
         return dict(DEFAULT_SETTINGS)
 
@@ -207,6 +565,7 @@ def validate_settings(data: Mapping[str, Any]) -> Dict[str, Any]:
         r"[^A-Za-z0-9_]", "", str(merged.get("openai_api_key_env") or "OPENAI_API_KEY")
     )[:80]
     merged["model_providers"] = normalize_provider_settings(merged.get("model_providers"))
+    merged["mcp_servers"] = normalize_mcp_servers(merged.get("mcp_servers"))
     merged["model_input_cost_per_million"] = max(
         0.0, min(1_000_000.0, float(merged.get("model_input_cost_per_million") or 0.0))
     )
@@ -394,8 +753,14 @@ def validate_settings(data: Mapping[str, Any]) -> Dict[str, Any]:
 def save_settings(data: Mapping[str, Any]) -> None:
     path = settings_path()
     path.parent.mkdir(parents=True, exist_ok=True)
+    persisted = _known_settings(data)
+    # Enforce the same strict boundary even for internal callers that bypass
+    # validate_settings (for example the small UI-state update endpoint).
+    persisted["mcp_servers"] = normalize_mcp_servers(
+        persisted.get("mcp_servers")
+    )
     path.write_text(
-        json.dumps(_known_settings(data), indent=2, ensure_ascii=False) + "\n",
+        json.dumps(persisted, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
     )
 

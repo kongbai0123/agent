@@ -84,6 +84,8 @@ class DeliveryResultRequest(_StrictModel):
 
 
 def _failure(exc: BaseException, error_payload: Callable[..., Dict[str, Any]]) -> HTTPException:
+    if isinstance(exc, HTTPException):
+        return exc
     if isinstance(exc, GmailIntegrationError):
         return HTTPException(
             status_code=exc.status_code,
@@ -105,6 +107,7 @@ def build_n8n_gmail_router(
     service: N8nGmailService,
     require_local: Callable[[Request], None],
     error_payload: Callable[..., Dict[str, Any]],
+    require_extension: Optional[Callable[[str, Optional[str]], Any]] = None,
 ) -> APIRouter:
     """Build the router.  The caller owns mounting and local-middleware bypasses."""
 
@@ -113,8 +116,39 @@ def build_n8n_gmail_router(
     def local(request: Request) -> None:
         require_local(request)
 
+    def require_n8n(project_id: Optional[str] = None) -> None:
+        if require_extension is None:
+            return
+        try:
+            outcome = require_extension("builtin.n8n", project_id)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(
+                status_code=409,
+                detail=error_payload(
+                    str(getattr(exc, "code", "EXTENSION_DISABLED"))[:128],
+                    "The n8n extension is disabled for this Project.",
+                    recoverable=True,
+                ),
+            ) from exc
+        if outcome is False:
+            raise HTTPException(
+                status_code=409,
+                detail=error_payload(
+                    "EXTENSION_DISABLED",
+                    "The n8n extension is disabled for this Project.",
+                    recoverable=True,
+                ),
+            )
+
+    def profile_project_id() -> Optional[str]:
+        value = service.get_profile().get("project_id")
+        return str(value) if value else None
+
     def generate_in_background(draft_id: str) -> None:
         try:
+            require_n8n(profile_project_id())
             service.generate_draft(draft_id)
         except Exception:
             # The service already persists a content-free failure state.
@@ -122,6 +156,7 @@ def build_n8n_gmail_router(
 
     def dispatch_in_background(delivery_id: str) -> None:
         try:
+            require_n8n(profile_project_id())
             service.dispatch_delivery(delivery_id)
         except Exception:
             # The delivery remains approved_queued and records only a safe code.
@@ -146,6 +181,8 @@ def build_n8n_gmail_router(
     def put_profile(payload: ProfileUpdate, request: Request):
         local(request)
         try:
+            if payload.enabled:
+                require_n8n(payload.project_id)
             # Workflow identity, label, recipient and retention are V1 server
             # policy.  They are intentionally absent from the browser request.
             return service.configure_profile(
@@ -184,6 +221,7 @@ def build_n8n_gmail_router(
     def compose(payload: ComposeRequest, request: Request, background: BackgroundTasks):
         local(request)
         try:
+            require_n8n(profile_project_id())
             result = service.compose(payload.model_dump())
             background.add_task(generate_in_background, result["draft_id"])
             return result
@@ -205,6 +243,7 @@ def build_n8n_gmail_router(
     ):
         local(request)
         try:
+            require_n8n(profile_project_id())
             result = service.approve_draft(draft_id, payload.model_dump())
             background.add_task(dispatch_in_background, result["delivery_id"])
             return result
@@ -226,6 +265,7 @@ def build_n8n_gmail_router(
     ):
         local(request)
         try:
+            require_n8n(profile_project_id())
             result = service.regenerate_draft(draft_id, payload.model_dump())
             background.add_task(generate_in_background, draft_id)
             return result
@@ -252,6 +292,7 @@ def build_n8n_gmail_router(
     async def receive_event(request: Request, background: BackgroundTasks):
         payload = await signed_payload(request, InboundEvent)
         try:
+            require_n8n(profile_project_id())
             result = service.receive_event(payload.model_dump())
             if not result["idempotent"] and result.get("draft_id"):
                 background.add_task(generate_in_background, result["draft_id"])
@@ -263,6 +304,7 @@ def build_n8n_gmail_router(
     async def claim_delivery(delivery_id: str, request: Request):
         payload = await signed_payload(request, DeliveryClaimRequest)
         try:
+            require_n8n(profile_project_id())
             return service.claim_delivery(delivery_id, payload.model_dump())
         except Exception as exc:
             raise _failure(exc, error_payload) from exc
@@ -271,6 +313,7 @@ def build_n8n_gmail_router(
     async def complete_delivery(delivery_id: str, request: Request):
         payload = await signed_payload(request, DeliveryResultRequest)
         try:
+            require_n8n(profile_project_id())
             return service.complete_delivery(delivery_id, payload.model_dump())
         except Exception as exc:
             raise _failure(exc, error_payload) from exc

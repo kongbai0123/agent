@@ -59,6 +59,9 @@ def build_hermes_router(
     error_payload: Callable[..., Dict[str, Any]],
     cancel_local_run: Optional[Callable[[str], Optional[Dict[str, Any]]]] = None,
     rollback_handler: Optional[Callable[[], Dict[str, Any]]] = None,
+    generic_approval_resolver: Optional[
+        Callable[[str, str, bool], Optional[Dict[str, Any]]]
+    ] = None,
 ) -> APIRouter:
     if manager is None and manager_provider is None:
         raise ValueError("Hermes router requires a manager or manager provider.")
@@ -175,6 +178,21 @@ def build_hermes_router(
         request: Request,
     ):
         require_local(request)
+        if generic_approval_resolver is not None:
+            try:
+                generic = generic_approval_resolver(
+                    run_id,
+                    body.approval_id,
+                    bool(body.approved),
+                )
+            except HTTPException:
+                raise
+            if generic is not None:
+                return {
+                    "success": True,
+                    "approved": body.approved,
+                    "approval": generic,
+                }
         try:
             active_manager = current_manager()
             current = active_manager.approval_store.get(body.approval_id)

@@ -55,7 +55,7 @@ function configureBasicChatComposerUi() {
     ragToggle.checked = false;
     userInput.placeholder = '輸入訊息，與 AI 助手聊天…';
     [
-        'rail-knowledge', 'rail-runs', 'rail-artifacts', 'rail-extensions',
+        'rail-knowledge', 'rail-runs', 'rail-artifacts',
         'chip-docs', 'skills-button', 'active-skills-bar',
         'task-progress-center', 'wz-kb'
     ].forEach(id => {
@@ -66,8 +66,6 @@ function configureBasicChatComposerUi() {
     document.querySelectorAll([
         '[data-target="tab-settings-rag"]', '[data-target="tab-settings-agent"]',
         '[data-target="tab-settings-integrations"]', '[data-target="tab-settings-runtime"]',
-        '[data-project-settings-tab="extensions"]', '[data-project-settings-pane="extensions"]',
-        '#project-settings-open-extensions',
         '[data-itab="run"]', '[data-itab="artifact"]', '[data-itab="logs"]',
         '[data-itab="safir"]'
     ].join(', '))

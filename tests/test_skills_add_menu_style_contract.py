@@ -65,10 +65,12 @@ def test_skill_format_guide_and_editor_layer_are_readable_above_the_output_panel
 
 def test_floating_popover_modal_and_toast_layers_are_ordered():
     assert ".output-floating-workspace {" in STYLE_CSS
-    assert "z-index: 230" in STYLE_CSS
+    assert "--z-floating-inspector: 230" in STYLE_CSS
+    assert "z-index: var(--z-floating-inspector)" in STYLE_CSS
     assert "z-index: 540" in STYLE_CSS
     assert "#project-skill-editor-modal { z-index: 900; }" in STYLE_CSS
-    assert "z-index: 1500" in STYLE_CSS
+    assert "--z-toast: 1500" in STYLE_CSS
+    assert "z-index: var(--z-toast)" in STYLE_CSS
 
 
 def test_empty_skills_state_exposes_primary_and_secondary_actions():

@@ -1,4 +1,6 @@
+import json
 from pathlib import Path
+import subprocess
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -174,6 +176,116 @@ def test_background_events_only_refresh_badges_and_never_hijack_chat():
     assert "mailExecution: byId('mail-inspector-execution')" in WORKFLOW_JS
 
 
+def test_mail_inspector_async_render_requires_current_workspace_owner_and_project():
+    helpers = _slice(WORKFLOW_JS, "function workflowWorkspaceActive", "function element")
+    assert "claimContentOwner" in helpers
+    assert "contentOwnerMatches" in helpers
+    assert "mail:${string(runId).trim()}" in helpers
+
+    load_run = _slice(WORKFLOW_JS, "async function loadRun", "async function openRun")
+    assert "openInspector ? claimMailInspector(runId) : state.inspectorLease" in load_run
+    assert "lease.owner !== mailOwner(runId)" in load_run
+    assert load_run.count("!ownsMailInspector(lease)") >= 3
+    assert "selectedRun.projectId !== authoritativeProject" in load_run
+    assert "useChatInspectorContext({ open: false })" in load_run
+
+    context = _slice(WORKFLOW_JS, "function useChatInspectorContext", "async function confirmUnknown")
+    assert "state.inspectorLease = null" in context
+    assert "claimContentOwner?.('chat')" in context
+    close = _slice(WORKFLOW_JS, "function close()", "function init(options")
+    assert "useChatInspectorContext({ open: false })" in close
+
+
+def test_delayed_mail_response_cannot_reclaim_an_inspector_owned_by_another_controller():
+    load_run = _slice(WORKFLOW_JS, "async function loadRun", "async function openRun")
+    script = r"""
+let generation = 0;
+let currentOwner = {owner: 'chat', generation: 0};
+const manager = {
+  claim(owner) { currentOwner = {owner, generation: ++generation}; return {...currentOwner}; },
+  matches(lease) { return lease?.owner === currentOwner.owner && lease?.generation === currentOwner.generation; },
+};
+const state = {
+  initialized: true,
+  selectedRun: null,
+  selectedRequestId: 0,
+  inspectorLease: null,
+  profile: {projectId: 'project-a'},
+  deps: {showToast: () => { toasts += 1; }},
+  dom: {
+    center: {hidden: false},
+    mailExecution: {replaceChildren() {}}, mailResults: {replaceChildren() {}},
+    chatExecution: {hidden: false}, chatResults: {hidden: false},
+  },
+};
+global.window = {workbenchRunInspector: {selectTab() {}}};
+const string = value => String(value == null ? '' : value);
+const encoded = value => encodeURIComponent(string(value));
+const mailOwner = runId => `mail:${string(runId).trim()}`;
+const workflowWorkspaceActive = () => state.initialized && state.dom.center.hidden === false;
+const claimMailInspector = runId => {
+  if (!workflowWorkspaceActive() || !runId) return null;
+  state.inspectorLease = manager.claim(mailOwner(runId));
+  return state.inspectorLease;
+};
+const ownsMailInspector = lease => !!lease && workflowWorkspaceActive() && manager.matches(lease);
+const empty = message => ({message});
+const runFrom = value => ({id: value.id, projectId: value.project_id});
+let requestCount = 0;
+let resolvers = [];
+const request = () => { requestCount += 1; return new Promise(resolve => resolvers.push(resolve)); };
+let executionRenders = 0;
+let resultRenders = 0;
+let shows = 0;
+let toasts = 0;
+let chatRestores = 0;
+const renderMailExecution = () => { executionRenders += 1; };
+const renderMailResults = () => { resultRenders += 1; };
+const showMailInspector = lease => { if (ownsMailInspector(lease)) shows += 1; };
+const useChatInspectorContext = () => {
+  chatRestores += 1;
+  state.selectedRun = null;
+  state.inspectorLease = null;
+  manager.claim('chat');
+};
+""" + load_run + r"""
+(async () => {
+  const stale = loadRun('mail-1', {openInspector: true});
+  manager.claim('operation:operation-1');
+  resolvers.shift()({id: 'mail-1', project_id: 'project-a'});
+  await stale;
+
+  const wrongProject = loadRun('mail-1', {openInspector: true});
+  resolvers.shift()({id: 'mail-1', project_id: 'project-b'});
+  await wrongProject;
+
+  state.inspectorLease = manager.claim('operation:operation-2');
+  await loadRun('mail-1', {openInspector: false});
+
+  const current = loadRun('mail-1', {openInspector: true});
+  resolvers.shift()({id: 'mail-1', project_id: 'project-a'});
+  await current;
+  process.stdout.write(JSON.stringify({
+    requestCount, executionRenders, resultRenders, shows, toasts, chatRestores,
+    selectedProject: state.selectedRun?.projectId || null,
+  }));
+})();
+"""
+    completed = subprocess.run(
+        ["node", "-"], input=script, text=True, encoding="utf-8",
+        capture_output=True, check=True,
+    )
+    assert json.loads(completed.stdout) == {
+        "requestCount": 3,
+        "executionRenders": 1,
+        "resultRenders": 1,
+        "shows": 1,
+        "toasts": 1,
+        "chatRestores": 1,
+        "selectedProject": "project-a",
+    }
+
+
 def test_profile_changes_and_stale_state_disable_compose_until_authoritative_refresh():
     assert "function composeAllowed()" in WORKFLOW_JS
     assert "state.profileDirty !== true" in WORKFLOW_JS
@@ -186,14 +298,13 @@ def test_profile_changes_and_stale_state_disable_compose_until_authoritative_ref
     assert "refreshService(), refreshProfile(), refreshRuns({ quiet: true })" in WORKFLOW_JS
 
 
-def test_pending_mail_is_keyboard_accessible_through_the_execution_tab():
+def test_pending_mail_never_hijacks_the_project_scoped_execution_tab():
     assert 'id="mail-approval-badge" aria-hidden="true"' in INDEX_HTML
     assert "state.dom.executionTab.setAttribute('aria-label', executionLabel)" in WORKFLOW_JS
-    assert "state.dom.executionTab.addEventListener('click', openPendingFromExecution" in WORKFLOW_JS
-    assert "state.dom.executionTab.addEventListener('keydown', openPendingFromExecution" in WORKFLOW_JS
-    assert "!['Enter', ' '].includes(event.key)" in WORKFLOW_JS
-    assert "event.stopImmediatePropagation()" in WORKFLOW_JS
-    assert "void openRun(pending.id)" in WORKFLOW_JS
+    assert "可從工作流程中心開啟" in WORKFLOW_JS
+    assert "openPendingFromExecution" not in WORKFLOW_JS
+    assert "executionTab.addEventListener" not in WORKFLOW_JS
+    assert "stopImmediatePropagation" not in WORKFLOW_JS
 
 
 def test_sse_refreshes_only_when_service_or_mail_revision_changes():

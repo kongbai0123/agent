@@ -4,7 +4,7 @@
 
     const state = {
         initialized: false, deps: {}, dom: {}, policy: null, operations: [], workflows: [], audits: [],
-        credentialAliases: [], runtimeApprovals: [], inspectorScope: '',
+        credentialAliases: [], runtimeApprovals: [], inspectorScope: '', inspectorLease: null,
         plan: null, planMessages: [], planScope: '', planBusy: false, planBusyAction: '',
         catalogResults: [], catalogDigest: '', adoptionPreview: null,
         requestId: 0, refreshTimer: null,
@@ -40,6 +40,41 @@
     const planScopeKey = () => `${projectId()}::${sessionId() || 'no-session'}`;
     const query = value => encodeURIComponent(String(value || ''));
     const empty = text => node('div', 'workflow-empty', text);
+
+    function workflowWorkspaceActive() {
+        return state.initialized
+            && document.getElementById('n8n-workflow-center')?.hidden === false;
+    }
+
+    function inspectorOwner(kind, id) {
+        return `${kind}:${String(id || '').trim()}`;
+    }
+
+    function claimInspectorOwner(owner) {
+        if (!workflowWorkspaceActive() || !owner) return null;
+        const lease = window.workbenchRunInspector?.claimContentOwner?.(owner) || null;
+        state.inspectorLease = lease;
+        return lease;
+    }
+
+    function ownsInspector(lease = state.inspectorLease) {
+        return !!lease
+            && workflowWorkspaceActive()
+            && window.workbenchRunInspector?.contentOwnerMatches?.(lease) === true;
+    }
+
+    function releaseInspectorContext() {
+        state.inspectorScope = '';
+        state.inspectorLease = null;
+        if (state.dom?.inspectorExecution) {
+            state.dom.inspectorExecution.hidden = true;
+            state.dom.inspectorResults.hidden = true;
+            state.dom.chatExecution.hidden = false;
+            state.dom.chatResults.hidden = false;
+            document.getElementById('output-floating-workspace')?.classList.remove('mail-inspector-active');
+        }
+        window.workbenchRunInspector?.claimContentOwner?.('chat');
+    }
 
     const listOf = value => {
         if (Array.isArray(value)) return value;
@@ -806,7 +841,13 @@
         return fragment;
     }
 
-    function showOperation(operation) {
+    function showOperation(operation, { lease = null } = {}) {
+        const scopedProject = projectId();
+        if (!workflowWorkspaceActive() || !scopedProject || operation?.project_id !== scopedProject) return;
+        const owner = inspectorOwner('operation', operation.id);
+        const activeLease = lease || claimInspectorOwner(owner);
+        if (!activeLease || activeLease.owner !== owner || !ownsInspector(activeLease)) return;
+        state.inspectorLease = activeLease;
         state.inspectorScope = `operation:${operation.project_id || projectId()}`;
         state.dom.chatExecution.hidden = true;
         state.dom.chatResults.hidden = true;
@@ -843,9 +884,13 @@
         window.workbenchRunInspector?.selectTab?.('execution');
     }
 
-    function showRuntimeApproval(approval) {
+    function showRuntimeApproval(approval, { lease = null } = {}) {
         const scopedProject = projectId();
-        if (!scopedProject || approval.project_id !== scopedProject) return;
+        if (!workflowWorkspaceActive() || !scopedProject || approval.project_id !== scopedProject) return;
+        const owner = inspectorOwner('runtime', approval.approval_id);
+        const activeLease = lease || claimInspectorOwner(owner);
+        if (!activeLease || activeLease.owner !== owner || !ownsInspector(activeLease)) return;
+        state.inspectorLease = activeLease;
         state.inspectorScope = `runtime:${scopedProject}`;
         state.dom.chatExecution.hidden = true;
         state.dom.chatResults.hidden = true;
@@ -921,6 +966,8 @@
     async function decideRuntimeApproval(approval, approved, durationMinutes = 0) {
         const scopedProject = projectId();
         if (!scopedProject || approval.project_id !== scopedProject || state.inspectorScope !== `runtime:${scopedProject}`) return;
+        const lease = state.inspectorLease;
+        if (!ownsInspector(lease)) return;
         try {
             const updated = await api(`/api/integrations/n8n/runtime-approvals/${query(approval.approval_id)}/${approved ? 'approve' : 'reject'}`, {
                 method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -933,13 +980,18 @@
             if (projectId() !== scopedProject) return;
             state.deps.showToast?.(approved ? '執行時核准已處理。' : '執行時動作已拒絕。', 'success');
             await refreshAll();
-            if (projectId() === scopedProject) showRuntimeApproval(updated);
+            if (projectId() === scopedProject && ownsInspector(lease)) {
+                showRuntimeApproval(updated, { lease });
+            }
         } catch (error) {
             if (projectId() === scopedProject) state.deps.showToast?.(error.message, 'error');
         }
     }
 
     async function decide(operation, approved) {
+        const scopedProject = projectId();
+        const lease = state.inspectorLease;
+        if (operation?.project_id !== scopedProject || !ownsInspector(lease)) return;
         let confirmation = null;
         if (approved && operation.risk?.irreversible) {
             confirmation = window.prompt(`此操作可能無法復原。請輸入「${operation.workflow_name || operation.workflow_id}」確認：`);
@@ -956,7 +1008,10 @@
                 }),
             });
             state.deps.showToast?.(approved ? '核准已處理。' : '操作已拒絕。', 'success');
-            await refreshAll(); showOperation(updated);
+            await refreshAll();
+            if (projectId() === scopedProject && ownsInspector(lease)) {
+                showOperation(updated, { lease });
+            }
         } catch (error) { state.deps.showToast?.(error.message, 'error'); }
     }
 
@@ -1224,7 +1279,7 @@
         if (Object.values(state.dom).some(value => !value)) throw new Error('n8n governance DOM is incomplete.');
         state.dom.form.addEventListener('submit', savePolicy); state.dom.apiKeyForm.addEventListener('submit', saveApiKey);
         state.dom.credentialAliasForm.addEventListener('submit', adoptCredentialAlias);
-        state.dom.project.addEventListener('change', () => { resetProjectScopedRuntime(); resetPlanner(); resetAdoptionPreview(); renderPlanSessions(); void refreshAll(); });
+        state.dom.project.addEventListener('change', () => { releaseInspectorContext(); resetProjectScopedRuntime(); resetPlanner(); resetAdoptionPreview(); renderPlanSessions(); void refreshAll(); });
         state.dom.planSession.addEventListener('change', () => { resetPlanner(); resetAdoptionPreview(); void refreshAll(); });
         state.dom.mode.addEventListener('change', () => { state.dom.duration.disabled = state.dom.mode.value !== 'full_audit'; state.dom.ack.closest('label').hidden = state.dom.mode.value !== 'full_audit'; });
         state.dom.planForm.addEventListener('submit', submitPlanMessage);
@@ -1255,6 +1310,7 @@
         init,
         refreshAll,
         refreshProjects: renderProjects,
+        releaseInspectorContext,
         startPlanFromChat,
         getState: () => state,
     };

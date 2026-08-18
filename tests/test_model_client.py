@@ -76,6 +76,33 @@ class ModelClientTests(unittest.TestCase):
         self.assertEqual(post.call_args.kwargs["json"]["max_tokens"], 128)
         self.assertNotIn("options", post.call_args.kwargs["json"])
 
+    def test_openai_payload_serializes_assistant_tool_arguments(self):
+        payload = model_client._openai_payload(
+            {
+                "model": "remote",
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "call-1",
+                                "type": "function",
+                                "function": {
+                                    "name": "github.get_issue",
+                                    "arguments": {"repository": "owner/repo", "number": 7},
+                                },
+                            }
+                        ],
+                    }
+                ],
+            },
+            True,
+        )
+
+        arguments = payload["messages"][0]["tool_calls"][0]["function"]["arguments"]
+        self.assertEqual(json.loads(arguments), {"number": 7, "repository": "owner/repo"})
+
     def test_openai_stream_preserves_finish_reason_for_completeness_gate(self):
         response = Mock()
         response.status_code = 200

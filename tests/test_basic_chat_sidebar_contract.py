@@ -8,17 +8,17 @@ SKILL_CENTER_JS = (ROOT / "frontend" / "skill-center.js").read_text(encoding="ut
 STYLE_CSS = (ROOT / "frontend" / "style.css").read_text(encoding="utf-8")
 
 
-def test_removed_sidebar_surfaces_are_not_reachable_in_basic_chat_mode():
+def test_only_unsupported_sidebar_surfaces_are_hidden_in_basic_chat_mode():
     for element_id in (
         "rail-knowledge",
         "rail-runs",
         "rail-artifacts",
-        "rail-extensions",
         "manage-kb-btn",
     ):
         assert element_id in BASIC_MODE_JS
-    assert '[data-project-settings-tab="extensions"]' in BASIC_MODE_JS
-    assert '[data-project-settings-pane="extensions"]' in BASIC_MODE_JS
+    assert "'rail-extensions'" not in BASIC_MODE_JS
+    assert '[data-project-settings-tab="extensions"]' not in BASIC_MODE_JS
+    assert '[data-project-settings-pane="extensions"]' not in BASIC_MODE_JS
     assert "BASIC_CHAT_MODE ? basicPaletteActions(PALETTE_ACTIONS)" in APP_JS
     assert "[hidden]" in STYLE_CSS and "display: none !important" in STYLE_CSS
 

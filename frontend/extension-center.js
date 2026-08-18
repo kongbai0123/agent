@@ -108,7 +108,40 @@ async function checkMcpStatus() {
     mcpStatusState.textContent = '檢查中...';
     mcpStatusState.className = 'runtime-health-state';
     try {
-        const data = await removedBasicFeature('MCP integration');
+        const response = await apiFetch(`${API_BASE}/api/extensions`);
+        const catalog = await response.json();
+        if (!response.ok || !catalog.success) {
+            throw new Error(catalog.detail?.message || catalog.message || `HTTP ${response.status}`);
+        }
+        const configured = (catalog.extensions || []).filter(item => item.kind === 'mcp');
+        const resolvedServers = await Promise.all(configured.map(async item => {
+            let current = item;
+            if (item.installed && item.effective_enabled) {
+                const healthResponse = await apiFetch(
+                    `${API_BASE}/api/extensions/${encodeURIComponent(item.id)}/health`,
+                    { method: 'POST' }
+                );
+                const healthPayload = await healthResponse.json();
+                if (healthResponse.ok && healthPayload.success && healthPayload.extension) {
+                    current = healthPayload.extension;
+                }
+            }
+            const health = current.health || {};
+            const detail = health.detail || {};
+            let status = 'disabled';
+            if (current.installed && current.effective_enabled && health.status === 'ready') {
+                status = 'connected';
+            } else if (current.installed && current.effective_enabled) {
+                status = 'error';
+            }
+            return {
+                id: current.name || current.id,
+                status,
+                tool_count: Number(detail.tool_count || 0),
+                error: detail.error_code || detail.reason || health.status || 'unavailable'
+            };
+        }));
+        const data = { servers: resolvedServers };
         const servers = data.servers || [];
         const connected = servers.filter(server => server.status === 'connected');
         mcpStatusState.textContent = servers.length
@@ -894,7 +927,7 @@ async function saveModelProviderSecrets() {
 
     const state = {
         deps: null,
-        activeTab: 'installed',
+        activeTab: 'available',
         projectId: null,
         response: { extensions: [], sections: {} },
         pendingReview: null,
@@ -926,9 +959,17 @@ async function saveModelProviderSecrets() {
         const response = await state.deps.apiFetch(`${state.deps.apiBase || ''}${path}`, options);
         const data = await response.json().catch(() => ({}));
         if (!response.ok || data.success === false) {
-            throw new Error(messageFrom(data, `HTTP ${response.status}`));
+            const error = new Error(messageFrom(data, `HTTP ${response.status}`));
+            error.status = response.status;
+            error.code = data?.detail?.code || data?.code || null;
+            error.payload = data;
+            throw error;
         }
         return data;
+    }
+
+    function projectQuery(projectId = state.projectId) {
+        return projectId ? `?project_id=${encoded(projectId)}` : '';
     }
 
     function projectOptions(preferredProjectId = null) {
@@ -954,7 +995,9 @@ async function saveModelProviderSecrets() {
     }
 
     function setTab(tab) {
-        state.activeTab = ['installed', 'available', 'local'].includes(tab) ? tab : 'installed';
+        state.activeTab = ['installed', 'available', 'connections', 'local', 'developer'].includes(tab)
+            ? tab
+            : 'available';
         document.querySelectorAll('.extension-tab-btn[data-extension-tab]').forEach(button => {
             const active = button.dataset.extensionTab === state.activeTab;
             button.classList.toggle('active', active);
@@ -966,14 +1009,56 @@ async function saveModelProviderSecrets() {
             panel.classList.toggle('active', active);
             panel.hidden = !active;
         });
+        const search = byId('extension-search');
+        const searchable = ['installed', 'available', 'local'].includes(state.activeTab);
+        if (search?.closest('.extension-search')) search.closest('.extension-search').hidden = !searchable;
+        const globalOption = byId('extension-scope-select')?.querySelector('option[value="global"]');
+        if (globalOption && state.activeTab !== 'connections') globalOption.disabled = false;
+    }
+
+    function ensureConnectionProjectScope() {
+        const select = byId('extension-scope-select');
+        const projects = (state.deps?.getProjects?.() || []).filter(project => !project.archived);
+        const active = state.deps?.getActiveProjectId?.();
+        const preferred = state.projectId || active || projects[0]?.id || null;
+        const valid = preferred && projects.some(project => String(project.id) === String(preferred));
+        const nextProjectId = valid ? String(preferred) : null;
+        const changed = state.projectId !== nextProjectId;
+        state.projectId = nextProjectId;
+        if (select) {
+            const globalOption = select.querySelector('option[value="global"]');
+            if (globalOption) globalOption.disabled = !!nextProjectId;
+            select.value = nextProjectId || 'global';
+        }
+        return changed;
+    }
+
+    async function refreshConnections() {
+        ensureConnectionProjectScope();
+        window.workbenchConnectors?.setProject?.(state.projectId);
+        await window.workbenchConnectors?.refresh?.({ projectId: state.projectId });
+    }
+
+    async function selectWorkspaceTab(tab) {
+        setTab(tab);
+        if (state.activeTab !== 'connections') return;
+        const scopeChanged = ensureConnectionProjectScope();
+        if (scopeChanged) await loadCatalog().catch(() => {});
+        await refreshConnections().catch(() => {});
+    }
+
+    async function refreshActiveTab() {
+        await loadCatalog();
+        if (state.activeTab === 'connections') await refreshConnections();
     }
 
     function healthInfo(item) {
         const raw = item.health;
         if (typeof raw === 'string') return { status: raw, message: raw };
+        const detail = raw?.detail || {};
         return {
             status: raw?.status || 'unknown',
-            message: raw?.message || raw?.error || '',
+            message: raw?.message || raw?.error || detail.message || detail.reason || detail.error || '',
             checkedAt: raw?.checked_at || raw?.checkedAt || ''
         };
     }
@@ -987,16 +1072,54 @@ async function saveModelProviderSecrets() {
         };
     }
 
-    function sectionItems(section) {
-        const all = state.response.extensions || [];
+    function catalogSectionItems(response, section) {
+        const all = response?.extensions || [];
         const lookup = new Map(all.map(item => [String(item.id), item]));
-        const explicit = state.response.sections?.[section];
-        if (Array.isArray(explicit)) {
-            return explicit.map(item => typeof item === 'string' ? lookup.get(item) : item).filter(Boolean);
+        const normalize = entries => (Array.isArray(entries) ? entries : [])
+            .map(item => typeof item === 'string' ? lookup.get(item) : item)
+            .filter(Boolean);
+        const explicit = normalize(response?.sections?.[section]);
+        if (section === 'available') {
+            // Keep unavailable catalog entries discoverable even if an older
+            // release recorded them as installed. Their controls remain
+            // fail-closed through extensionControlPolicy().
+            const unavailable = normalize(response?.sections?.unavailable);
+            const unique = new Map([...explicit, ...unavailable].map(item => [String(item.id), item]));
+            if (unique.size) return [...unique.values()];
         }
+        if (explicit.length) return explicit;
         if (section === 'installed') return all.filter(item => item.installed);
-        if (section === 'available') return all.filter(item => item.available && !item.installed);
+        if (section === 'available') {
+            return all.filter(item => !item.installed && (item.available || item.runtime_available === false));
+        }
         return all.filter(item => item.origin === 'local');
+    }
+
+    function sectionItems(section) {
+        return catalogSectionItems(state.response, section);
+    }
+
+    function unavailableExplanation(item) {
+        if (item?.runtime_available !== false) return '';
+        const reason = String(item.availability_reason || 'adapter_unavailable');
+        return ({
+            cursor_adapter_not_implemented: '此版本尚未提供 Cursor adapter。',
+            excel_adapter_not_implemented: '此版本尚未提供 Excel adapter。'
+        })[reason] || `此版本暫時無法使用此擴充（${reason}）。`;
+    }
+
+    function extensionControlPolicy(item) {
+        const unavailable = item?.runtime_available === false;
+        const globallyEnabled = item?.installed === true && item?.global_enabled === true;
+        return {
+            unavailable,
+            explanation: unavailableExplanation(item),
+            canInstall: item?.installed !== true && item?.available === true && !unavailable,
+            // An already-enabled unavailable extension may still be switched
+            // off, but an unavailable extension can never be switched on.
+            canToggleGlobal: item?.installed === true && (!unavailable || globallyEnabled),
+            canEnable: item?.installed === true && !globallyEnabled && !unavailable
+        };
     }
 
     function stateBlock(text, className = '') {
@@ -1031,8 +1154,8 @@ async function saveModelProviderSecrets() {
         const card = document.createElement('article');
         card.className = `extension-card ${item.effective_enabled === false ? 'is-disabled' : ''}`.trim();
         card.dataset.extensionId = String(item.id);
-        const globallyReady = item.global_enabled !== false
-            && item.global_approval_current !== false;
+        const globalEnabled = !!(item.installed && item.global_enabled === true);
+        const controlPolicy = extensionControlPolicy(item);
 
         const head = document.createElement('div');
         head.className = 'extension-card-head';
@@ -1064,6 +1187,12 @@ async function saveModelProviderSecrets() {
         const badges = document.createElement('div');
         badges.className = 'extension-badges';
         badges.appendChild(badge(item.trusted ? '已信任' : '未信任', item.trusted ? 'is-trusted' : 'is-warning'));
+        if (item.runtime_available === false) {
+            badges.appendChild(badge(
+                controlPolicy.explanation,
+                'is-error'
+            ));
+        }
         const health = healthInfo(item);
         const healthClass = ['healthy', 'ready', 'connected', 'ok'].includes(health.status)
             ? 'is-healthy'
@@ -1095,8 +1224,9 @@ async function saveModelProviderSecrets() {
         globalToggle.className = 'extension-global-toggle';
         const checkbox = document.createElement('input');
         checkbox.type = 'checkbox';
-        checkbox.checked = globallyReady;
-        checkbox.disabled = !item.installed;
+        checkbox.checked = globalEnabled;
+        checkbox.disabled = !controlPolicy.canToggleGlobal;
+        if (controlPolicy.unavailable) checkbox.title = controlPolicy.explanation;
         checkbox.dataset.extensionGlobalToggle = String(item.id);
         globalToggle.append(checkbox, document.createTextNode('全域啟用'));
         controls.appendChild(globalToggle);
@@ -1112,17 +1242,25 @@ async function saveModelProviderSecrets() {
 
         const actions = document.createElement('div');
         actions.className = 'extension-card-actions';
-        if (!item.installed && item.available) {
+        if (!item.installed && (item.available || controlPolicy.unavailable)) {
             const install = actionButton(
-                item.origin === 'local' && !item.trusted ? '信任並安裝' : '審查並安裝',
+                controlPolicy.unavailable
+                    ? '目前不可安裝'
+                    : item.origin === 'local' && !item.trusted
+                    ? '信任、安裝並啟用'
+                    : '審查、安裝並啟用',
                 'install',
                 'download',
                 'btn btn-primary compact'
             );
-            install.addEventListener('click', () => openPermissionReview(item, 'install'));
+            install.disabled = !controlPolicy.canInstall;
+            if (controlPolicy.unavailable) install.title = controlPolicy.explanation;
+            if (controlPolicy.canInstall) {
+                install.addEventListener('click', () => openPermissionReview(item, 'install'));
+            }
             actions.appendChild(install);
         }
-        if (item.origin === 'local' && !item.trusted) {
+        if (item.installed && !item.trusted) {
             const trust = actionButton('信任', 'trust', 'shield-check');
             trust.addEventListener('click', () => openPermissionReview(item, 'trust'));
             actions.appendChild(trust);
@@ -1133,15 +1271,24 @@ async function saveModelProviderSecrets() {
             const auditButton = actionButton('Audit', 'audit', 'scroll-text');
             auditButton.addEventListener('click', () => openAudit(item));
             const disableButton = actionButton(
-                globallyReady ? '停用' : '審查並啟用',
-                globallyReady ? 'disable' : 'enable',
-                globallyReady ? 'power-off' : 'power'
+                globalEnabled ? '停用' : (controlPolicy.unavailable ? '目前無法啟用' : '審查並啟用'),
+                globalEnabled ? 'disable' : 'enable',
+                globalEnabled ? 'power-off' : 'power'
             );
-            disableButton.addEventListener('click', () => {
-                if (globallyReady) mutateGlobalState(item, false, disableButton);
-                else openPermissionReview(item, 'enable');
-            });
+            disableButton.disabled = !globalEnabled && !controlPolicy.canEnable;
+            if (controlPolicy.unavailable) disableButton.title = controlPolicy.explanation;
+            if (!disableButton.disabled || globalEnabled) {
+                disableButton.addEventListener('click', () => {
+                    if (globalEnabled) mutateGlobalState(item, false, disableButton);
+                    else openPermissionReview(item, 'enable');
+                });
+            }
             actions.append(healthButton, auditButton, disableButton);
+        }
+        if (item.installed && item.connection_required) {
+            const connections = actionButton('設定連線', 'connections', 'link');
+            connections.addEventListener('click', () => selectWorkspaceTab('connections'));
+            actions.appendChild(connections);
         }
         if (item.removable && item.installed) {
             const remove = actionButton('移除', 'remove', 'trash-2', 'btn btn-danger compact');
@@ -1165,6 +1312,14 @@ async function saveModelProviderSecrets() {
         const select = document.createElement('select');
         select.className = 'settings-input extension-project-override';
         select.dataset.extensionProjectOverride = String(item.id);
+        const canEnable = !!(
+            item.installed
+            && item.trusted
+            && item.runtime_available !== false
+            && item.configuration_enabled !== false
+            && item.global_enabled === true
+            && item.global_approval_current === true
+        );
         [
             ['inherit', '繼承全域'],
             ['enabled', '此專案啟用'],
@@ -1173,17 +1328,19 @@ async function saveModelProviderSecrets() {
             const option = document.createElement('option');
             option.value = value;
             option.textContent = label;
+            if (value === 'enabled') option.disabled = !canEnable;
             select.appendChild(option);
         });
         select.value = ['inherit', 'enabled', 'disabled'].includes(item.project_override)
             ? item.project_override
             : 'inherit';
-        select.disabled = item.global_enabled === false
-            || item.global_approval_current === false;
-        select.title = select.disabled ? '全域總開關已停用' : '設定此專案的擴充覆寫';
-        const previous = select.value;
+        select.dataset.previousMode = select.value;
+        select.title = canEnable
+            ? '設定此專案的擴充覆寫'
+            : '可繼承或停用；如要在此專案啟用，請先完成全域信任與啟用';
         select.addEventListener('change', () => {
             const mode = select.value;
+            const previous = select.dataset.previousMode || 'inherit';
             if (mode === 'enabled' && previous !== 'enabled') {
                 select.value = previous;
                 openPermissionReview(item, 'project_enable', { projectId, mode, select });
@@ -1257,7 +1414,7 @@ async function saveModelProviderSecrets() {
     async function mutateGlobalState(item, enabled, control) {
         control.disabled = true;
         try {
-            await request(`/api/extensions/${encoded(item.id)}/state`, {
+            await request(`/api/extensions/${encoded(item.id)}/state${projectQuery()}`, {
                 method: 'PATCH',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
@@ -1270,8 +1427,13 @@ async function saveModelProviderSecrets() {
             await state.deps?.reloadProject?.();
         } catch (error) {
             state.deps?.showToast?.(`更新擴充失敗：${error.message}`, 'error');
-            control.disabled = false;
-            renderLists();
+            // A failed cleanup response may still have committed an
+            // authority-reducing disable. Reload the server snapshot instead
+            // of restoring a stale client-side enabled control.
+            await loadCatalog().catch(() => {
+                control.disabled = false;
+                renderLists();
+            });
         }
     }
 
@@ -1282,27 +1444,46 @@ async function saveModelProviderSecrets() {
             await request(`/api/projects/${encoded(projectId)}/extensions/${encoded(item.id)}`, {
                 method: 'PUT',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ mode })
+                body: JSON.stringify({
+                    mode,
+                    ...(mode === 'enabled' ? { manifest_sha256: item.manifest_sha256 } : {})
+                })
             });
+            control.dataset.previousMode = mode;
             state.deps?.showToast?.(`${item.name || item.id} 的專案設定已更新。`, 'success');
-            if (byId('extension-center-modal')?.classList.contains('active')) await loadCatalog();
+            if (!byId('extension-center-workspace')?.hidden) await loadCatalog();
             await renderProjectAssignments(byId('project-settings-extension-list'), projectId);
         } catch (error) {
             state.deps?.showToast?.(`更新專案擴充失敗：${error.message}`, 'error');
-            control.disabled = false;
-            control.value = item.project_override || 'inherit';
+            // Project disable is also fail-closed when runtime cleanup fails.
+            // Re-read the persisted mode before deciding which option to show.
+            await loadCatalog().catch(() => {
+                control.disabled = false;
+                control.value = item.project_override || 'inherit';
+            });
+            await renderProjectAssignments(
+                byId('project-settings-extension-list'),
+                projectId
+            ).catch(() => {});
         }
     }
 
     function reviewDescription(operation, item) {
-        if (operation === 'trust') return `信任本機擴充「${item.name || item.id}」`;
-        if (operation === 'install') return `安裝並允許「${item.name || item.id}」註冊下列能力`;
+        if (operation === 'trust') return `信任擴充「${item.name || item.id}」的目前 manifest`;
+        if (operation === 'install') return `安裝、信任並啟用「${item.name || item.id}」的下列能力`;
         if (operation === 'project_enable') return `允許「${item.name || item.id}」在指定專案生效`;
         if (operation === 'activate') return `允許並啟用「${item.name || item.id}」作為聊天模型`;
         return `重新啟用「${item.name || item.id}」及下列能力`;
     }
 
     function openPermissionReview(item, operation, context = {}) {
+        if (
+            item?.runtime_available === false
+            && ['install', 'enable', 'activate', 'project_enable'].includes(operation)
+        ) {
+            state.deps?.showToast?.(unavailableExplanation(item), 'warning');
+            return;
+        }
         const modal = byId('extension-permission-modal');
         const summary = byId('extension-permission-summary');
         const trust = byId('extension-trust-confirm');
@@ -1363,7 +1544,7 @@ async function saveModelProviderSecrets() {
                 pending.returnFocus.focus();
                 return;
             }
-            if (byId('extension-center-modal')?.classList.contains('active')) {
+            if (!byId('extension-center-workspace')?.hidden) {
                 byId('extension-search')?.focus();
             }
         }, 0);
@@ -1376,50 +1557,60 @@ async function saveModelProviderSecrets() {
         const confirm = byId('extension-permission-confirm');
         confirm.disabled = true;
         try {
+            let current = item;
+            const scope = projectQuery(context.projectId || state.projectId);
             if (operation === 'install') {
-                await request(`/api/extensions/${encoded(item.id)}/install`, {
+                const result = await request(`/api/extensions/${encoded(current.id)}/install${scope}`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ manifest_sha256: item.manifest_sha256 })
+                    body: JSON.stringify({ manifest_sha256: current.manifest_sha256 })
                 });
+                current = result.extension || current;
             }
-            if (['trust', 'install', 'activate'].includes(operation) && !item.trusted) {
-                await request(`/api/extensions/${encoded(item.id)}/trust`, {
+            if (['trust', 'install', 'enable', 'activate', 'project_enable'].includes(operation) && !current.trusted) {
+                const result = await request(`/api/extensions/${encoded(current.id)}/trust${scope}`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ manifest_sha256: item.manifest_sha256 })
+                    body: JSON.stringify({ manifest_sha256: current.manifest_sha256 })
                 });
+                current = result.extension || current;
             }
-            if (operation === 'enable' || operation === 'activate') {
-                await request(`/api/extensions/${encoded(item.id)}/state`, {
+            if (operation === 'install' || operation === 'enable' || operation === 'activate') {
+                const result = await request(`/api/extensions/${encoded(current.id)}/state${scope}`, {
                     method: 'PATCH',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
                         global_enabled: true,
-                        manifest_sha256: item.manifest_sha256
+                        manifest_sha256: current.manifest_sha256
                     })
                 });
+                current = result.extension || current;
             } else if (operation === 'project_enable') {
-                await request(`/api/projects/${encoded(context.projectId)}/extensions/${encoded(item.id)}`, {
+                const result = await request(`/api/projects/${encoded(context.projectId)}/extensions/${encoded(current.id)}`, {
                     method: 'PUT',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
                         mode: 'enabled',
-                        manifest_sha256: item.manifest_sha256
+                        manifest_sha256: current.manifest_sha256
                     })
                 });
+                current = result.extension || current;
             }
             state.deps?.showToast?.(`${item.name || item.id} 的權限操作已完成。`, 'success');
             closePermissionReview();
-            if (byId('extension-center-modal')?.classList.contains('active')) await loadCatalog();
+            if (!byId('extension-center-workspace')?.hidden) await loadCatalog();
             if (context.projectId) {
                 await renderProjectAssignments(byId('project-settings-extension-list'), context.projectId);
             }
             await state.deps?.reloadProject?.();
             if (typeof context.onComplete === 'function') await context.onComplete();
+            if (operation === 'install' && current.connection_required) {
+                await selectWorkspaceTab('connections');
+            }
         } catch (error) {
             state.deps?.showToast?.(`權限操作失敗：${error.message}`, 'error');
             confirm.disabled = false;
+            if (!byId('extension-center-workspace')?.hidden) await loadCatalog().catch(() => {});
         }
     }
 
@@ -1437,9 +1628,15 @@ async function saveModelProviderSecrets() {
     async function refreshHealth(item, button) {
         button.disabled = true;
         try {
-            const scope = state.projectId ? `?project_id=${encoded(state.projectId)}` : '';
-            await request(`/api/extensions/${encoded(item.id)}/health${scope}`, { method: 'POST' });
-            state.deps?.showToast?.(`${item.name || item.id} 健康檢查完成。`, 'success');
+            const result = await request(`/api/extensions/${encoded(item.id)}/health${projectQuery()}`, { method: 'POST' });
+            const health = healthInfo(result.extension || item);
+            const healthy = ['healthy', 'ready', 'connected', 'ok'].includes(health.status);
+            const failed = ['error', 'failed', 'unavailable'].includes(health.status);
+            const detail = health.message ? `：${health.message}` : '';
+            state.deps?.showToast?.(
+                `${item.name || item.id} 健康狀態：${health.status}${detail}`,
+                healthy ? 'success' : (failed ? 'error' : 'warning')
+            );
             await loadCatalog();
         } catch (error) {
             state.deps?.showToast?.(`健康檢查失敗：${error.message}`, 'error');
@@ -1483,7 +1680,12 @@ async function saveModelProviderSecrets() {
 
     async function removeExtension(item, button) {
         if (!item.removable) return;
-        if (!window.confirm(`確定移除本機擴充「${item.name || item.id}」？來源資料夾不會被刪除。`)) return;
+        const retentionNote = item.origin === 'local'
+            ? '來源資料夾不會被刪除。'
+            : item.connection_required
+                ? '已保存的帳號憑證不會一併刪除；如不再使用，請先在「連線」中斷開帳號。'
+                : '內建目錄項目仍會保留，之後可重新安裝。';
+        if (!window.confirm(`確定移除擴充「${item.name || item.id}」？${retentionNote}`)) return;
         button.disabled = true;
         try {
             await request(`/api/extensions/${encoded(item.id)}`, { method: 'DELETE' });
@@ -1504,7 +1706,7 @@ async function saveModelProviderSecrets() {
         const list = byId('extension-local-list');
         list.replaceChildren(stateBlock('正在驗證本機 manifest…', 'is-loading'));
         try {
-            const data = await request('/api/extensions/local/inspect', {
+            const data = await request(`/api/extensions/local/inspect${projectQuery()}`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ filename })
@@ -1513,7 +1715,13 @@ async function saveModelProviderSecrets() {
             if (!item?.id) throw new Error('後端未回傳可識別的 extension manifest');
             list.replaceChildren(createExtensionCard(item));
             safeCreateIcons();
-            openPermissionReview(item, item.installed ? 'trust' : 'install');
+            if (!item.installed) {
+                openPermissionReview(item, 'install');
+            } else if (!item.trusted) {
+                openPermissionReview(item, 'trust');
+            } else {
+                state.deps?.showToast?.(`${item.name || item.id} 的目前 manifest 已安裝並信任。`, 'success');
+            }
         } catch (error) {
             list.replaceChildren(stateBlock(`Manifest 驗證失敗：${error.message}`, 'is-error'));
         } finally {
@@ -1659,44 +1867,71 @@ async function saveModelProviderSecrets() {
         });
     }
 
-    async function open(tab = 'installed', projectId = null) {
+    async function open(tab = 'available', projectId = null) {
         if (!state.initialized) return;
         closePermissionReview({ restoreFocus: false });
         const selectedProject = projectId || state.deps?.getActiveProjectId?.() || null;
         projectOptions(selectedProject);
-        if (!projectId) {
+        if (!projectId && tab !== 'connections') {
             byId('extension-scope-select').value = 'global';
             state.projectId = null;
         }
+        if (tab === 'connections') ensureConnectionProjectScope();
         byId('extension-search').value = '';
         byId('extension-audit-panel').hidden = true;
         setTab(tab);
-        byId('extension-center-modal').classList.add('active');
+        byId('extension-center-workspace').hidden = false;
+        state.deps?.onWorkspaceOpen?.();
         safeCreateIcons();
         await loadCatalog().catch(() => {});
-        setTimeout(() => byId('extension-search')?.focus(), 20);
+        if (tab === 'connections') await refreshConnections().catch(() => {});
+        setTimeout(() => {
+            if (['installed', 'available', 'local'].includes(state.activeTab)) {
+                byId('extension-search')?.focus();
+            } else {
+                byId('extension-scope-select')?.focus();
+            }
+        }, 20);
     }
 
     function close() {
         closePermissionReview({ restoreFocus: false });
-        byId('extension-center-modal')?.classList.remove('active');
+        if (byId('extension-center-workspace')) byId('extension-center-workspace').hidden = true;
         byId('extension-audit-panel').hidden = true;
+        state.deps?.onWorkspaceClose?.();
     }
 
     function init(dependencies = {}) {
         state.deps = dependencies;
         if (state.initialized) return;
         state.initialized = true;
+        const workspace = byId('extension-center-workspace');
+        const workbenchBody = document.querySelector('.workbench-body');
+        if (workspace && workbenchBody && workspace.parentElement !== workbenchBody) {
+            workbenchBody.appendChild(workspace);
+        }
         byId('extensions-close')?.addEventListener('click', close);
         byId('extensions-close-btn')?.addEventListener('click', close);
-        byId('extension-refresh')?.addEventListener('click', () => loadCatalog().catch(() => {}));
+        byId('extension-refresh')?.addEventListener('click', () => refreshActiveTab().catch(() => {}));
         byId('extension-search')?.addEventListener('input', renderLists);
-        byId('extension-scope-select')?.addEventListener('change', event => {
+        byId('extension-scope-select')?.addEventListener('change', async event => {
             state.projectId = event.target.value === 'global' ? null : event.target.value;
-            loadCatalog().catch(() => {});
+            if (state.activeTab === 'connections') ensureConnectionProjectScope();
+            await loadCatalog().catch(() => {});
+            if (state.activeTab === 'connections') await refreshConnections().catch(() => {});
         });
         document.querySelectorAll('.extension-tab-btn[data-extension-tab]').forEach(button => {
-            button.addEventListener('click', () => setTab(button.dataset.extensionTab));
+            button.addEventListener('click', () => selectWorkspaceTab(button.dataset.extensionTab));
+        });
+        byId('extension-developer-toggle')?.addEventListener('click', () => setTab('developer'));
+        window.addEventListener('workbench:connector-project-change', event => {
+            if (state.activeTab !== 'connections') return;
+            const projectId = event.detail?.projectId ? String(event.detail.projectId) : null;
+            const select = byId('extension-scope-select');
+            if (!projectId || ![...(select?.options || [])].some(option => option.value === projectId)) return;
+            state.projectId = projectId;
+            select.value = projectId;
+            loadCatalog().catch(() => {});
         });
         byId('extension-local-path')?.addEventListener('input', event => {
             const filename = event.target.value.trim();
@@ -1713,9 +1948,6 @@ async function saveModelProviderSecrets() {
             byId('extension-permission-confirm').disabled = !event.target.checked;
         });
         byId('extension-permission-confirm')?.addEventListener('click', confirmPermissionReview);
-        byId('extension-center-modal')?.addEventListener('click', event => {
-            if (event.target === byId('extension-center-modal')) close();
-        });
         byId('extension-permission-modal')?.addEventListener('click', event => {
             if (event.target === byId('extension-permission-modal')) closePermissionReview();
         });
@@ -1731,6 +1963,11 @@ async function saveModelProviderSecrets() {
         refresh: loadCatalog,
         reviewProviderModel,
         renderProjectAssignments,
-        openProjectSettings
+        openProjectSettings,
+        __testing: Object.freeze({
+            catalogSectionItems,
+            extensionControlPolicy,
+            createExtensionCard
+        })
     };
 }());

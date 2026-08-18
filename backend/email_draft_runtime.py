@@ -12,6 +12,11 @@ import re
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Optional
 
+from model_gateway import (
+    get_model_gateway,
+    model_hook_context,
+    validate_tool_free_model_payload,
+)
 from model_client import post_chat as provider_post_chat
 
 
@@ -104,36 +109,48 @@ class EmailDraftRuntime:
                 )
             response = None
             try:
-                response = self.post_chat(
-                    settings,
-                    {
-                        "model": model,
-                        "messages": messages,
+                model_payload = {
+                    "model": model,
+                    "messages": messages,
+                    "stream": False,
+                    "options": {"temperature": 0.2, "num_predict": 1600},
+                }
+                with get_model_gateway().post_chat_sync(
+                    context=model_hook_context(
+                        runtime="email_draft",
+                        model=model,
+                        project_id=request["project_id"],
+                        session_id=request["session_id"],
+                        run_id=request["run_id"],
+                        metadata={"attempt": attempt + 1, "mode": request["mode"]},
+                    ),
+                    settings=settings,
+                    payload=model_payload,
+                    post_chat=self.post_chat,
+                    post_chat_kwargs={
                         "stream": False,
-                        "options": {"temperature": 0.2, "num_predict": 1600},
+                        "timeout": (10, 180),
+                        "project_id": request["project_id"],
                     },
-                    stream=False,
-                    timeout=(10, 180),
-                    project_id=request["project_id"],
-                )
-                if int(getattr(response, "status_code", 500)) >= 400:
-                    raise EmailDraftGenerationError(
-                        "EMAIL_MODEL_REJECTED",
-                        "The selected model could not generate this email draft.",
-                    )
-                payload = response.json()
-                response_provider = str(getattr(response, "provider", "") or "")
-                text = str((payload.get("message") or {}).get("content") or "")
-                if len(text) > MAX_OUTPUT_CHARS:
-                    last_error = "output exceeded the draft limit"
-                    continue
-                try:
+                    validator=validate_tool_free_model_payload,
+                ) as gateway_call:
+                    response = gateway_call.response
+                    if int(getattr(response, "status_code", 500)) >= 400:
+                        raise EmailDraftGenerationError(
+                            "EMAIL_MODEL_REJECTED",
+                            "The selected model could not generate this email draft.",
+                        )
+                    payload = response.json()
+                    response_provider = str(getattr(response, "provider", "") or "")
+                    text = str((payload.get("message") or {}).get("content") or "")
+                    if len(text) > MAX_OUTPUT_CHARS:
+                        raise ValueError("output exceeded the draft limit")
                     result = _validate_result(_parse_json_object(text), request)
-                    break
-                except (TypeError, ValueError) as exc:
-                    last_error = str(exc)
+                break
             except EmailDraftGenerationError:
                 raise
+            except (TypeError, ValueError) as exc:
+                last_error = str(exc)
             except Exception as exc:
                 raise EmailDraftGenerationError(
                     "EMAIL_MODEL_UNAVAILABLE",

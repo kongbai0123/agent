@@ -6,10 +6,13 @@ provider streaming, visible-response filtering, persistence, and metrics.
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import json
 import logging
 import re
 import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Callable, Dict, Iterable, List, Mapping, Optional
@@ -18,7 +21,15 @@ import database
 from chat_cancellation import ChatRunCancelled, ChatRunControl, ChatRunDeadlineExceeded
 from chat.events import encode_sse
 from chat.generated_artifacts import persist_generated_artifacts
-from model_client import model_call_error, model_transport_error, post_chat as provider_post_chat
+from hook_runtime import HookContext, HookRuntimeError, get_hook_dispatcher
+from model_gateway import ModelGatewayDenied, get_model_gateway
+from model_client import (
+    model_call_error,
+    model_supports_tools,
+    model_transport_error,
+    post_chat as provider_post_chat,
+)
+from tool_runtime import ToolRuntimeError
 
 
 BASIC_CHAT_SYSTEM_PROMPT = (
@@ -37,6 +48,7 @@ MAX_HISTORY_MESSAGES = 24
 MAX_HISTORY_CHARS = 48_000
 MAX_TEMPORARY_CONTEXT_CHARS = 24_000
 HIDDEN_REASONING_TAGS = ("think", "thought", "analysis")
+MAX_BASIC_TOOL_CALLS = 8
 LOGGER = logging.getLogger(__name__)
 
 
@@ -414,6 +426,154 @@ class _GenerationState:
     metrics: Dict[str, Any] = field(default_factory=dict)
     failure: Optional[Dict[str, Any]] = None
     first_token_at: Optional[float] = None
+    tool_calls: List[Dict[str, Any]] = field(default_factory=list)
+
+
+def _model_hook_context(
+    event: str,
+    *,
+    model: str,
+    project_id: Optional[str],
+    run_id: str,
+    session_id: str,
+    call_id: str,
+    run_control: ChatRunControl,
+) -> HookContext:
+    remaining = run_control.deadline_remaining()
+    return HookContext(
+        event=event,
+        project_id=project_id,
+        session_id=session_id,
+        run_id=run_id,
+        call_id=call_id,
+        deadline_monotonic=(time.monotonic() + remaining) if remaining is not None else None,
+        metadata={"model": model, "runtime": "basic_chat"},
+    )
+
+
+def _validate_model_payload(value: Any) -> Dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ValueError("model hook returned a non-object payload")
+    result = dict(value)
+    if not isinstance(result.get("model"), str) or not result["model"].strip():
+        raise ValueError("model hook removed the model")
+    if not isinstance(result.get("messages"), list):
+        raise ValueError("model hook returned invalid messages")
+    if "tools" in result and not isinstance(result.get("tools"), list):
+        raise ValueError("model hook returned invalid tools")
+    return result
+
+
+_ITERATION_END = object()
+
+
+def _next_response_line(iterator: Any) -> Any:
+    try:
+        return next(iterator)
+    except StopIteration:
+        return _ITERATION_END
+
+
+async def _collect_model_round(
+    *,
+    settings: Dict[str, Any],
+    payload: Dict[str, Any],
+    model: str,
+    project_id: Optional[str],
+    session_id: str,
+    run_id: str,
+    run_control: ChatRunControl,
+    post_chat: Callable[..., Any],
+    state: _GenerationState,
+) -> None:
+    response = None
+    gateway_call = None
+    visible_filter = VisibleResponseFilter()
+    gateway = get_model_gateway()
+    call_id = f"model_{uuid.uuid4().hex}"
+    context = _model_hook_context(
+        "model.request.transform",
+        model=model,
+        project_id=project_id,
+        session_id=session_id,
+        run_id=run_id,
+        call_id=call_id,
+        run_control=run_control,
+    )
+    try:
+        run_control.raise_if_cancelled_or_expired()
+        with run_control.track_phase("generation", agent_id="basic-chat", model=model):
+            gateway_call = await gateway.start(
+                context=context,
+                payload=payload,
+                validator=_validate_model_payload,
+                transport=lambda governed_payload: post_chat(
+                    settings,
+                    governed_payload,
+                    stream=True,
+                    timeout=run_control.bounded_timeout(360),
+                    project_id=project_id,
+                ),
+            )
+            response = gateway_call.response
+            run_control.attach(response)
+            if int(response.status_code) != 200:
+                state.failure = model_call_error(
+                    settings,
+                    model,
+                    int(response.status_code),
+                    str(response.text or ""),
+                    project_id=project_id,
+                )
+                await gateway.failed(gateway_call)
+                return
+            iterator = iter(response.iter_lines())
+            while True:
+                run_control.raise_if_cancelled_or_expired()
+                raw = await asyncio.to_thread(_next_response_line, iterator)
+                if raw is _ITERATION_END:
+                    break
+                chunk = _decode_chunk(raw)
+                if not chunk:
+                    continue
+                message = chunk.get("message") if isinstance(chunk.get("message"), dict) else {}
+                content = str(message.get("content") or "")
+                visible_content = visible_filter.feed(content)
+                if visible_content:
+                    state.first_token_at = state.first_token_at or time.time()
+                    state.answer_parts.append(visible_content)
+                if isinstance(message.get("tool_calls"), list):
+                    state.tool_calls = [
+                        dict(item) for item in message["tool_calls"] if isinstance(item, Mapping)
+                    ]
+                if chunk.get("done"):
+                    visible_tail = visible_filter.feed("", final=True)
+                    if visible_tail:
+                        state.first_token_at = state.first_token_at or time.time()
+                        state.answer_parts.append(visible_tail)
+                    state.metrics = {
+                        "prompt_tokens": int(chunk.get("prompt_eval_count") or 0),
+                        "completion_tokens": int(chunk.get("eval_count") or 0),
+                        "load_duration_ns": int(chunk.get("load_duration") or 0),
+                        "eval_duration_ns": int(chunk.get("eval_duration") or 0),
+                        "done_reason": str(chunk.get("done_reason") or ""),
+                    }
+                    break
+        await gateway.completed(gateway_call)
+    except BaseException:
+        if gateway_call is not None:
+            try:
+                await asyncio.shield(gateway.failed(gateway_call))
+            except BaseException:
+                pass
+        raise
+    finally:
+        if response is not None:
+            run_control.detach(response)
+            try:
+                await asyncio.to_thread(response.close)
+            except Exception:
+                pass
 
 
 def _basic_payload(
@@ -440,61 +600,432 @@ def _basic_payload(
 
 async def _stream_model_tokens(
     *, settings: Dict[str, Any], payload: Dict[str, Any], model: str,
-    project_id: Optional[str], run_control: ChatRunControl,
+    project_id: Optional[str], session_id: str, run_id: str,
+    run_control: ChatRunControl,
     post_chat: Callable[..., Any], state: _GenerationState,
 ) -> AsyncIterator[str]:
-    response = None
-    visible_filter = VisibleResponseFilter()
     try:
-        run_control.raise_if_cancelled_or_expired()
-        with run_control.track_phase("generation", agent_id="basic-chat", model=model):
-            response = post_chat(
-                settings, payload, stream=True,
-                timeout=run_control.bounded_timeout(360), project_id=project_id,
+        await _collect_model_round(
+            settings=settings,
+            payload=payload,
+            model=model,
+            project_id=project_id,
+            session_id=session_id,
+            run_id=run_id,
+            run_control=run_control,
+            post_chat=post_chat,
+            state=state,
+        )
+        for content in state.answer_parts:
+            yield encode_sse("token", {"content": content})
+    except (HookRuntimeError, ModelGatewayDenied, ValueError) as exc:
+        state.failure = {
+            "code": getattr(exc, "code", "MODEL_HOOK_INVALID"),
+            "message": str(exc) or "The model request was rejected by a trusted hook.",
+            "recoverable": True,
+        }
+
+
+def _merge_round_metrics(total: Dict[str, Any], current: Mapping[str, Any]) -> None:
+    for key in (
+        "prompt_tokens",
+        "completion_tokens",
+        "load_duration_ns",
+        "eval_duration_ns",
+    ):
+        total[key] = int(total.get(key) or 0) + int(current.get(key) or 0)
+    if current.get("done_reason"):
+        total["done_reason"] = str(current["done_reason"])
+
+
+def _normalized_model_tool_call(raw: Mapping[str, Any]) -> tuple[str, str, Dict[str, Any]]:
+    function = raw.get("function")
+    if not isinstance(function, Mapping):
+        raise ValueError("tool call is missing a function")
+    name = str(function.get("name") or "").strip().casefold()
+    if not name or len(name) > 160:
+        raise ValueError("tool call has an invalid name")
+    arguments = function.get("arguments")
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except ValueError as exc:
+            raise ValueError("tool call arguments are not valid JSON") from exc
+    if not isinstance(arguments, Mapping):
+        raise ValueError("tool call arguments must be an object")
+    call_id = str(raw.get("id") or f"call_{uuid.uuid4().hex}").strip()
+    if not call_id or len(call_id) > 512 or any(ord(char) < 32 for char in call_id):
+        call_id = f"call_{uuid.uuid4().hex}"
+    return call_id, name, dict(arguments)
+
+
+def _tool_result_message(call_id: str, name: str, value: Any) -> Dict[str, Any]:
+    try:
+        content = json.dumps(value, ensure_ascii=False, allow_nan=False)
+    except (TypeError, ValueError):
+        content = json.dumps(
+            {"success": False, "code": "TOOL_RESULT_INVALID"},
+            ensure_ascii=False,
+        )
+    return {
+        "role": "tool",
+        "tool_call_id": call_id,
+        "name": name,
+        "content": content[:16_384],
+    }
+
+
+async def _governed_tool_events(
+    *,
+    host_tool_runtime: Any,
+    definition: Any,
+    arguments: Mapping[str, Any],
+    call_id: str,
+    run_id: str,
+    session_id: str,
+    project_id: str,
+    run_control: ChatRunControl,
+    result_holder: Dict[str, Any],
+) -> AsyncIterator[str]:
+    call_context = await host_tool_runtime.resolve_call_context(
+        project_id, definition, arguments
+    )
+    remaining = run_control.deadline_remaining()
+    deadline = time.monotonic() + remaining if remaining is not None else None
+    execution = asyncio.create_task(
+        host_tool_runtime.dispatcher.execute(
+            run_id=run_id,
+            project_id=project_id,
+            session_id=session_id,
+            call_id=call_id,
+            tool_name=definition.name,
+            arguments=dict(arguments),
+            connection_id=call_context.connection_id,
+            resource_id=call_context.resource_id,
+            deadline_monotonic=deadline,
+            approval_callback=host_tool_runtime.approval_broker.approval_callback,
+        )
+    )
+    tool_queue = host_tool_runtime.event_queue(run_id)
+    approval_queue = host_tool_runtime.approval_broker.event_queue(run_id)
+    try:
+        while not execution.done():
+            run_control.raise_if_cancelled_or_expired()
+            tool_event = asyncio.create_task(tool_queue.get())
+            approval_event = asyncio.create_task(approval_queue.get())
+            done, pending = await asyncio.wait(
+                {execution, tool_event, approval_event},
+                return_when=asyncio.FIRST_COMPLETED,
             )
-            run_control.attach(response)
-            if int(response.status_code) != 200:
-                state.failure = model_call_error(
-                    settings,
-                    model,
-                    int(response.status_code),
-                    str(response.text or ""),
-                    project_id=project_id,
-                )
-                return
-            for raw in response.iter_lines():
-                run_control.raise_if_cancelled_or_expired()
-                chunk = _decode_chunk(raw)
-                if not chunk:
-                    continue
-                message = chunk.get("message") if isinstance(chunk.get("message"), dict) else {}
-                content = str(message.get("content") or "")
-                visible_content = visible_filter.feed(content)
-                if visible_content:
-                    state.first_token_at = state.first_token_at or time.time()
-                    state.answer_parts.append(visible_content)
-                    yield encode_sse("token", {"content": visible_content})
-                if chunk.get("done"):
-                    visible_tail = visible_filter.feed("", final=True)
-                    if visible_tail:
-                        state.first_token_at = state.first_token_at or time.time()
-                        state.answer_parts.append(visible_tail)
-                        yield encode_sse("token", {"content": visible_tail})
-                    state.metrics = {
-                        "prompt_tokens": int(chunk.get("prompt_eval_count") or 0),
-                        "completion_tokens": int(chunk.get("eval_count") or 0),
-                        "load_duration_ns": int(chunk.get("load_duration") or 0),
-                        "eval_duration_ns": int(chunk.get("eval_duration") or 0),
-                        "done_reason": str(chunk.get("done_reason") or ""),
-                    }
-                    break
+            for task in pending:
+                if task is not execution:
+                    task.cancel()
+            if approval_event in done:
+                payload = approval_event.result()
+                _record_public_event(run_id, "approval_required", payload)
+                yield encode_sse("approval_required", payload)
+            if tool_event in done:
+                event, payload = tool_event.result()
+                _record_public_event(run_id, event, payload)
+                yield encode_sse(event, payload)
+        # The dispatcher awaits its audit sink before returning, so all start
+        # and terminal events are already queued at this point.
+        while not approval_queue.empty():
+            payload = approval_queue.get_nowait()
+            _record_public_event(run_id, "approval_required", payload)
+            yield encode_sse("approval_required", payload)
+        while not tool_queue.empty():
+            event, payload = tool_queue.get_nowait()
+            _record_public_event(run_id, event, payload)
+            yield encode_sse(event, payload)
+        result = await execution
+        host_tool_runtime.approval_broker.mark_consumed(result.approval_id)
+        result_holder["result"] = result
     finally:
-        if response is not None:
-            run_control.detach(response)
+        if not execution.done():
+            execution.cancel()
+            await asyncio.gather(execution, return_exceptions=True)
+
+
+async def _stream_model_tool_loop(
+    *,
+    settings: Dict[str, Any],
+    payload: Dict[str, Any],
+    model: str,
+    project_id: Optional[str],
+    session_id: str,
+    run_id: str,
+    run_control: ChatRunControl,
+    post_chat: Callable[..., Any],
+    state: _GenerationState,
+    host_tool_runtime: Any,
+) -> AsyncIterator[str]:
+    if not project_id or not model_supports_tools(settings, model, project_id=project_id):
+        async for event in _stream_model_tokens(
+            settings=settings,
+            payload=payload,
+            model=model,
+            project_id=project_id,
+            session_id=session_id,
+            run_id=run_id,
+            run_control=run_control,
+            post_chat=post_chat,
+            state=state,
+        ):
+            yield event
+        return
+    try:
+        definitions = await host_tool_runtime.definitions_for_project(project_id)
+    except Exception as exc:
+        LOGGER.warning("Project tools unavailable (%s).", type(exc).__name__)
+        definitions = ()
+    if not definitions:
+        async for event in _stream_model_tokens(
+            settings=settings,
+            payload=payload,
+            model=model,
+            project_id=project_id,
+            session_id=session_id,
+            run_id=run_id,
+            run_control=run_control,
+            post_chat=post_chat,
+            state=state,
+        ):
+            yield event
+        return
+
+    governed_payload = dict(payload)
+    governed_payload["messages"] = [dict(item) for item in payload.get("messages") or []]
+    if governed_payload["messages"] and governed_payload["messages"][0].get("role") == "system":
+        governed_payload["messages"][0]["content"] = (
+            str(governed_payload["messages"][0].get("content") or "")
+            + " Project-scoped tools listed in this request are available. Use only "
+              "those tools, never invent a tool result, and ask before assuming a resource. "
+              "External writes pause for one explicit local approval."
+        )
+    governed_payload["tools"] = [definition.model_schema() for definition in definitions]
+    governed_payload["tool_choice"] = "auto"
+    by_name = {definition.name: definition for definition in definitions}
+    total_calls = 0
+    rounds = 0
+    aggregate_metrics: Dict[str, Any] = {}
+    force_final_reason: Optional[str] = None
+
+    while True:
+        run_control.raise_if_cancelled_or_expired()
+        rounds += 1
+        round_payload = dict(governed_payload)
+        round_payload["messages"] = list(governed_payload["messages"])
+        if force_final_reason is not None:
+            round_payload.pop("tools", None)
+            round_payload["tool_choice"] = "none"
+            final_instruction = (
+                "The governed tool-call limit has been reached. Do not call tools. "
+                "Give the safest useful final answer from the results already provided."
+                if force_final_reason == "tool_limit"
+                else
+                "An external write may have completed, but its result could not be "
+                "confirmed after dispatch. Do not call or retry any tool. Tell the user "
+                "to verify the operation in the connected service before trying again."
+            )
+            round_payload["messages"].append({
+                "role": "system",
+                "content": final_instruction,
+            })
+        round_state = _GenerationState()
+        try:
+            await _collect_model_round(
+                settings=settings,
+                payload=round_payload,
+                model=model,
+                project_id=project_id,
+                session_id=session_id,
+                run_id=run_id,
+                run_control=run_control,
+                post_chat=post_chat,
+                state=round_state,
+            )
+        except (HookRuntimeError, ModelGatewayDenied, ValueError) as exc:
+            state.failure = {
+                "code": getattr(exc, "code", "MODEL_HOOK_INVALID"),
+                "message": str(exc),
+                "recoverable": True,
+            }
+            return
+        _merge_round_metrics(aggregate_metrics, round_state.metrics)
+        if round_state.failure:
+            state.failure = round_state.failure
+            return
+        if force_final_reason is not None:
+            if round_state.tool_calls:
+                state.failure = {
+                    "code": (
+                        "TOOL_CALL_LIMIT_REACHED"
+                        if force_final_reason == "tool_limit"
+                        else "EXECUTION_UNKNOWN"
+                    ),
+                    "message": (
+                        "The model continued requesting tools after the governed limit."
+                        if force_final_reason == "tool_limit"
+                        else (
+                            "An external write may have completed. Verify the connected "
+                            "service before trying again."
+                        )
+                    ),
+                    "recoverable": True,
+                }
+                return
+            state.answer_parts = round_state.answer_parts
+            state.first_token_at = round_state.first_token_at
+            state.metrics = {
+                **aggregate_metrics,
+                "tool_calls": total_calls,
+                "tool_rounds": rounds,
+                "tool_limit_reached": force_final_reason == "tool_limit",
+                "execution_unknown": force_final_reason == "execution_unknown",
+            }
+            for content in state.answer_parts:
+                yield encode_sse("token", {"content": content})
+            return
+        if not round_state.tool_calls:
+            state.answer_parts = round_state.answer_parts
+            state.first_token_at = round_state.first_token_at
+            state.metrics = {
+                **aggregate_metrics,
+                "tool_calls": total_calls,
+                "tool_rounds": rounds,
+            }
+            for content in state.answer_parts:
+                yield encode_sse("token", {"content": content})
+            return
+
+        normalized_calls: List[tuple[str, str, Dict[str, Any]]] = []
+        for raw_call in round_state.tool_calls:
             try:
-                response.close()
-            except Exception:
-                pass
+                normalized_calls.append(_normalized_model_tool_call(raw_call))
+            except ValueError:
+                normalized_calls.append(
+                    (f"call_{uuid.uuid4().hex}", "invalid.tool", {})
+                )
+        governed_payload["messages"].append({
+            "role": "assistant",
+            "content": "".join(round_state.answer_parts),
+            "tool_calls": [
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": name, "arguments": arguments},
+                }
+                for call_id, name, arguments in normalized_calls
+            ],
+        })
+
+        for call_index, (call_id, name, arguments) in enumerate(normalized_calls):
+            if total_calls >= MAX_BASIC_TOOL_CALLS:
+                governed_payload["messages"].append(
+                    _tool_result_message(
+                        call_id,
+                        name,
+                        {
+                            "success": False,
+                            "code": "TOOL_CALL_LIMIT_REACHED",
+                            "message": "The governed tool-call limit was reached.",
+                        },
+                    )
+                )
+                continue
+            total_calls += 1
+            definition = by_name.get(name)
+            if definition is None:
+                failure = {
+                    "success": False,
+                    "code": "TOOL_UNAVAILABLE",
+                    "message": "The requested tool is not available to this Project.",
+                }
+                governed_payload["messages"].append(
+                    _tool_result_message(call_id, name, failure)
+                )
+                event_payload = {
+                    "tool": name,
+                    "tool_call_id": call_id,
+                    "run_id": run_id,
+                    "project_id": project_id,
+                    "success": False,
+                    "result": failure["code"],
+                    "details_redacted": True,
+                    "duration_ms": 0,
+                }
+                _record_public_event(run_id, "tool_end", event_payload)
+                yield encode_sse("tool_end", event_payload)
+                continue
+            result_holder: Dict[str, Any] = {}
+            try:
+                async for event in _governed_tool_events(
+                    host_tool_runtime=host_tool_runtime,
+                    definition=definition,
+                    arguments=arguments,
+                    call_id=call_id,
+                    run_id=run_id,
+                    session_id=session_id,
+                    project_id=project_id,
+                    run_control=run_control,
+                    result_holder=result_holder,
+                ):
+                    yield event
+                result = result_holder["result"]
+                tool_content = {"success": True, "result": result.content}
+            except ToolRuntimeError as exc:
+                tool_content = {"success": False, **exc.as_dict()}
+                event_payload = {
+                    "tool": name,
+                    "tool_call_id": call_id,
+                    "run_id": run_id,
+                    "project_id": project_id,
+                    "success": False,
+                    "result": exc.code,
+                    "details_redacted": True,
+                    "duration_ms": 0,
+                }
+                _record_public_event(run_id, "tool_end", event_payload)
+                yield encode_sse("tool_end", event_payload)
+            governed_payload["messages"].append(
+                _tool_result_message(call_id, name, tool_content)
+            )
+            if tool_content.get("code") == "EXECUTION_UNKNOWN":
+                # Never let the model automatically retry an indeterminate
+                # external write. Satisfy multi-tool response protocols with
+                # explicit skipped results, then force one tool-free answer
+                # telling the user to verify the provider first.
+                for skipped_id, skipped_name, _skipped_arguments in normalized_calls[
+                    call_index + 1:
+                ]:
+                    skipped = {
+                        "success": False,
+                        "code": "TOOL_SKIPPED_AFTER_EXECUTION_UNKNOWN",
+                        "message": (
+                            "This tool was not executed because a prior external write "
+                            "has an unknown result."
+                        ),
+                    }
+                    governed_payload["messages"].append(
+                        _tool_result_message(skipped_id, skipped_name, skipped)
+                    )
+                    skipped_event = {
+                        "tool": skipped_name,
+                        "tool_call_id": skipped_id,
+                        "run_id": run_id,
+                        "project_id": project_id,
+                        "success": False,
+                        "result": skipped["code"],
+                        "details_redacted": True,
+                        "duration_ms": 0,
+                    }
+                    _record_public_event(run_id, "tool_end", skipped_event)
+                    yield encode_sse("tool_end", skipped_event)
+                force_final_reason = "execution_unknown"
+                break
+        if force_final_reason is None and total_calls >= MAX_BASIC_TOOL_CALLS:
+            force_final_reason = "tool_limit"
 
 
 def _persist_failed_run(
@@ -595,6 +1126,7 @@ async def stream_basic_chat(
     history_snapshot: Optional[Iterable[Any]] = None,
     archive_sync: Optional[Callable[[str], bool]] = None,
     post_chat: Optional[Callable[..., Any]] = None,
+    host_tool_runtime: Any = None,
 ) -> AsyncIterator[str]:
     """Stream one direct model response and persist the completed turn."""
     started_at = time.time()
@@ -620,6 +1152,15 @@ async def stream_basic_chat(
         run_id, session_id, turn_id, model, "chat", "running",
         **run_fields,
     )
+    runtime_context = HookContext(
+        event="run.started",
+        project_id=project_id,
+        session_id=session_id,
+        run_id=run_id,
+        retry_of_run_id=retry_of_run_id,
+        metadata={"model": model, "runtime": "basic_chat"},
+    )
+    await get_hook_dispatcher().observe("run.started", runtime_context)
     meta_payload = {
         **binding,
         "model": model,
@@ -638,11 +1179,33 @@ async def stream_basic_chat(
     )
     state = _GenerationState()
     try:
-        async for event in _stream_model_tokens(
-            settings=settings, payload=payload, model=model, project_id=project_id,
-            run_control=run_control, post_chat=post_chat or provider_post_chat, state=state,
-        ):
-            yield event
+        if host_tool_runtime is not None:
+            async for event in _stream_model_tool_loop(
+                settings=settings,
+                payload=payload,
+                model=model,
+                project_id=project_id,
+                session_id=session_id,
+                run_id=run_id,
+                run_control=run_control,
+                post_chat=post_chat or provider_post_chat,
+                state=state,
+                host_tool_runtime=host_tool_runtime,
+            ):
+                yield event
+        else:
+            async for event in _stream_model_tokens(
+                settings=settings,
+                payload=payload,
+                model=model,
+                project_id=project_id,
+                session_id=session_id,
+                run_id=run_id,
+                run_control=run_control,
+                post_chat=post_chat or provider_post_chat,
+                state=state,
+            ):
+                yield event
         if state.failure:
             _persist_failed_run(
                 run_id=run_id, session_id=session_id, turn_id=turn_id,
@@ -656,6 +1219,9 @@ async def stream_basic_chat(
             _record_public_event(
                 run_id, "error", public_failure
             )
+            await get_hook_dispatcher().observe(
+                "run.failed", runtime_context.for_event("run.failed")
+            )
             yield encode_sse("error", public_failure)
             return
         run_control.raise_if_cancelled_or_expired()
@@ -668,6 +1234,9 @@ async def stream_basic_chat(
                 model=model, failure=failure, project_id=project_id,
             )
             _record_public_event(run_id, "error", failure)
+            await get_hook_dispatcher().observe(
+                "run.failed", runtime_context.for_event("run.failed")
+            )
             yield encode_sse(
                 "error", {**failure, "content": failure["message"]}
             )
@@ -688,6 +1257,9 @@ async def stream_basic_chat(
                 project_id=project_id,
             )
             _record_public_event(run_id, "error", failure)
+            await get_hook_dispatcher().observe(
+                "run.failed", runtime_context.for_event("run.failed")
+            )
             yield encode_sse("error", {**failure, "content": failure["message"]})
             return
         run_control.record_usage(
@@ -702,6 +1274,12 @@ async def stream_basic_chat(
             user_message_id=user_message_id, user_query=user_query, answer=answer,
             metrics=metrics, archive_sync=archive_sync, project_id=project_id,
             project_skill_sources=canonical_skill_sources,
+        )
+        await get_hook_dispatcher().observe(
+            "response.persisted", runtime_context.for_event("response.persisted")
+        )
+        await get_hook_dispatcher().observe(
+            "run.completed", runtime_context.for_event("run.completed")
         )
         _record_public_event(run_id, "metrics", metrics)
         yield encode_sse("metrics", metrics)
@@ -721,7 +1299,36 @@ async def stream_basic_chat(
         _record_public_event(
             run_id, "cancelled", cancelled_payload
         )
+        await get_hook_dispatcher().observe(
+            "run.cancelled", runtime_context.for_event("run.cancelled")
+        )
         yield encode_sse("cancelled", cancelled_payload)
+    except asyncio.CancelledError:
+        _persist_failed_run(
+            run_id=run_id,
+            session_id=session_id,
+            turn_id=turn_id,
+            model=model,
+            status="cancelled",
+            extra_metrics={"deadline": run_control.deadline_report()},
+            project_id=project_id,
+        )
+        _record_public_event(
+            run_id,
+            "cancelled",
+            {
+                **binding,
+                "message": "The chat client disconnected.",
+                "recoverable": True,
+                "deadline_exceeded": run_control.deadline_exceeded(),
+            },
+        )
+        await asyncio.shield(
+            get_hook_dispatcher().observe(
+                "run.cancelled", runtime_context.for_event("run.cancelled")
+            )
+        )
+        raise
     except Exception as exc:
         cancelled = run_control.cancelled.is_set()
         failure = None if cancelled else model_transport_error(
@@ -746,4 +1353,12 @@ async def stream_basic_chat(
         _record_public_event(
             run_id, event, public_failure
         )
+        await get_hook_dispatcher().observe(
+            "run.cancelled" if cancelled else "run.failed",
+            runtime_context.for_event("run.cancelled" if cancelled else "run.failed"),
+        )
         yield encode_sse(event, public_failure)
+    finally:
+        close_run = getattr(host_tool_runtime, "close_run", None)
+        if callable(close_run):
+            close_run(run_id)

@@ -24,9 +24,11 @@ _PROVIDER_EXTENSION_GATE: Optional[Callable[[str, Optional[str]], bool]] = None
 
 def configure_provider_extension_gate(
     gate: Optional[Callable[[str, Optional[str]], bool]],
-) -> None:
+) -> Optional[Callable[[str, Optional[str]], bool]]:
     global _PROVIDER_EXTENSION_GATE
+    previous = _PROVIDER_EXTENSION_GATE
     _PROVIDER_EXTENSION_GATE = gate
+    return previous
 
 
 def provider_extension_id(provider_id: str) -> str:
@@ -433,7 +435,41 @@ def _openai_payload(
         supports_tools=True,
         legacy_chat_default=True,
     )
-    return build_openai_chat_payload(payload, stream=stream, profile=resolved)
+    normalized = dict(payload)
+    messages = payload.get("messages")
+    if isinstance(messages, list):
+        normalized_messages: list[Any] = []
+        for raw_message in messages:
+            if not isinstance(raw_message, Mapping):
+                normalized_messages.append(raw_message)
+                continue
+            message = dict(raw_message)
+            raw_calls = message.get("tool_calls")
+            if isinstance(raw_calls, list):
+                calls: list[Any] = []
+                for raw_call in raw_calls:
+                    if not isinstance(raw_call, Mapping):
+                        calls.append(raw_call)
+                        continue
+                    call = dict(raw_call)
+                    function = call.get("function")
+                    if isinstance(function, Mapping):
+                        normalized_function = dict(function)
+                        arguments = normalized_function.get("arguments")
+                        if isinstance(arguments, Mapping):
+                            normalized_function["arguments"] = json.dumps(
+                                dict(arguments),
+                                ensure_ascii=False,
+                                sort_keys=True,
+                                separators=(",", ":"),
+                                allow_nan=False,
+                            )
+                        call["function"] = normalized_function
+                    calls.append(call)
+                message["tool_calls"] = calls
+            normalized_messages.append(message)
+        normalized["messages"] = normalized_messages
+    return build_openai_chat_payload(normalized, stream=stream, profile=resolved)
 
 
 class CompatibleChatResponse:

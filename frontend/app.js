@@ -527,7 +527,7 @@ function renderTaskProgress() {
     taskProgressCenter.hidden = items.length === 0;
     if (
         items.length > 0
-        && window.matchMedia('(max-width: 840px)').matches
+        && window.matchMedia('(max-width: 1180px)').matches
         && window.workbenchRunInspector?.isOpen?.()
     ) {
         setTaskProgressCollapsed(true);
@@ -575,10 +575,62 @@ function setTaskProgressCollapsed(collapsed) {
     taskProgressToggle.title = collapsed ? '展開執行進度' : '收合執行進度';
 }
 
+function syncChatDrawerA11y(drawer = document.getElementById('chat-drawer')) {
+    if (!drawer) return false;
+    const expanded = !drawer.hidden && !drawer.classList.contains('collapsed');
+    drawer.setAttribute('aria-hidden', String(!expanded));
+    drawer.inert = !expanded;
+    if (expanded) drawer.removeAttribute('inert');
+    else drawer.setAttribute('inert', '');
+    document.getElementById('rail-chat')?.setAttribute('aria-expanded', String(expanded));
+    return expanded;
+}
+
+function collapseCompactChatDrawer({ focusTarget = null } = {}) {
+    if (!window.matchMedia('(max-width: 900px)').matches) return false;
+    const drawer = document.getElementById('chat-drawer');
+    if (!drawer || drawer.hidden || drawer.classList.contains('collapsed')) return false;
+    const focusWasInsideDrawer = drawer.contains(document.activeElement);
+    drawer.classList.add('collapsed');
+    syncChatDrawerA11y(drawer);
+    if (focusWasInsideDrawer) {
+        (focusTarget || document.getElementById('rail-chat'))?.focus?.();
+    }
+    return true;
+}
+
+function syncRightSidebarForViewport() {
+    if (window.matchMedia('(max-width: 900px)').matches) {
+        const inspector = window.workbenchRunInspector;
+        const outputOpen = inspector?.isOpen?.() === true;
+        const agentOpen = agentCollaborationPanel && !agentCollaborationPanel.hidden;
+        const artifactOpen = artifactsSandboxPanel?.classList.contains('active') === true;
+        if (outputOpen || agentOpen || artifactOpen) {
+            const activeTab = inspector?.getState?.().activeTab || 'skills';
+            const focusTarget = outputOpen
+                ? document.getElementById(`output-tab-${activeTab}`)
+                : agentOpen
+                    ? document.getElementById('rail-agents')
+                    : (btnSandboxToggle || document.getElementById('rail-artifacts'));
+            collapseCompactChatDrawer({ focusTarget });
+        }
+    }
+    if (
+        window.matchMedia('(max-width: 1180px)').matches
+        && !taskProgressCenter?.hidden
+        && window.workbenchRunInspector?.isOpen?.()
+    ) {
+        setTaskProgressCollapsed(true);
+    }
+}
+
 function prepareRunInspectorOpen() {
-    closeInspectorPanel();
-    closeAgentCollaboration(true);
-    if (window.matchMedia('(max-width: 840px)').matches && !taskProgressCenter?.hidden) {
+    const activeTab = window.workbenchRunInspector?.getState?.().activeTab || 'skills';
+    const focusTarget = document.getElementById(`output-tab-${activeTab}`);
+    closeInspectorPanel({ focusTarget });
+    closeAgentCollaboration(true, { focusTarget });
+    collapseCompactChatDrawer();
+    if (window.matchMedia('(max-width: 1180px)').matches && !taskProgressCenter?.hidden) {
         setTaskProgressCollapsed(true);
     }
 }
@@ -634,13 +686,14 @@ function initTaskProgress() {
         const expanding = taskProgressCenter.classList.contains('collapsed');
         if (
             expanding
-            && window.matchMedia('(max-width: 840px)').matches
+            && window.matchMedia('(max-width: 1180px)').matches
             && window.workbenchRunInspector?.isOpen?.()
         ) {
             setOutputFloatingPanelOpen(false);
         }
         setTaskProgressCollapsed(!expanding);
     });
+    window.addEventListener('resize', syncRightSidebarForViewport, { passive: true });
     taskProgressClockTimer = setInterval(refreshTaskProgressClock, 1000);
 }
 
@@ -913,16 +966,19 @@ function openAgentCollaboration(force = false) {
     if (!agentCollaborationPanel || (!force && agentPanelDismissedForRun)) return;
     setOutputFloatingPanelOpen(false);
     closeInspectorPanel();
+    collapseCompactChatDrawer();
     agentCollaborationPanel.hidden = false;
     document.getElementById('rail-agents')?.classList.add('active');
     renderAgentCollaboration();
 }
 
-function closeAgentCollaboration(dismissForRun = true) {
+function closeAgentCollaboration(dismissForRun = true, { focusTarget = null } = {}) {
     if (!agentCollaborationPanel) return;
+    const focusWasInside = agentCollaborationPanel.contains(document.activeElement);
     agentCollaborationPanel.hidden = true;
     document.getElementById('rail-agents')?.classList.remove('active');
     if (dismissForRun) agentPanelDismissedForRun = true;
+    if (focusWasInside) (focusTarget || document.getElementById('rail-agents'))?.focus?.();
 }
 
 function resetAgentCollaboration() {
@@ -1213,7 +1269,9 @@ function initAgentCollaboration() {
         const saved = Number(localStorage.getItem('agent-collaboration-width'));
         if (Number.isFinite(saved) && saved >= 300) agentCollaborationPanel.style.width = `${saved}px`;
     } catch (error) { /* localStorage 不可用時使用 CSS 預設寬度 */ }
-    agentCollaborationClose?.addEventListener('click', () => closeAgentCollaboration(true));
+    agentCollaborationClose?.addEventListener('click', () => closeAgentCollaboration(true, {
+        focusTarget: document.getElementById('rail-agents'),
+    }));
     agentResourceSummary?.addEventListener('click', () => {
         const expanded = agentResourceSummary.getAttribute('aria-expanded') === 'true';
         agentResourceSummary.setAttribute('aria-expanded', String(!expanded));
@@ -1889,11 +1947,14 @@ function clearOutputSkillsContext(message = '正在切換專案…') {
     renderOutputSkillsPane(null, message);
 }
 
-function setOutputFloatingPanelOpen(open) {
+function setOutputFloatingPanelOpen(open, { restoreFocus = false } = {}) {
     if (open === true && !window.workbenchRunInspector?.isOpen()) {
         window.workbenchRunInspector?.selectTab('skills');
     } else if (open !== true && window.workbenchRunInspector?.isOpen()) {
-        window.workbenchRunInspector?.selectTab(window.workbenchRunInspector.getState().activeTab, { toggle: true });
+        window.workbenchRunInspector?.selectTab(
+            window.workbenchRunInspector.getState().activeTab,
+            { toggle: true, focus: restoreFocus }
+        );
     }
 }
 
@@ -4711,12 +4772,19 @@ function renderVirtualFileTree(filterQuery = "") {
 // 專案工作區已經改為直接整合編輯器，故移除 DOM 樹渲染器
 
 function initArtifactsControls() {
-    btnSandboxClose.addEventListener('click', closeInspectorPanel);
+    btnSandboxClose.addEventListener('click', () => closeInspectorPanel({
+        focusTarget: btnSandboxToggle || document.getElementById('rail-artifacts'),
+    }));
 
     if (btnSandboxToggle) {
         btnSandboxToggle.addEventListener('click', () => {
             const isNowActive = artifactsSandboxPanel.classList.toggle('active');
             btnSandboxToggle.classList.toggle('active', isNowActive);
+            if (isNowActive) {
+                setOutputFloatingPanelOpen(false);
+                closeAgentCollaboration(false);
+                collapseCompactChatDrawer();
+            }
             
             // 防呆引導：如果點擊展開沙盒但目前還沒有代碼
             if (isNowActive && !activeArtifactCode) {
@@ -5818,10 +5886,14 @@ function regenerateLastAnswer() {
 }
 
 // ---- Inspector Panel（P10）----
-function closeInspectorPanel() {
+function closeInspectorPanel({ focusTarget = null } = {}) {
+    const focusWasInside = artifactsSandboxPanel.contains(document.activeElement);
     artifactsSandboxPanel.classList.remove('active');
     artifactsSandboxPanel.setAttribute('aria-label', 'Inspector 面板');
     if (btnSandboxToggle) btnSandboxToggle.classList.remove('active');
+    if (focusWasInside) {
+        (focusTarget || btnSandboxToggle || document.getElementById('rail-artifacts'))?.focus?.();
+    }
 }
 
 function openInspector(tab) {
@@ -5829,6 +5901,7 @@ function openInspector(tab) {
     if (!pane) return;
     setOutputFloatingPanelOpen(false);
     closeAgentCollaboration(false);
+    collapseCompactChatDrawer();
     artifactsSandboxPanel.classList.add('active');
     artifactsSandboxPanel.setAttribute('aria-label', 'Inspector 面板');
     document.querySelectorAll('.inspector-tab').forEach(inspectorTab => {
@@ -6601,15 +6674,30 @@ function initA11y() {
                 else if (top.id === 'extension-permission-modal') {
                     window.workbenchExtensions?.closePermissionReview?.();
                 }
-                else if (top.id === 'extension-center-modal') {
-                    window.workbenchExtensions?.close?.();
-                }
                 else if (top.id === 'cloud-llm-modal') {
                     window.workbenchCloudLlm?.close?.();
                 }
                 else top.classList.remove('active');
+            } else if (primaryWorkspace === 'extensions') {
+                e.preventDefault();
+                window.workbenchExtensions?.close?.();
+            } else if (window.workbenchRunInspector?.isOpen?.()) {
+                e.preventDefault();
+                setOutputFloatingPanelOpen(false, { restoreFocus: true });
+            } else if (agentCollaborationPanel && !agentCollaborationPanel.hidden) {
+                e.preventDefault();
+                closeAgentCollaboration(true);
+                document.getElementById('rail-agents')?.focus();
             } else if (artifactsSandboxPanel.classList.contains('active')) {
+                e.preventDefault();
                 closeInspectorPanel();
+                (btnSandboxToggle || document.getElementById('rail-artifacts'))?.focus?.();
+            } else if (
+                window.matchMedia('(max-width: 900px)').matches
+                && !document.getElementById('chat-drawer')?.classList.contains('collapsed')
+            ) {
+                e.preventDefault();
+                collapseCompactChatDrawer({ focusTarget: document.getElementById('rail-chat') });
             }
             return;
         }
@@ -6649,32 +6737,66 @@ function initA11y() {
 }
 
 let primaryWorkspace = 'chat';
+let runInspectorSuspendedWorkspace = null;
 
 function setPrimaryWorkspace(workspace = 'chat') {
     const workflowMode = workspace === 'workflows';
+    const extensionMode = workspace === 'extensions';
     const chatWorkspace = document.querySelector('main.chat-container');
     const workflowCenter = document.getElementById('n8n-workflow-center');
+    const extensionCenter = document.getElementById('extension-center-workspace');
     const drawer = document.getElementById('chat-drawer');
     const railChat = document.getElementById('rail-chat');
     const railWorkflows = document.getElementById('rail-workflows');
-    if (!chatWorkspace || !workflowCenter || !drawer || !railChat || !railWorkflows) return;
+    const railExtensions = document.getElementById('rail-extensions');
+    if (!chatWorkspace || !workflowCenter || !extensionCenter || !drawer
+        || !railChat || !railWorkflows || !railExtensions) return;
 
-    primaryWorkspace = workflowMode ? 'workflows' : 'chat';
-    chatWorkspace.hidden = workflowMode;
+    const previousWorkspace = primaryWorkspace;
+    primaryWorkspace = workflowMode ? 'workflows' : (extensionMode ? 'extensions' : 'chat');
+    if (extensionMode && previousWorkspace !== 'extensions') {
+        runInspectorSuspendedWorkspace = previousWorkspace;
+    }
+    window.workbenchRunInspector?.setAvailable?.(!extensionMode, {
+        focusTarget: extensionMode ? railExtensions : null,
+    });
+    const returningToSuspendedWorkspace = previousWorkspace === 'extensions'
+        && runInspectorSuspendedWorkspace === primaryWorkspace;
+    if (workflowMode && !returningToSuspendedWorkspace) setOutputFloatingPanelOpen(false);
+    if (!extensionMode) runInspectorSuspendedWorkspace = null;
+    chatWorkspace.hidden = workflowMode || extensionMode;
     workflowCenter.hidden = !workflowMode;
-    drawer.hidden = workflowMode;
-    railChat.classList.toggle('active', !workflowMode);
+    extensionCenter.hidden = !extensionMode;
+    drawer.hidden = workflowMode || extensionMode;
+    syncChatDrawerA11y(drawer);
+    railChat.classList.toggle('active', !workflowMode && !extensionMode);
     railWorkflows.classList.toggle('active', workflowMode);
-    railChat.setAttribute('aria-current', workflowMode ? 'false' : 'page');
+    railExtensions.classList.toggle('active', extensionMode);
+    railChat.setAttribute('aria-current', (!workflowMode && !extensionMode) ? 'page' : 'false');
     railWorkflows.setAttribute('aria-current', workflowMode ? 'page' : 'false');
+    railExtensions.setAttribute('aria-current', extensionMode ? 'page' : 'false');
 
-    if (workflowMode) {
+    if (workflowMode || extensionMode) {
         closeInspectorPanel();
         closeAgentCollaboration(true);
+        if (extensionMode) {
+            window.workbenchN8nWorkflows?.close?.();
+            window.workbenchN8nGovernance?.releaseInspectorContext?.();
+            window.workbenchN8nWorkflows?.useChatInspectorContext?.({ open: false });
+        }
         return;
     }
 
+    if (
+        window.matchMedia('(max-width: 900px)').matches
+        && !drawer.classList.contains('collapsed')
+        && window.workbenchRunInspector?.isOpen?.()
+    ) {
+        setOutputFloatingPanelOpen(false);
+    }
+
     window.workbenchN8nWorkflows?.close?.();
+    window.workbenchN8nGovernance?.releaseInspectorContext?.();
     window.workbenchN8nWorkflows?.useChatInspectorContext?.({ open: false });
 }
 
@@ -6687,7 +6809,19 @@ function initWorkbench(status) {
         openFolderBrowser,
         getProjects: () => sidebarProjects,
         getActiveProjectId: () => activeProjectId,
-        reloadProject: () => loadSessions(searchSessionsInput.value.trim())
+        reloadProject: () => loadSessions(searchSessionsInput.value.trim()),
+        onWorkspaceOpen: () => setPrimaryWorkspace('extensions'),
+        onWorkspaceClose: () => {
+            setPrimaryWorkspace('chat');
+            document.getElementById('rail-chat')?.focus();
+        }
+    });
+    window.workbenchConnectors?.init({
+        apiFetch,
+        apiBase: API_BASE,
+        showToast,
+        getProjects: () => sidebarProjects,
+        getActiveProjectId: () => activeProjectId
     });
     window.workbenchCloudLlm?.init({
         collectProviders: collectModelProviders, providerCard: modelProviderCard,
@@ -6727,16 +6861,24 @@ function initWorkbench(status) {
     const drawer = document.getElementById('chat-drawer');
     document.getElementById('rail-chat').addEventListener('click', () => {
         setPrimaryWorkspace('chat');
+        if (window.matchMedia('(max-width: 900px)').matches) {
+            setOutputFloatingPanelOpen(false);
+            closeInspectorPanel();
+            closeAgentCollaboration(true);
+        }
         drawer.classList.remove('collapsed');
+        syncChatDrawerA11y(drawer);
+        document.getElementById('rail-chat').classList.add('active');
     });
     document.getElementById('rail-workflows').addEventListener('click', () => window.workbenchN8nWorkflows?.open?.());
     document.getElementById('chat-drawer-close').addEventListener('click', () => {
         if (window.matchMedia('(max-width: 900px)').matches) {
             drawer.classList.add('collapsed');
-            document.getElementById('rail-chat').classList.remove('active');
+            syncChatDrawerA11y(drawer);
             return;
         }
         drawer.classList.remove('collapsed');
+        syncChatDrawerA11y(drawer);
         document.getElementById('rail-chat').classList.add('active');
     });
     document.getElementById('rail-knowledge').addEventListener('click', () => openKnowledgeCenter('documents'));
@@ -6750,7 +6892,7 @@ function initWorkbench(status) {
     });
     document.getElementById('rail-models').addEventListener('click', () => openModelManager('installed'));
     document.getElementById('rail-cloud-llm').addEventListener('click', () => window.workbenchCloudLlm?.open());
-    document.getElementById('rail-extensions').addEventListener('click', () => window.workbenchExtensions?.open('installed'));
+    document.getElementById('rail-extensions').addEventListener('click', () => window.workbenchExtensions?.open('available'));
     document.getElementById('rail-settings').addEventListener('click', () => document.getElementById('btn-settings-trigger').click());
     setPrimaryWorkspace('chat');
 

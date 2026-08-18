@@ -20,7 +20,7 @@ from n8n_gmail_crypto import AesGcmContentCipher
 from n8n_gmail_service import FIXED_TEST_RECIPIENT, N8nGmailService
 
 
-def _setup(tmp_path, monkeypatch):
+def _setup(tmp_path, monkeypatch, *, require_extension=None):
     monkeypatch.setattr(database, "DB_PATH", str(tmp_path / "routes.db"))
     database.init_db()
     database.create_project("fixed_project", "Fixed", str(tmp_path / "fixed"))
@@ -57,6 +57,7 @@ def _setup(tmp_path, monkeypatch):
         error_payload=lambda code, message, recoverable=False: {
             "code": code, "message": message, "recoverable": recoverable,
         },
+        require_extension=require_extension,
     ))
     return TestClient(app), now
 
@@ -127,3 +128,26 @@ def test_callbacks_require_signature_at_route_boundary(tmp_path, monkeypatch):
     )
     assert response.status_code == 401
     assert response.json()["detail"]["code"] == "authentication_failed"
+
+
+def test_external_gmail_work_is_blocked_when_n8n_extension_is_disabled(
+    tmp_path,
+    monkeypatch,
+):
+    calls = []
+
+    def gate(extension_id, project_id=None):
+        calls.append((extension_id, project_id))
+        raise RuntimeError("disabled")
+
+    client, _ = _setup(tmp_path, monkeypatch, require_extension=gate)
+    # Read-only status remains available so the user can diagnose and clean up
+    # a disabled integration, but no model generation or external write starts.
+    assert client.get("/api/integrations/n8n/mail-profile").status_code == 200
+    response = client.post(
+        "/api/integrations/n8n/mail/compose",
+        json={"instruction": "Draft", "subject": "Hello", "model": None},
+    )
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "EXTENSION_DISABLED"
+    assert calls == [("builtin.n8n", "fixed_project")]

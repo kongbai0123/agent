@@ -26,13 +26,19 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, Response, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 import database
 from api.routes.attachments import build_attachments_router
 from api.routes.chat import router as chat_router
+from api.routes.connectors import (
+    build_connector_callback_router,
+    build_connectors_router,
+)
+from api.routes.extensions import build_extensions_router
 from api.routes.hermes import build_hermes_router
 from api.routes.models import build_models_router
 from api.routes.n8n_agent import build_n8n_agent_router
@@ -63,6 +69,9 @@ from chat_cancellation import (
     release_chat_run,
 )
 from conversation_store import archive_session, ensure_session_folder, export_session
+from connector_secrets import ConnectorSecretStore
+from connector_service import ConnectorService, ConnectorServiceError
+from connector_store import ConnectorStoreError, ConnectorStore
 from core.settings import (
     apply_network_settings,
     load_settings,
@@ -71,6 +80,10 @@ from core.settings import (
     validate_settings as validate_chat_settings,
 )
 from email_draft_runtime import EmailDraftRuntime
+from extension_registry import (
+    ExtensionError,
+    create_extension_registry,
+)
 from local_session import (
     SESSION_COOKIE_NAME,
     install_local_session_guard,
@@ -78,7 +91,21 @@ from local_session import (
     session_token,
     write_token_file,
 )
+from hook_runtime import (
+    DiagnosticBuiltinHookPlugin,
+    GuardAction,
+    HookContext,
+    HookDispatcher,
+    HookRuntimeError,
+    HookSnapshot,
+    HookSnapshotEntry,
+    configure_hook_dispatcher,
+)
+from hook_audit_store import HookAuditStore
+from host_tools import HostToolRuntime
+from mcp_coordinator import MCPSettingsCoordinator
 from model_client import (
+    configure_provider_extension_gate,
     list_all_models as provider_model_inventory,
     model_profile_for_model,
     provider_for_model,
@@ -128,6 +155,17 @@ from project_skills import ProjectSkillError, ProjectSkillStore
 from runtime_manager import export_session_zip
 from startup_progress import complete_startup, read_startup_status, update_startup
 from structured_log import redact
+from tool_approval_broker import (
+    ToolApprovalBroker,
+    ToolApprovalBrokerError,
+    ToolApprovalNotFound,
+)
+from tool_runtime import (
+    ToolDispatcher,
+    ToolRegistry,
+    ToolScopeState,
+    ToolUnavailableError,
+)
 from workspace import (
     context_for_project,
     context_payload,
@@ -153,6 +191,14 @@ n8n_lifecycle: Optional[ManagedN8nLifecycle] = None
 n8n_gmail_service: Optional[N8nGmailService] = None
 n8n_agent_task_runtime: Optional[N8nAgentTaskRuntime] = None
 n8n_background_tasks: set[asyncio.Task[Any]] = set()
+extension_registry: Any = None
+connector_service: Optional[ConnectorService] = None
+host_tool_runtime: Optional[HostToolRuntime] = None
+mcp_coordinator: Optional[MCPSettingsCoordinator] = None
+application_event_loop: Optional[asyncio.AbstractEventLoop] = None
+hook_dispatcher = configure_hook_dispatcher(
+    HookDispatcher.from_builtin_plugins([DiagnosticBuiltinHookPlugin()])
+)
 
 
 def now_iso() -> str:
@@ -165,6 +211,19 @@ def create_id(prefix: str) -> str:
 
 def sse(event: str, data: Dict[str, Any]) -> str:
     return encode_sse(event, data)
+
+
+def extension_is_enabled(
+    extension_id: str,
+    project_id: Optional[str] = None,
+) -> bool:
+    """Fail closed when an extension lifecycle record is unavailable."""
+
+    registry = extension_registry
+    return bool(
+        registry is not None
+        and registry.is_effectively_enabled(extension_id, project_id)
+    )
 
 
 def error_payload(
@@ -638,6 +697,37 @@ def _authorized_attachment_path(
     return resolved
 
 
+def _hook_snapshot_payload() -> List[Dict[str, Any]]:
+    return [
+        dict(entry.__dict__)
+        for entry in hook_dispatcher.snapshot().entries
+    ]
+
+
+def _stored_hook_snapshot_is_compatible(manifest: Dict[str, Any]) -> bool:
+    raw_entries = manifest.get("hook_snapshot")
+    # Runs created before the Hook MVP remain retry-compatible. Their input is
+    # transformed once during the new attempt and receives a current snapshot.
+    if raw_entries is None:
+        return True
+    if not isinstance(raw_entries, list):
+        return False
+    try:
+        snapshot = HookSnapshot(
+            tuple(
+                HookSnapshotEntry(**dict(item))
+                for item in raw_entries
+                if isinstance(item, dict)
+            )
+        )
+        if len(snapshot.entries) != len(raw_entries):
+            return False
+        hook_dispatcher.verify_snapshot(snapshot)
+        return True
+    except (HookRuntimeError, TypeError, ValueError):
+        return False
+
+
 def _retry_eligibility(run: Dict[str, Any]) -> tuple[bool, Optional[str]]:
     status = str(run.get("status") or "").casefold()
     if status not in {"completed", "failed", "cancelled"}:
@@ -667,6 +757,8 @@ def _retry_eligibility(run: Dict[str, Any]) -> tuple[bool, Optional[str]]:
         or manifest.get("reproducible") is not True
     ):
         return False, str(manifest.get("reason") or "input_manifest_unavailable")
+    if not _stored_hook_snapshot_is_compatible(manifest):
+        return False, "required_hook_snapshot_incompatible"
     try:
         message_id = int(manifest.get("user_message_id"))
     except (TypeError, ValueError):
@@ -852,6 +944,8 @@ def _input_manifest(
     runtime_route: str,
     user_query: str,
     history_snapshot: List[Dict[str, str]],
+    hook_snapshot: Optional[List[Dict[str, Any]]] = None,
+    hook_transform_steps: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     inline_image_count = len(request.images)
     return {
@@ -871,6 +965,8 @@ def _input_manifest(
         "project_skill_provenance": project_skill_provenance,
         "project_skills_truncated": bool(project_skills_truncated),
         "runtime_route": runtime_route,
+        "hook_snapshot": list(hook_snapshot or []),
+        "hook_transform_steps": list(hook_transform_steps or []),
     }
 
 
@@ -1042,8 +1138,76 @@ def _on_managed_n8n_stop() -> None:
     _revoke_n8n_runtime_grants("n8n_stopped")
 
 
+def _extension_project_ids() -> tuple[str, ...]:
+    """Return stable project identities used for project-scoped runtimes."""
+
+    try:
+        return tuple(
+            sorted(
+                str(project["id"])
+                for project in database.get_projects()
+                if project.get("id") and not bool(project.get("archived"))
+            )
+        )
+    except Exception:
+        return ()
+
+
+def _resolve_mcp_secret(alias: str) -> str:
+    """Resolve a non-secret alias from an explicitly named process variable."""
+
+    normalized = re.sub(r"[^A-Z0-9]+", "_", str(alias or "").upper()).strip("_")
+    value = os.environ.get(f"WORKBENCH_MCP_SECRET_{normalized}") if normalized else None
+    if not isinstance(value, str) or not value or "\x00" in value:
+        raise ValueError("The configured MCP secret alias is unavailable.")
+    return value
+
+
+def _schedule_mcp_sync() -> None:
+    """Reconcile MCP safely from sync settings/extension route threads."""
+
+    coordinator = mcp_coordinator
+    loop = application_event_loop
+    if coordinator is None or loop is None or not loop.is_running():
+        return
+
+    async def reconcile() -> None:
+        try:
+            # A global MCP enable toggles its settings-backed enable bit inside
+            # the registry callback. Refresh the persisted catalog before the
+            # coordinator reads effective state, even if the event loop wins
+            # the race with set_global() returning to its caller.
+            await asyncio.to_thread(extension_registry.sync)
+            await coordinator.sync_from_settings(
+                load_settings(),
+                project_ids=_extension_project_ids(),
+            )
+        except Exception as exc:
+            # Coordinator health contains the bounded failure.  Core chat must
+            # remain available even when one local child cannot start.
+            print(f"[MCP] Reconciliation failed: {type(exc).__name__}")
+
+    try:
+        current = asyncio.get_running_loop()
+    except RuntimeError:
+        current = None
+    if current is loop:
+        task = loop.create_task(reconcile(), name="mcp-settings-reconcile")
+        n8n_background_tasks.add(task)
+        task.add_done_callback(n8n_background_tasks.discard)
+    else:
+        asyncio.run_coroutine_threadsafe(reconcile(), loop)
+
+
 @asynccontextmanager
-async def app_lifespan(_app: FastAPI):
+async def _app_runtime_lifespan(_app: FastAPI):
+    await hook_dispatcher.observe(
+        "app.starting",
+        HookContext(
+            event="app.starting",
+            metadata={"app_version": APP_VERSION},
+        ),
+    )
     try:
         write_token_file()
     except Exception as exc:  # pragma: no cover - startup best effort
@@ -1061,12 +1225,18 @@ async def app_lifespan(_app: FastAPI):
     profile = database.get_n8n_gmail_profile()
     if (
         lifecycle is not None
+        and extension_is_enabled("builtin.n8n")
         and profile
         and bool(profile.get("enabled"))
         and bool(profile.get("auto_start"))
     ):
         _schedule_n8n_runtime_start(lifecycle)
-    if mail_service is not None and profile and bool(profile.get("enabled")):
+    if (
+        mail_service is not None
+        and extension_is_enabled("builtin.n8n")
+        and profile
+        and bool(profile.get("enabled"))
+    ):
         try:
             database.expire_n8n_gmail_deliveries(now=now_iso())
             for draft_id in mail_service.recover_generation_jobs():
@@ -1077,17 +1247,47 @@ async def app_lifespan(_app: FastAPI):
         except Exception as exc:  # content remains encrypted and durable
             print(f"[N8N] Recovery scan failed: {type(exc).__name__}")
     task_runtime = n8n_agent_task_runtime
-    if task_runtime is not None:
+    if task_runtime is not None and extension_is_enabled("builtin.n8n"):
         _schedule_n8n_agent_task_recovery(task_runtime)
+    coordinator = mcp_coordinator
+    if coordinator is not None:
+        try:
+            await coordinator.sync_from_settings(
+                load_settings(),
+                project_ids=_extension_project_ids(),
+            )
+        except Exception as exc:
+            print(f"[MCP] Startup reconciliation failed: {type(exc).__name__}")
     try:
+        await hook_dispatcher.observe(
+            "app.ready",
+            HookContext(
+                event="app.ready",
+                metadata={"app_version": APP_VERSION},
+            ),
+        )
         yield
     finally:
+        await hook_dispatcher.observe(
+            "app.stopping",
+            HookContext(
+                event="app.stopping",
+                metadata={"app_version": APP_VERSION},
+            ),
+        )
         if n8n_background_tasks:
             _, pending = await asyncio.wait(
                 tuple(n8n_background_tasks), timeout=30.0
             )
             for task in pending:
                 task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+        if coordinator is not None:
+            try:
+                await coordinator.stop_all()
+            except Exception as exc:
+                print(f"[MCP] Shutdown incomplete: {type(exc).__name__}")
         if lifecycle is not None:
             try:
                 state = await asyncio.to_thread(lifecycle.status)
@@ -1102,6 +1302,26 @@ async def app_lifespan(_app: FastAPI):
             cache.close()
 
 
+@asynccontextmanager
+async def app_lifespan(_app: FastAPI):
+    """Install process-wide runtime gates for exactly one app lifespan.
+
+    The runtime context can fail before yielding or while shutting down. Keep
+    the provider gate restoration in this outermost finally so neither path
+    can leak extension authority into a later app/test lifespan.
+    """
+
+    global application_event_loop
+    application_event_loop = asyncio.get_running_loop()
+    previous_provider_gate = configure_provider_extension_gate(extension_is_enabled)
+    try:
+        async with _app_runtime_lifespan(_app):
+            yield
+    finally:
+        configure_provider_extension_gate(previous_provider_gate)
+        application_event_loop = None
+
+
 ensure_runtime_dirs()
 apply_network_settings(load_settings())
 update_startup(
@@ -1111,6 +1331,13 @@ update_startup(
     progress_percent=28,
 )
 database.init_db()
+hook_audit_store = HookAuditStore(database_module=database)
+hook_dispatcher = configure_hook_dispatcher(
+    HookDispatcher.from_builtin_plugins(
+        [DiagnosticBuiltinHookPlugin()],
+        audit_sink=hook_audit_store.record,
+    )
+)
 migrate_legacy_storage()
 update_startup(
     "workspace",
@@ -1118,6 +1345,273 @@ update_startup(
     detail="載入模型、對話與介面設定",
     progress_percent=92,
 )
+
+
+def _extension_runtime_health(item: Dict[str, Any]) -> tuple[str, Any]:
+    extension_id = str(item.get("id") or "")
+    if extension_id in {"connector.github", "connector.notion"}:
+        assert connector_service is not None
+        return connector_service.extension_health(extension_id)
+    if extension_id == "builtin.n8n":
+        lifecycle = n8n_lifecycle
+        if lifecycle is None:
+            return "unavailable", {"reason": "runtime_not_initialized"}
+        status = lifecycle.status(probe_node=True)
+        state = str(status.get("state") or "failed")
+        return (
+            "ready" if state == "ready" else "degraded" if state == "degraded" else "unavailable",
+            {"state": state, "reason": status.get("reason")},
+        )
+    if extension_id.startswith("mcp."):
+        coordinator = mcp_coordinator
+        if coordinator is None:
+            return "unavailable", {"reason": "mcp_coordinator_unavailable"}
+        health = coordinator.health(extension_id)
+        status = str(health.get("status") or "unknown")
+        public_detail = {
+            "status": status,
+            "running": bool(health.get("running")),
+            "tool_count": int(health.get("tool_count") or 0),
+            "projects": list(health.get("projects") or []),
+            "error_code": health.get("error_code"),
+        }
+        if status == "healthy" and health.get("running"):
+            return "ready", public_detail
+        return "degraded" if status not in {"unknown", "disabled"} else "unavailable", public_detail
+    return "ready", {"registered": True}
+
+
+def _handle_extension_state_change(
+    extension_id: str,
+    enabled: bool,
+    _item: Dict[str, Any],
+) -> None:
+    """Immediately revoke runtime authority when a global extension is disabled."""
+
+    if extension_id.startswith("mcp."):
+        settings_id = extension_id.removeprefix("mcp.")
+        cfg = load_settings()
+        updated = False
+        servers: list[dict[str, Any]] = []
+        for raw in cfg.get("mcp_servers") or []:
+            server = dict(raw)
+            if str(server.get("id") or "").strip().casefold() == settings_id:
+                server["enabled"] = bool(enabled)
+                updated = True
+            servers.append(server)
+        if not updated:
+            raise ValueError("The MCP settings entry is unavailable.")
+        cfg["mcp_servers"] = servers
+        save_settings(cfg)
+        _schedule_mcp_sync()
+
+    if extension_id == "builtin.n8n" and not enabled and n8n_lifecycle is not None:
+        _on_managed_n8n_stop()
+        state = n8n_lifecycle.status(probe_node=False)
+        if str(state.get("state") or "") in {"ready", "starting", "degraded"}:
+            n8n_lifecycle.stop()
+
+
+def _handle_extension_state_rollback(
+    extension_id: str,
+    enabled: bool,
+    item: Dict[str, Any],
+) -> None:
+    """Converge a compensated transition without rewriting MCP settings."""
+
+    if extension_id.startswith("mcp."):
+        # ExtensionRegistry already restored the one digest-bound settings
+        # mirror.  Only enqueue reconciliation here, avoiding an ID-only write
+        # against a concurrently replaced MCP configuration.
+        _schedule_mcp_sync()
+        return
+    if extension_id == "builtin.n8n" and not enabled:
+        # A failed revocation remains fail closed.  Retrying cleanup is safe and
+        # never reopens the persisted authorization gate.
+        _handle_extension_state_change(extension_id, False, item)
+
+
+def _handle_project_extension_state_change(
+    extension_id: str,
+    _project_id: str,
+    _mode: str,
+    _item: Dict[str, Any],
+) -> None:
+    if extension_id.startswith("mcp."):
+        _schedule_mcp_sync()
+
+
+connector_service = ConnectorService(
+    store=ConnectorStore(),
+    secrets_store=ConnectorSecretStore(),
+    project_exists=lambda project_id: database.get_project(project_id) is not None,
+)
+connector_service.initialize()
+extension_registry = create_extension_registry(
+    load_settings=load_settings,
+    save_settings=save_settings,
+    apply_configuration=apply_runtime_configuration,
+    require_project=database.get_project,
+    health_probes={
+        "github": _extension_runtime_health,
+        "notion": _extension_runtime_health,
+        "n8n": _extension_runtime_health,
+        "mcp": _extension_runtime_health,
+    },
+    state_change_handler=_handle_extension_state_change,
+    state_rollback_handler=_handle_extension_state_rollback,
+    project_state_change_handler=_handle_project_extension_state_change,
+    synchronize=True,
+)
+def _manifest_digest(extension_id: str) -> str:
+    row = extension_registry.store.get(extension_id)
+    return str((row or {}).get("manifest_sha256") or "")
+
+
+tool_registry = ToolRegistry()
+tool_approval_broker = ToolApprovalBroker(database_module=database)
+mcp_coordinator = MCPSettingsCoordinator(
+    extension_registry=extension_registry,
+    tool_registry=tool_registry,
+    allowed_cwd_roots=(REPO_ROOT, PROJECTS_ROOT),
+    project_ids_provider=_extension_project_ids,
+    secret_resolver=_resolve_mcp_secret,
+)
+
+
+async def _prepare_project_tools(project_id: str) -> None:
+    try:
+        await mcp_coordinator.sync_from_settings(
+            load_settings(),
+            project_ids=_extension_project_ids(),
+        )
+    except Exception as exc:
+        # MCP health/audit remains inspectable while connector tools and chat
+        # continue to operate normally.
+        print(f"[MCP] Project tool preparation failed: {type(exc).__name__}")
+    mcp_definitions = tuple(
+        definition
+        for definition in tool_registry.for_project(project_id)
+        if str(definition.extension_id).startswith("mcp.")
+    )
+    connector_definitions = tuple(
+        definition
+        for definition in connector_service.runtime_tool_definitions(
+            project_id,
+            _manifest_digest,
+        )
+        if extension_is_enabled(definition.extension_id, project_id)
+    )
+    # One atomic project replacement avoids a window where a healthy MCP tool
+    # disappears while connector definitions are refreshed.
+    tool_registry.replace_project(
+        project_id,
+        (*connector_definitions, *mcp_definitions),
+    )
+
+
+def _resolve_tool_scope(definition: Any, call: Any) -> ToolScopeState:
+    if str(definition.extension_id).startswith("mcp."):
+        try:
+            item = extension_registry.get(
+                definition.extension_id,
+                call.project_id,
+                synchronize=False,
+            )
+            health = mcp_coordinator.health(definition.extension_id)
+        except ExtensionError as exc:
+            raise ToolUnavailableError(
+                str(exc) or "MCP scope is unavailable.",
+                details={"tool_name": definition.name},
+            ) from exc
+        active_projects = {str(value) for value in health.get("projects") or []}
+        return ToolScopeState(
+            installed=bool(item.get("installed")),
+            trusted=bool(item.get("trusted")),
+            enabled=bool(item.get("effective_enabled")),
+            healthy=bool(health.get("running")) and call.project_id in active_projects,
+            resource_allowed=not bool(definition.requires_resource),
+            manifest_sha256=str(item.get("manifest_sha256") or ""),
+            resource_revision=0,
+            connection_enabled=not bool(definition.requires_connection),
+            reason=str(health.get("error_code") or health.get("status") or ""),
+        )
+    try:
+        invocation = connector_service.resolve_tool_invocation(
+            call.project_id,
+            definition.name,
+            call.arguments,
+            verify_remote_scope=True,
+        )
+        item = extension_registry.get(
+            definition.extension_id,
+            call.project_id,
+            synchronize=False,
+        )
+        connection = connector_service.get_connection(invocation["connection_id"])
+    except (ConnectorServiceError, ConnectorStoreError, ExtensionError) as exc:
+        raise ToolUnavailableError(
+            str(exc) or "Connector scope is unavailable.",
+            details={"tool_name": definition.name},
+        ) from exc
+    return ToolScopeState(
+        installed=bool(item.get("installed")),
+        trusted=bool(item.get("trusted")),
+        enabled=bool(item.get("effective_enabled")),
+        healthy=str(connection.get("status") or "") == "connected",
+        resource_allowed=True,
+        manifest_sha256=str(item.get("manifest_sha256") or ""),
+        resource_revision=int(invocation.get("resource_revision") or 0),
+        connection_enabled=True,
+        connection_id=str(invocation["connection_id"]),
+        resource_id=str(invocation["resource_id"]),
+        reason=str(connection.get("error_code") or ""),
+    )
+
+
+tool_dispatcher = ToolDispatcher(
+    tool_registry,
+    scope_resolver=_resolve_tool_scope,
+    hook_dispatcher=hook_dispatcher,
+)
+host_tool_runtime = HostToolRuntime(
+    registry=tool_registry,
+    dispatcher=tool_dispatcher,
+    approval_broker=tool_approval_broker,
+    prepare_project=_prepare_project_tools,
+    resolve_call_context=lambda project_id, definition, arguments: (
+        connector_service.resolve_host_call_context(
+            project_id,
+            definition,
+            arguments,
+        )
+        if str(definition.extension_id).startswith("connector.")
+        else {}
+    ),
+)
+
+
+def save_settings_and_sync(settings: Dict[str, Any]) -> None:
+    save_settings(settings)
+    extension_registry.sync()
+    _schedule_mcp_sync()
+
+
+def require_extension_http(
+    extension_id: str,
+    project_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    try:
+        return extension_registry.require_enabled(extension_id, project_id)
+    except ExtensionError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=error_payload(
+                getattr(exc, "code", "EXTENSION_DISABLED"),
+                str(exc),
+                recoverable=True,
+            ),
+        ) from exc
 
 
 app = FastAPI(title="Local AI Workbench Chat API", lifespan=app_lifespan)
@@ -1129,6 +1623,25 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Content-Type", "X-Workbench-Token"],
 )
+
+
+@app.exception_handler(RequestValidationError)
+async def redacted_request_validation_error(
+    _request: Request,
+    exc: RequestValidationError,
+) -> JSONResponse:
+    """Keep malformed credential payloads out of FastAPI's default 422 body."""
+
+    errors = []
+    for raw in exc.errors():
+        errors.append(
+            {
+                "type": str(raw.get("type") or "validation_error")[:128],
+                "loc": [str(part)[:128] for part in raw.get("loc") or ()],
+                "msg": str(redact(str(raw.get("msg") or "Invalid request.")))[:500],
+            }
+        )
+    return JSONResponse(status_code=422, content={"detail": errors})
 
 
 @app.middleware("http")
@@ -1158,20 +1671,20 @@ system_router = build_system_router(
 models_router = build_models_router(
     database=database,
     load_settings=load_settings,
-    save_settings=save_settings,
+    save_settings=save_settings_and_sync,
     error_payload=error_payload,
     create_id=create_id,
     require_local_workbench=require_local_workbench,
     rag_stats=disabled_service_status,
     ollama_models=ollama_models,
-    require_extension=lambda _extension_id, _project_id=None: None,
+    require_extension=require_extension_http,
     app_version=APP_VERSION,
     agent_protocol_version=1,
 )
 
 settings_router = build_settings_router(
     load_settings=load_settings,
-    save_settings=save_settings,
+    save_settings=save_settings_and_sync,
     validate_settings=validate_settings,
     effective_config=effective_config,
     normalize_modal_size=normalize_settings_modal_size,
@@ -1440,6 +1953,9 @@ n8n_agent_task_runtime = N8nAgentTaskRuntime(
     skill_resolver=_resolve_n8n_agent_skill,
     credential_resolver=_resolve_managed_n8n_credential,
     policy_resolver=_resolve_live_n8n_agent_policy,
+    execution_gate=lambda project_id: extension_registry.require_enabled(
+        "builtin.n8n", project_id
+    ),
     workflow_revision_resolver=_resolve_live_managed_n8n_workflow_revision,
 )
 
@@ -1734,6 +2250,7 @@ n8n_gmail_router = build_n8n_gmail_router(
     service=n8n_gmail_service,
     require_local=require_local_workbench,
     error_payload=error_payload,
+    require_extension=require_extension_http,
 )
 n8n_agent_router = build_n8n_agent_router(
     service=n8n_agent_governance,
@@ -1755,7 +2272,41 @@ n8n_runtime_router = build_n8n_runtime_router(
     workflow_status=lambda: inspect_gmail_workflows_readiness(n8n_lifecycle.paths),
     mail_status=n8n_gmail_service.public_event_snapshot,
     on_stop=_on_managed_n8n_stop,
+    require_extension=require_extension_http,
 )
+
+extensions_router = build_extensions_router(
+    registry=extension_registry,
+    require_local=require_local_workbench,
+    error_payload=error_payload,
+)
+connectors_router = build_connectors_router(
+    service=connector_service,
+    require_local=require_local_workbench,
+    error_payload=error_payload,
+    require_extension=require_extension_http,
+)
+connector_callbacks_router = build_connector_callback_router(
+    service=connector_service,
+    require_extension=require_extension_http,
+)
+
+
+def _observe_session_lifecycle(action: str, payload: Dict[str, Any]) -> None:
+    event = f"session.{action}"
+    hook_dispatcher.observe_sync(
+        event,
+        HookContext(
+            event=event,
+            project_id=(
+                str(payload.get("project_id"))
+                if payload.get("project_id")
+                else None
+            ),
+            session_id=str(payload.get("session_id") or ""),
+            metadata={"model": payload.get("model")},
+        ),
+    )
 
 sessions_router = build_sessions_router(
     database=database,
@@ -1769,6 +2320,7 @@ sessions_router = build_sessions_router(
     export_session_zip=export_session_zip,
     has_active_chat_run=has_active_chat_run,
     session_change_guard=guard_integration_session,
+    session_lifecycle_observer=_observe_session_lifecycle,
 )
 
 attachments_router = build_attachments_router(
@@ -1783,6 +2335,36 @@ attachments_router = build_attachments_router(
     session_access_guard=guard_integration_session,
 )
 
+
+def _resolve_tool_approval(
+    run_id: str,
+    approval_id: str,
+    approved: bool,
+) -> Optional[Dict[str, Any]]:
+    try:
+        return tool_approval_broker.decide(
+            run_id=run_id,
+            approval_id=approval_id,
+            approved=approved,
+            decided_by="local_session",
+            rationale=(
+                "Approved once by the local Workbench user."
+                if approved
+                else "Denied by the local Workbench user."
+            ),
+        )
+    except ToolApprovalNotFound:
+        return None
+    except ToolApprovalBrokerError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=error_payload(
+                getattr(exc, "code", "TOOL_APPROVAL_INVALID"),
+                str(exc),
+                recoverable=True,
+            ),
+        ) from exc
+
 hermes_router = build_hermes_router(
     manager_provider=lambda: hermes_manager_cache.try_get(load_settings()),
     status_provider=hermes_status_payload,
@@ -1790,6 +2372,7 @@ hermes_router = build_hermes_router(
     error_payload=error_payload,
     cancel_local_run=cancel_chat_run,
     rollback_handler=rollback_hermes_rollout,
+    generic_approval_resolver=_resolve_tool_approval,
 )
 
 run_results_router = build_run_results_router(
@@ -1803,6 +2386,9 @@ for domain_router in (
     projects_router,
     project_skills_router,
     attachments_router,
+    extensions_router,
+    connectors_router,
+    connector_callbacks_router,
     hermes_router,
     n8n_gmail_router,
     n8n_agent_router,
@@ -1836,6 +2422,7 @@ async def chat(request: ChatRequest):
             ),
         )
 
+    existing_session = database.get_session(session_id)
     database.create_session(session_id, model=model)
     session = database.get_session(session_id)
     if session and str(session.get("mode") or "").casefold() == "email":
@@ -1853,12 +2440,94 @@ async def chat(request: ChatRequest):
         else None
     )
     project_id = project.get("id") if project else None
+    settings = {**settings, "_extension_project_id": project_id}
+
+    if existing_session is None:
+        await hook_dispatcher.observe(
+            "session.created",
+            HookContext(
+                event="session.created",
+                project_id=project_id,
+                session_id=session_id,
+                metadata={"model": model},
+            ),
+        )
 
     temporary_text, images = _resolve_chat_inputs(
         request,
         session_id=session_id,
         project_id=project_id,
     )
+
+    input_hook_context = HookContext(
+        event="chat.input.before_dispatch",
+        project_id=project_id,
+        session_id=session_id,
+        run_id=run_id,
+        retry_of_run_id=request.retry_of_run_id,
+        metadata={"model": model, "input_kind": "chat"},
+    )
+    hook_snapshot = _hook_snapshot_payload()
+    if retry_manifest is not None and "hook_snapshot" in retry_manifest:
+        dispatch_query = str(retry_manifest.get("user_message") or "")
+        hook_transform_steps = [
+            dict(item)
+            for item in retry_manifest.get("hook_transform_steps") or []
+            if isinstance(item, dict)
+        ]
+    else:
+        try:
+            transformed = await hook_dispatcher.transform_with_trace(
+                "chat.input.before_dispatch",
+                input_hook_context,
+                user_query,
+            )
+        except HookRuntimeError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail=error_payload(
+                    getattr(exc, "code", "HOOK_TRANSFORM_FAILED"),
+                    str(exc),
+                    recoverable=True,
+                ),
+            ) from exc
+        dispatch_query = str(transformed.value or "").strip()
+        hook_transform_steps = [dict(step.__dict__) for step in transformed.steps]
+    if not dispatch_query:
+        raise HTTPException(
+            status_code=409,
+            detail=error_payload(
+                "HOOK_TRANSFORM_FAILED",
+                "A trusted input hook produced an empty chat request.",
+                recoverable=True,
+            ),
+        )
+    try:
+        input_guard = await hook_dispatcher.guard(
+            "chat.input.before_dispatch",
+            input_hook_context,
+        )
+    except HookRuntimeError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=error_payload(
+                getattr(exc, "code", "HOOK_GUARD_UNAVAILABLE"),
+                str(exc),
+                recoverable=True,
+            ),
+        ) from exc
+    if input_guard.action is not GuardAction.ABSTAIN:
+        raise HTTPException(
+            status_code=403 if input_guard.action is GuardAction.DENY else 409,
+            detail=error_payload(
+                "HOOK_GUARD_DENIED"
+                if input_guard.action is GuardAction.DENY
+                else "HOOK_APPROVAL_UNSUPPORTED",
+                input_guard.reason
+                or "A trusted hook did not permit this chat input.",
+                recoverable=True,
+            ),
+        )
 
     # Hermes currently accepts text-only turns. Images and stored attachments
     # stay on the mature basic-chat path until their boundary is explicitly
@@ -1937,7 +2606,7 @@ async def chat(request: ChatRequest):
             # one-turn Skill activation and provenance identity.
             hermes_skill_attachment = hermes_manager.prepare_project_skills(
                 session_id,
-                user_query,
+                dispatch_query,
                 run_id=run_id,
                 consume_turn=True,
             )
@@ -1947,7 +2616,7 @@ async def chat(request: ChatRequest):
         else:
             project_skill_prompt = project_skill_runtime.build_prompt_context(
                 session_id,
-                user_query,
+                dispatch_query,
                 run_id=run_id,
                 consume_turn=True,
             )
@@ -1988,8 +2657,45 @@ async def chat(request: ChatRequest):
             ),
         )
 
+    run_hook_context = HookContext(
+        event="run.before_start",
+        project_id=project_id,
+        session_id=session_id,
+        run_id=run_id,
+        retry_of_run_id=request.retry_of_run_id,
+        deadline_monotonic=(
+            time.monotonic() + float(settings.get("chat_run_budget_seconds") or 600)
+        ),
+        metadata={
+            "model": model,
+            "runtime": "hermes" if hermes_manager is not None else "basic_chat",
+        },
+    )
+    try:
+        run_guard = await hook_dispatcher.guard("run.before_start", run_hook_context)
+    except HookRuntimeError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=error_payload(
+                getattr(exc, "code", "HOOK_GUARD_UNAVAILABLE"),
+                str(exc),
+                recoverable=True,
+            ),
+        ) from exc
+    if run_guard.action is not GuardAction.ABSTAIN:
+        raise HTTPException(
+            status_code=403 if run_guard.action is GuardAction.DENY else 409,
+            detail=error_payload(
+                "HOOK_GUARD_DENIED"
+                if run_guard.action is GuardAction.DENY
+                else "HOOK_APPROVAL_UNSUPPORTED",
+                run_guard.reason or "A trusted hook did not permit this run.",
+                recoverable=True,
+            ),
+        )
+
     cancel_session_chat_runs(session_id, exclude_run_id=run_id)
-    normalized_prompt = user_query.replace("\r\n", "\n").replace("\r", "\n").strip()
+    normalized_prompt = dispatch_query.replace("\r\n", "\n").replace("\r", "\n").strip()
     prompt_sha256 = hashlib.sha256(normalized_prompt.encode("utf-8")).hexdigest()
     run_control = register_chat_run(
         run_id,
@@ -2025,7 +2731,7 @@ async def chat(request: ChatRequest):
             "user",
             user_query,
             visible_content=user_query,
-            llm_content=user_query,
+            llm_content=dispatch_query,
             turn_id=turn_id,
         )
     run_input_manifest = _input_manifest(
@@ -2037,8 +2743,10 @@ async def chat(request: ChatRequest):
         project_skill_provenance=project_skill_provenance,
         project_skills_truncated=project_skills_truncated,
         runtime_route="hermes" if hermes_manager is not None else "basic",
-        user_query=user_query,
+        user_query=dispatch_query,
         history_snapshot=history_snapshot,
+        hook_snapshot=hook_snapshot,
+        hook_transform_steps=hook_transform_steps,
     )
 
     async def basic_stream(skill_attachment=None):
@@ -2056,7 +2764,7 @@ async def chat(request: ChatRequest):
             run_id=run_id,
             prompt_sha256=prompt_sha256,
             user_message_id=user_message_id,
-            user_query=user_query,
+            user_query=dispatch_query,
             temporary_context=temporary_text,
             images=images,
             run_control=run_control,
@@ -2067,6 +2775,7 @@ async def chat(request: ChatRequest):
             input_manifest=run_input_manifest,
             history_snapshot=history_snapshot,
             archive_sync=sync_session_archive,
+            host_tool_runtime=host_tool_runtime,
         ):
             yield item
 
@@ -2081,7 +2790,7 @@ async def chat(request: ChatRequest):
                     run_id=run_id,
                     prompt_sha256=prompt_sha256,
                     user_message_id=user_message_id,
-                    user_query=user_query,
+                    user_query=dispatch_query,
                     temporary_context=temporary_text,
                     run_control=run_control,
                     fallback_stream_factory=basic_stream,

@@ -12,8 +12,12 @@
 
     const state = {
         initialized: false,
+        available: true,
         expanded: true,
+        expandedBeforeUnavailable: true,
         activeTab: 'skills',
+        contentOwner: 'chat',
+        contentGeneration: 0,
         context: { sessionId: null, projectId: null, projectName: '' },
         contextRequestId: 0,
         runRequestId: 0,
@@ -31,6 +35,150 @@
 
     const encoded = value => encodeURIComponent(String(value || ''));
     const array = value => Array.isArray(value) ? value : [];
+
+    function interactionKey(kind, ...parts) {
+        return [kind, ...parts].map(part => encodeURIComponent(String(part ?? ''))).join(':');
+    }
+
+    function markInteraction(node, key, { focus = false } = {}) {
+        if (!node || !key) return node;
+        node.dataset.inspectorStateKey = key;
+        if (focus) node.dataset.inspectorFocusKey = key;
+        return node;
+    }
+
+    function descendantElements(root) {
+        const result = [];
+        const visit = node => {
+            const children = Array.from(node?.children || node?.childNodes || []);
+            children.forEach(child => {
+                if (!child || typeof child !== 'object') return;
+                result.push(child);
+                visit(child);
+            });
+        };
+        visit(root);
+        return result;
+    }
+
+    function containsNode(root, node) {
+        if (!root || !node) return false;
+        if (typeof root.contains === 'function') return root.contains(node);
+        return root === node || descendantElements(root).includes(node);
+    }
+
+    function currentContextKey() {
+        return interactionKey('context', state.context.projectId || '', state.context.sessionId || '');
+    }
+
+    function captureInteractionState() {
+        const snapshot = {
+            contextKey: currentContextKey(),
+            scrollTop: Object.fromEntries(TAB_ORDER.map(name => [name, Number(dom.panes[name]?.scrollTop || 0)])),
+            details: new Map(),
+            focusKey: null,
+            focusWasInsideRenderedContent: false,
+        };
+        descendantElements(dom.panel).forEach(node => {
+            const stateKey = node.dataset?.inspectorStateKey;
+            if (node.tagName !== 'DETAILS' || !stateKey) return;
+            const preview = descendantElements(node).find(child => child.tagName === 'PRE');
+            const loaded = ['true', 'error'].includes(String(node.dataset.loaded || ''))
+                ? String(node.dataset.loaded)
+                : null;
+            snapshot.details.set(stateKey, {
+                open: node.open === true,
+                loaded,
+                content: loaded ? String(preview?.textContent || '') : null,
+            });
+        });
+
+        const active = document.activeElement;
+        const renderedHosts = [dom.usedSkills, dom.execution, dom.results];
+        snapshot.focusWasInsideRenderedContent = renderedHosts.some(host => containsNode(host, active));
+        if (snapshot.focusWasInsideRenderedContent) {
+            const keyed = descendantElements(dom.panel).find(node => (
+                node.dataset?.inspectorFocusKey
+                && containsNode(node, active)
+            ));
+            snapshot.focusKey = keyed?.dataset?.inspectorFocusKey || null;
+        }
+        return snapshot;
+    }
+
+    function resetPaneScroll() {
+        TAB_ORDER.forEach(name => {
+            if (dom.panes[name]) dom.panes[name].scrollTop = 0;
+        });
+    }
+
+    function restoreInteractionState(snapshot, { reset = false } = {}) {
+        if (reset || !snapshot || snapshot.contextKey !== currentContextKey()) {
+            resetPaneScroll();
+            if (
+                snapshot?.focusWasInsideRenderedContent
+                && state.available
+                && state.expanded
+            ) {
+                dom.tabs[state.activeTab]?.focus?.();
+            }
+            return;
+        }
+
+        const descendants = descendantElements(dom.panel);
+        descendants.forEach(node => {
+            const saved = snapshot.details.get(node.dataset?.inspectorStateKey);
+            if (node.tagName !== 'DETAILS' || !saved) return;
+            if (saved.loaded) {
+                const preview = descendantElements(node).find(child => child.tagName === 'PRE');
+                node.dataset.loaded = saved.loaded;
+                if (preview) preview.textContent = saved.content || '';
+            }
+            node.open = saved.open;
+        });
+        TAB_ORDER.forEach(name => {
+            if (dom.panes[name]) dom.panes[name].scrollTop = snapshot.scrollTop[name] || 0;
+        });
+
+        if (!snapshot.focusWasInsideRenderedContent || !state.available || !state.expanded) return;
+        const focusTarget = descendants.find(node => (
+            node.dataset?.inspectorFocusKey === snapshot.focusKey
+            && node.hidden !== true
+            && node.disabled !== true
+            && typeof node.focus === 'function'
+        ));
+        if (focusTarget) focusTarget.focus();
+        else dom.tabs[state.activeTab]?.focus?.();
+    }
+
+    function claimContentOwner(owner) {
+        const normalized = String(owner || '').trim();
+        if (!normalized) throw new Error('Inspector content owner is required.');
+        state.contentOwner = normalized;
+        state.contentGeneration += 1;
+        return Object.freeze({ owner: normalized, generation: state.contentGeneration });
+    }
+
+    function contentOwnerMatches(leaseOrOwner, generation = null) {
+        const owner = typeof leaseOrOwner === 'object'
+            ? String(leaseOrOwner?.owner || '')
+            : String(leaseOrOwner || '');
+        const expectedGeneration = typeof leaseOrOwner === 'object'
+            ? Number(leaseOrOwner?.generation)
+            : (generation == null ? null : Number(generation));
+        return owner === state.contentOwner
+            && (expectedGeneration == null || expectedGeneration === state.contentGeneration);
+    }
+
+    function releaseContentOwner(owner = null, fallback = 'chat') {
+        if (owner && !contentOwnerMatches(owner)) return false;
+        claimContentOwner(fallback);
+        return true;
+    }
+
+    function getContentOwner() {
+        return { owner: state.contentOwner, generation: state.contentGeneration };
+    }
 
     function element(tag, className = '', text = null) {
         const node = document.createElement(tag);
@@ -121,33 +269,64 @@
     }
 
     function syncTabs() {
-        dom.panel.hidden = !state.expanded;
-        document.documentElement?.classList.toggle('run-inspector-open', state.expanded);
+        const visible = state.available && state.expanded;
+        if (dom.workspace) dom.workspace.hidden = !state.available;
+        dom.panel.hidden = !visible;
+        dom.panel.setAttribute('aria-hidden', visible ? 'false' : 'true');
+        document.documentElement?.classList.toggle('run-inspector-open', visible);
         TAB_ORDER.forEach(name => {
             const selected = state.activeTab === name;
             const tab = dom.tabs[name];
             const pane = dom.panes[name];
-            tab.classList.toggle('active', selected && state.expanded);
+            tab.classList.toggle('active', selected && visible);
             tab.setAttribute('aria-selected', selected ? 'true' : 'false');
-            tab.setAttribute('aria-expanded', selected && state.expanded ? 'true' : 'false');
+            tab.setAttribute('aria-expanded', selected && visible ? 'true' : 'false');
             tab.tabIndex = selected ? 0 : -1;
-            pane.hidden = !selected;
-            pane.classList.toggle('active', selected);
+            pane.hidden = !selected || !visible;
+            pane.classList.toggle('active', selected && visible);
         });
         dom.title.textContent = TAB_TITLES[state.activeTab];
     }
 
     function selectTab(name, { focus = false, toggle = false } = {}) {
         if (!TAB_ORDER.includes(name)) return;
+        const previousTab = state.activeTab;
+        const focusedInsidePanel = typeof dom.panel.contains === 'function'
+            && dom.panel.contains(document.activeElement);
         if (toggle && state.activeTab === name && state.expanded) {
             state.expanded = false;
         } else {
-            deps?.beforeOpen?.();
             state.activeTab = name;
-            state.expanded = true;
+            if (state.available) {
+                deps?.beforeOpen?.();
+                state.expanded = true;
+            } else {
+                state.expanded = false;
+            }
         }
         syncTabs();
-        if (focus) dom.tabs[name].focus();
+        const movedFromFocusedPane = focusedInsidePanel && previousTab !== state.activeTab;
+        if (focus || movedFromFocusedPane || (!state.expanded && focusedInsidePanel && state.available)) {
+            dom.tabs[name].focus();
+        }
+    }
+
+    function setAvailable(available, { focusTarget = null } = {}) {
+        const focusedInsideWorkspace = typeof dom.workspace?.contains === 'function'
+            && dom.workspace.contains(document.activeElement);
+        const nextAvailable = available === true;
+        const wasAvailable = state.available;
+        if (!nextAvailable && wasAvailable) {
+            state.expandedBeforeUnavailable = state.expanded;
+            state.expanded = false;
+        } else if (nextAvailable && !wasAvailable) {
+            state.expanded = state.expandedBeforeUnavailable;
+        }
+        state.available = nextAvailable;
+        syncTabs();
+        if (!state.available && focusedInsideWorkspace && typeof focusTarget?.focus === 'function') {
+            focusTarget.focus();
+        }
     }
 
     function onTabKeydown(event) {
@@ -224,7 +403,11 @@
         host.replaceChildren(list);
     }
 
-    function renderApproval(approval) {
+    function renderApproval(approval, index = 0) {
+        const approvalKey = interactionKey(
+            'approval',
+            approval.approval_id || approval.capability || approval.tool || index
+        );
         const card = element('article', 'run-inspector-approval');
         const title = element('div', 'run-inspector-item-title');
         title.append(
@@ -236,6 +419,8 @@
         const actions = element('div', 'run-inspector-actions');
         const reject = element('button', 'run-inspector-button secondary', '拒絕');
         const approve = element('button', 'run-inspector-button primary', '核准');
+        markInteraction(reject, interactionKey(approvalKey, 'reject'), { focus: true });
+        markInteraction(approve, interactionKey(approvalKey, 'approve'), { focus: true });
         reject.type = approve.type = 'button';
         reject.disabled = approve.disabled = approval.deciding === true;
         reject.addEventListener('click', () => void decideApproval(approval, false));
@@ -261,7 +446,7 @@
         const approvals = state.execution.approvals.filter(item => item.status === 'pending');
         if (approvals.length) {
             const approvalSection = section('等待核准', approvals.length);
-            approvals.forEach(item => approvalSection.appendChild(renderApproval(item)));
+            approvals.forEach((item, index) => approvalSection.appendChild(renderApproval(item, index)));
             fragment.appendChild(approvalSection);
         }
 
@@ -315,6 +500,7 @@
             errorSection.appendChild(empty(state.execution.error.message || String(state.execution.error), 'is-error'));
             if (state.execution.retry?.allowed === true && deps.retryRun && state.run?.runId) {
                 const retry = element('button', 'run-inspector-button secondary run-inspector-retry', '重新執行本輪');
+                markInteraction(retry, interactionKey('retry', state.run.runId), { focus: true });
                 retry.type = 'button';
                 retry.addEventListener('click', async () => {
                     retry.disabled = true;
@@ -336,7 +522,11 @@
         deps.createIcons?.();
     }
 
-    function renderArtifact(artifact) {
+    function renderArtifact(artifact, index = 0) {
+        const artifactKey = interactionKey(
+            'artifact',
+            artifact.artifact_id || artifact.id || artifact.path || artifact.filename || index
+        );
         const row = element('article', 'run-inspector-item');
         const title = element('div', 'run-inspector-item-title');
         title.append(icon('file'), element('strong', '', artifact.title || artifact.name || artifact.filename || artifact.path || '產出檔案'));
@@ -347,13 +537,20 @@
         const preview = artifact.preview ?? artifact.content_preview;
         if (typeof preview === 'string' && preview) {
             const details = element('details', 'run-inspector-preview');
-            details.append(element('summary', '', '安全預覽'), element('pre', '', preview.slice(0, 12000)));
+            const detailsKey = interactionKey(artifactKey, 'inline-preview');
+            const summary = element('summary', '', '安全預覽');
+            markInteraction(details, detailsKey);
+            markInteraction(summary, interactionKey(detailsKey, 'summary'), { focus: true });
+            details.append(summary, element('pre', '', preview.slice(0, 12000)));
             row.appendChild(details);
         }
         array(artifact.files).forEach(file => {
             const details = element('details', 'run-inspector-preview');
+            const detailsKey = interactionKey(artifactKey, 'file', file.path || '');
             const summary = element('summary', '', file.path || '預覽檔案');
             const body = element('pre', '', '展開後載入…');
+            markInteraction(details, detailsKey);
+            markInteraction(summary, interactionKey(detailsKey, 'summary'), { focus: true });
             details.append(summary, body);
             details.addEventListener('toggle', () => {
                 if (details.open && !details.dataset.loaded) void loadArtifactPreview(artifact, file, details, body);
@@ -391,7 +588,7 @@
         }
     }
 
-    function renderChange(change) {
+    function renderChange(change, index = 0, scope = 'run') {
         change = normalizeChange(change);
         if (!change) return empty('此變更沒有安全的相對路徑。', 'is-error');
         const row = element('article', 'run-inspector-item run-inspector-change');
@@ -407,8 +604,11 @@
         }
         if (change.path && state.context.projectId) {
             const details = element('details', 'run-inspector-preview');
+            const detailsKey = interactionKey('change', scope, change.path || index);
             const summary = element('summary', '', '查看 Diff');
             const body = element('pre', '', '展開後載入…');
+            markInteraction(details, detailsKey);
+            markInteraction(summary, interactionKey(detailsKey, 'summary'), { focus: true });
             details.append(summary, body);
             details.addEventListener('toggle', () => {
                 if (details.open && !details.dataset.loaded) void loadDiff(change.path, details, body);
@@ -437,13 +637,13 @@
         const fragment = document.createDocumentFragment();
         const artifacts = state.results.artifacts;
         const artifactSection = section('生成的檔案與預覽', artifacts.length);
-        if (artifacts.length) artifacts.forEach(item => artifactSection.appendChild(renderArtifact(item)));
+        if (artifacts.length) artifacts.forEach((item, index) => artifactSection.appendChild(renderArtifact(item, index)));
         else artifactSection.appendChild(empty('本輪沒有可驗證的生成檔案。'));
         fragment.appendChild(artifactSection);
 
         const changes = state.results.changes;
         const changeSection = section('本輪修改與 Diff', changes.length);
-        if (changes.length) changes.forEach(item => changeSection.appendChild(renderChange(item)));
+        if (changes.length) changes.forEach((item, index) => changeSection.appendChild(renderChange(item, index, 'run')));
         else changeSection.appendChild(empty('本輪沒有可歸屬的檔案變更。'));
         fragment.appendChild(changeSection);
 
@@ -504,7 +704,7 @@
             if (workspaceChanges.length) {
                 const label = element('div', 'run-inspector-meta', `目前工作區變更 · ${workspaceChanges.length}`);
                 workspace.appendChild(label);
-                workspaceChanges.forEach(change => workspace.appendChild(renderChange(change)));
+                workspaceChanges.forEach((change, index) => workspace.appendChild(renderChange(change, index, 'workspace')));
             }
             vcsSection.appendChild(workspace);
         } else if (state.workspaceVcs.status === 'error') {
@@ -527,7 +727,8 @@
         deps.createIcons?.();
     }
 
-    function renderAll() {
+    function renderAll({ resetInteraction = false } = {}) {
+        const interaction = captureInteractionState();
         dom.project.textContent = state.context.projectName || (state.context.projectId ? '目前專案' : '尚未選擇專案');
         renderUsedSkills();
         renderExecution();
@@ -537,6 +738,7 @@
         setBadge('skills', state.usedSkills.items.length);
         setBadge('execution', pending || running, pending ? 'is-warning' : '');
         setBadge('results', state.results.artifacts.length + state.results.changes.length);
+        restoreInteractionState(interaction, { reset: resetInteraction });
     }
 
     function resetRunState() {
@@ -556,12 +758,13 @@
             renderAll();
             return;
         }
+        claimContentOwner('chat');
         cancelPendingApprovals('對話或專案已切換。');
         const requestId = ++state.contextRequestId;
         ++state.runRequestId;
         resetRunState();
         state.workspaceVcs = { status: projectId ? 'loading' : 'idle', value: null, error: null };
-        renderAll();
+        renderAll({ resetInteraction: true });
         const jobs = [];
         if (sessionId) jobs.push(hydrateLatestRun(requestId, sessionId));
         if (projectId) jobs.push(hydrateWorkspaceVcs(requestId, projectId));
@@ -613,7 +816,7 @@
             if (contextRequestId !== state.contextRequestId) return;
             state.workspaceVcs = { status: 'error', value: null, error: error.message };
         }
-        renderResults();
+        renderAll();
     }
 
     function mergeByIdentity(snapshotItems, liveItems, identity) {
@@ -830,8 +1033,16 @@
         else if (type === 'agent_failed') upsertAgent(data, 'failed');
         else if (type === 'approval_required') {
             const approvalId = String(data.approval_id || '');
+            let added = false;
             if (!state.execution.approvals.some(item => String(item.approval_id) === approvalId)) {
                 state.execution.approvals.push({ ...data, approval_id: approvalId, status: 'pending' });
+                added = true;
+            }
+            if (added && !state.available) {
+                deps.showToast?.(
+                    '此執行正在等待批准。請回到「聊天」或「流程」，再開啟右側「執行」處理。',
+                    'warning'
+                );
             }
             selectTab('execution');
         } else if (type === 'approval_decided') {
@@ -872,7 +1083,7 @@
     async function decideApproval(approval, approved) {
         if (approval.deciding || approval.status !== 'pending') return;
         approval.deciding = true;
-        renderExecution();
+        renderAll();
         try {
             const runId = approval.run_id || state.run?.runId;
             await request(`/api/chat/runs/${encoded(runId)}/approval`, {
@@ -956,6 +1167,7 @@
         };
         if (typeof deps.apiFetch !== 'function') throw new Error('Run Inspector 需要 apiFetch。');
         dom = {
+            workspace: document.getElementById('output-floating-workspace'),
             panel: document.getElementById('output-floating-panel'),
             title: document.getElementById('output-panel-title'),
             project: document.getElementById('output-panel-project'),
@@ -975,6 +1187,9 @@
             dom.tabs[name].addEventListener('keydown', onTabKeydown);
         });
         state.initialized = true;
+        if (state.expanded && window.matchMedia?.('(max-width: 900px)').matches) {
+            deps.beforeOpen?.();
+        }
         syncTabs();
         renderAll();
         deps.createIcons?.();
@@ -992,7 +1207,12 @@
         hydrateSkills,
         markError,
         selectTab,
-        isOpen: () => state.initialized && state.expanded,
+        setAvailable,
+        claimContentOwner,
+        contentOwnerMatches,
+        releaseContentOwner,
+        getContentOwner,
+        isOpen: () => state.initialized && state.available && state.expanded,
         getState: () => state,
     };
 })();

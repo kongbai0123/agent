@@ -23,6 +23,40 @@
     --sidebar-width: 320px;
     --navigation-rail-width: 54px;
     --navigation-drawer-width: 232px;
+    /* Right-surface layout contract.  A dock participates in workbench flex on
+       desktop; the floating inspector owns this reserved edge; compact docks
+       become bounded overlays below the top bar. */
+    --right-tab-rail-width: 46px;
+    --right-surface-gap: 16px;
+    --right-rail-safe-area: calc(var(--right-tab-rail-width) + var(--right-surface-gap));
+    --right-inspector-width: clamp(320px, 24vw, 380px);
+    --right-inspector-safe-area: calc(var(--right-inspector-width) + var(--right-rail-safe-area));
+    --right-compact-bottom-inset: 0px;
+    --right-compact-panel-offset: 24px;
+    --right-compact-panel-gap: 16px;
+    --right-compact-main-reserve: clamp(160px, 28dvh, 240px);
+    --right-compact-panel-max: 360px;
+    --right-compact-panel-height: min(
+        var(--right-compact-panel-max),
+        max(
+            58px,
+            calc(
+                100dvh - 48px - var(--right-compact-bottom-inset)
+                - var(--right-compact-main-reserve) - var(--right-compact-panel-offset)
+                - var(--right-compact-panel-gap)
+            )
+        )
+    );
+    --z-workspace-surface: 20;
+    --z-shell-navigation: 30;
+    --z-compact-drawer: 205;
+    --z-compact-inspector: 210;
+    --z-compact-navigation: 220;
+    --z-floating-inspector: 230;
+    --z-transient-progress: 260;
+    --z-popover: 540;
+    --z-modal: 900;
+    --z-toast: 1500;
     --transition-smooth: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1);
     /* Times New Roman 沒有中文字形，中文會逐字回退到微軟正黑體。 */
     --font-sans: "Times New Roman", "Microsoft JhengHei UI", "Microsoft JhengHei", serif;
@@ -1310,7 +1344,7 @@ input:checked + .slider:before {
     opacity: 0;
     pointer-events: none;
     transition: opacity 0.3s ease;
-    z-index: 900;
+    z-index: var(--z-modal);
 }
 
 .modal-overlay.active {
@@ -2179,7 +2213,7 @@ input:checked + .slider:before {
     border: 1px solid var(--panel-border);
     border-radius: 12px;
     box-shadow: 0 10px 40px rgba(0,0,0,0.6);
-    z-index: 1000;
+    z-index: var(--z-popover);
     display: none;
     flex-direction: column;
     overflow: hidden;
@@ -3395,8 +3429,10 @@ html:not([data-theme="dark"]) ::-webkit-scrollbar-thumb:hover {
 .workbench-body {
     flex: 1;
     display: flex;
+    min-width: 0;
     min-height: 0;
     position: relative;
+    overflow: hidden;
 }
 
 /* --- Top Bar --- */
@@ -3409,7 +3445,7 @@ html:not([data-theme="dark"]) ::-webkit-scrollbar-thumb:hover {
     flex-shrink: 0;
     background: var(--panel-bg);
     border-bottom: 1px solid var(--panel-border);
-    z-index: 30;
+    z-index: var(--z-shell-navigation);
 }
 .top-bar-brand {
     display: flex;
@@ -3462,7 +3498,7 @@ html:not([data-theme="dark"]) ::-webkit-scrollbar-thumb:hover {
     padding: 10px 0;
     background: var(--sidebar-bg);
     border-right: 1px solid var(--panel-border);
-    z-index: 25;
+    z-index: calc(var(--z-shell-navigation) - 5);
 }
 .rail-btn {
     width: 44px;
@@ -3493,7 +3529,7 @@ html:not([data-theme="dark"]) ::-webkit-scrollbar-thumb:hover {
     background: var(--sidebar-bg);
     border-right: 1px solid var(--panel-border);
     transition: margin-left 0.25s ease;
-    z-index: 24;
+    z-index: calc(var(--z-shell-navigation) - 6);
 }
 .side-drawer.collapsed { margin-left: calc(-1 * var(--navigation-drawer-width)); visibility: hidden; }
 .drawer-head {
@@ -3611,10 +3647,10 @@ html:not([data-theme="dark"]) ::-webkit-scrollbar-thumb:hover {
     right: 0;
     display: flex;
     align-items: flex-start;
-    z-index: 230;
+    z-index: var(--z-floating-inspector);
 }
 .output-floating-panel {
-    width: clamp(320px, 24vw, 380px);
+    width: var(--right-inspector-width);
     max-height: calc(100vh - 112px);
     display: flex;
     flex-direction: column;
@@ -3627,9 +3663,12 @@ html:not([data-theme="dark"]) ::-webkit-scrollbar-thumb:hover {
     align-items: stretch;
     margin-top: 10px;
     gap: 4px;
+    max-height: calc(100dvh - 112px);
+    overflow-y: auto;
+    overscroll-behavior: contain;
 }
 .output-floating-tab {
-    width: 46px;
+    width: var(--right-tab-rail-width);
     min-height: 66px;
     padding: 8px 5px;
     position: relative;
@@ -4006,7 +4045,7 @@ html:not([data-theme="dark"]) ::-webkit-scrollbar-thumb:hover {
 
 /* --- Command Palette --- */
 .palette-overlay {
-    display: none; position: fixed; inset: 0; z-index: 900;
+    display: none; position: fixed; inset: 0; z-index: var(--z-modal);
     background: rgba(0, 0, 0, 0.45);
     align-items: flex-start; justify-content: center; padding-top: 12vh;
 }
@@ -4035,7 +4074,7 @@ html:not([data-theme="dark"]) ::-webkit-scrollbar-thumb:hover {
 
 /* --- Toast（P13 錯誤 UX） --- */
 .toast-container {
-    position: fixed; right: 18px; bottom: 18px; z-index: 1500;
+    position: fixed; right: 18px; bottom: 18px; z-index: var(--z-toast);
     display: flex; flex-direction: column; gap: 8px; max-width: 360px;
 }
 .toast {
@@ -4483,9 +4522,215 @@ html:not([data-theme="dark"]) ::-webkit-scrollbar-thumb:hover {
     background: var(--chat-bg);
 }
 .workflow-center[hidden],
+.extension-workspace[hidden],
 .chat-container[hidden],
 .side-drawer[hidden] {
     display: none;
+}
+
+.extension-workspace {
+    min-width: 0;
+    height: 100%;
+    flex: 1 1 auto;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    background: var(--chat-bg);
+}
+
+.extensions-workspace-shell {
+    position: relative;
+    width: min(1180px, 100%);
+    height: 100%;
+    margin: 0 auto;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    background: var(--elev-bg);
+    border-inline: 1px solid var(--panel-border);
+}
+
+.extensions-workspace-shell > .modal-header {
+    min-height: 86px;
+    padding: 16px 24px;
+    align-items: flex-start;
+    flex: 0 0 auto;
+}
+
+.extensions-workspace-shell > .modal-header h3 {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 2px 0 3px;
+    font-size: 22px;
+}
+
+.extension-header-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.extension-header-actions svg,
+.extensions-workspace-shell > .modal-header h3 svg {
+    width: 18px;
+    height: 18px;
+}
+
+.extension-workspace-footer {
+    min-height: 54px;
+    padding: 10px 18px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    border-top: 1px solid var(--panel-border);
+    background: var(--elev-header-bg);
+}
+
+.extension-developer-grid,
+.connector-center {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 14px;
+}
+
+.connector-center-head {
+    grid-column: 1 / -1;
+    display: flex;
+    align-items: end;
+    justify-content: space-between;
+    gap: 16px;
+    padding: 2px 0 4px;
+}
+
+.connector-center-head h3 {
+    margin: 0;
+    font-size: 17px;
+}
+
+.connector-center-head p {
+    margin: 4px 0 0;
+    color: var(--text-muted);
+    font-size: 12.5px;
+}
+
+.extension-developer-card,
+.connector-card {
+    min-width: 0;
+    padding: 16px;
+    border: 1px solid var(--panel-border);
+    border-radius: 10px;
+    background: var(--surface-subtle);
+}
+
+.extension-developer-card h4,
+.connector-card h3 {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 0 0 6px;
+}
+
+.extension-developer-card h4 svg,
+.connector-card h3 svg {
+    width: 17px;
+    height: 17px;
+    color: var(--primary-color);
+}
+
+.extension-developer-card p,
+.connector-card p {
+    margin: 0 0 12px;
+    color: var(--text-muted);
+    font-size: 12.5px;
+    line-height: 1.5;
+}
+
+.connector-card-head,
+.connector-card-actions,
+.connector-resource-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+}
+
+.connector-status-pill {
+    padding: 4px 8px;
+    border-radius: 999px;
+    background: var(--ink-05);
+    color: var(--text-muted);
+    font-size: 12px;
+    white-space: nowrap;
+}
+
+.connector-status-pill.is-connected {
+    background: color-mix(in srgb, var(--success-color) 18%, transparent);
+    color: var(--success-color);
+}
+
+.connector-form,
+.connector-resources {
+    display: grid;
+    gap: 10px;
+    margin-top: 12px;
+    padding-top: 12px;
+    border-top: 1px solid var(--panel-border);
+}
+
+.connector-form label {
+    display: grid;
+    gap: 5px;
+    color: var(--text-muted);
+    font-size: 12px;
+}
+
+.connector-callback {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 8px;
+}
+
+.connector-resource-list {
+    max-height: 240px;
+    display: grid;
+    gap: 6px;
+    overflow: auto;
+}
+
+.connector-connection {
+    display: grid;
+    gap: 8px;
+    padding: 10px;
+    border: 1px solid var(--panel-border);
+    border-radius: 8px;
+    background: var(--surface-process);
+}
+
+.connector-connection small {
+    display: block;
+    margin-top: 3px;
+    color: var(--text-muted);
+    font-size: 12px;
+}
+
+.connector-resource-row {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    gap: 8px;
+    align-items: start;
+    padding: 8px;
+    border-radius: 7px;
+    background: var(--ink-03);
+    font-size: 12px;
+}
+
+.connector-resource-row small {
+    display: block;
+    margin-top: 2px;
+    color: var(--text-muted);
+    overflow-wrap: anywhere;
 }
 .workflow-center-header {
     min-height: 86px;
@@ -5429,7 +5674,7 @@ html:not([data-theme="dark"]) ::-webkit-scrollbar-thumb:hover {
     .icon-rail {
         position: fixed; left: 0; right: 0; bottom: 0; top: auto;
         width: 100%; height: 56px; flex-direction: row; justify-content: space-around;
-        border-right: none; border-top: 1px solid var(--panel-border); z-index: 220;
+        border-right: none; border-top: 1px solid var(--panel-border); z-index: var(--z-compact-navigation);
         padding: 4px 0;
     }
     .rail-btn { width: auto; padding: 4px 8px; }
@@ -5889,13 +6134,60 @@ html:not([data-theme="dark"]) ::-webkit-scrollbar-thumb:hover {
     .agent-message.reply { margin-left: 8px; }
 }
 
+/* Only one interactive right surface is exposed at a time.  The inspector
+   controller already collapses the floating card; this rule also removes its
+   persistent tab rail while a full-height dock owns the right edge. */
+html:has(#artifacts-sandbox-panel.active) #output-floating-workspace,
+html:has(#agent-collaboration-panel:not([hidden])) #output-floating-workspace {
+    display: none;
+}
+
+/* A vertical dock beside both navigation columns leaves no useful reading
+   width in 928/1024px windows.  Treat it as a bounded compact drawer until the
+   viewport can preserve the desktop reading column. */
+@media (max-width: 1180px) {
+    .artifacts-sandbox-panel.inspector-panel,
+    .agent-collaboration-panel {
+        position: fixed;
+        right: 0;
+        top: 48px;
+        bottom: 0;
+        width: min(440px, 92vw) !important;
+        min-width: 0;
+        max-width: 92vw !important;
+        height: auto;
+    }
+
+    .artifacts-sandbox-panel.inspector-panel {
+        z-index: var(--z-compact-inspector);
+    }
+
+    .agent-collaboration-panel {
+        z-index: calc(var(--z-compact-inspector) + 5);
+    }
+
+    .sandbox-resizer-main,
+    .agent-collaboration-resizer {
+        display: none;
+    }
+}
+
+@media (max-width: 640px) {
+    .artifacts-sandbox-panel.inspector-panel,
+    .agent-collaboration-panel {
+        bottom: 56px;
+        width: 100vw !important;
+        max-width: 100vw !important;
+    }
+}
+
 
 /* 99_final_overrides：跨畫面的長時間工作進度中心 */
 .task-progress-center {
     position: fixed;
     right: 16px;
     bottom: 16px;
-    z-index: 260;
+    z-index: var(--z-transient-progress);
     width: min(360px, calc(100vw - 32px));
     max-height: min(440px, calc(100vh - 80px));
     overflow: hidden;
@@ -6037,45 +6329,75 @@ html:not([data-theme="dark"]) ::-webkit-scrollbar-thumb:hover {
     .task-progress-list { max-height: 310px; }
 }
 
-/* Run Inspector: reserve the reading surface instead of covering chat.
-   The 62px base inset is the 46px vertical tab strip plus a 16px safe gap. */
-@media (min-width: 901px) {
-    main.chat-container:not([hidden]) {
-        min-width: 0;
-        margin-right: 62px;
+/* Right-surface workspace contract.
+   - The tab rail is reserved by the workbench, so every primary main benefits.
+   - Wide screens dock the expanded inspector beside the active workspace.
+   - Up to 1180px, the inspector docks above the visible main.  Its computed
+     height preserves a useful reading surface and remains bounded on short
+     windows instead of relying on a fixed 216px minimum. */
+.workbench-body > main:not([hidden]) {
+    min-width: 0;
+}
+
+@media (min-width: 1181px) {
+    html:has(#output-floating-workspace:not([hidden])):not(:has(#artifacts-sandbox-panel.active)):not(:has(#agent-collaboration-panel:not([hidden]))) .workbench-body {
+        padding-right: var(--right-rail-safe-area);
     }
-    html.run-inspector-open main.chat-container:not([hidden]) {
-        min-width: 0;
-        margin-right: calc(clamp(320px, 24vw, 380px) + 62px);
+
+    html.run-inspector-open:has(#output-floating-workspace:not([hidden])):not(:has(#artifacts-sandbox-panel.active)):not(:has(#agent-collaboration-panel:not([hidden]))) .workbench-body {
+        padding-right: var(--right-inspector-safe-area);
     }
-    html.run-inspector-open .task-progress-center {
-        right: calc(clamp(320px, 24vw, 380px) + 62px);
+
+    html.run-inspector-open:has(#output-floating-workspace:not([hidden])):not(:has(#artifacts-sandbox-panel.active)):not(:has(#agent-collaboration-panel:not([hidden]))) .task-progress-center {
+        right: var(--right-inspector-safe-area);
+    }
+
+    .workbench-body > main:not([hidden]) {
+        margin-right: 0;
     }
 }
 
-/* A side-by-side inspector would leave an unusably narrow reading column on
-   compact windows. Dock it above chat and let the flex item surrender height,
-   so neither messages nor the composer sit underneath the fixed surface. */
-@media (max-width: 900px) {
-    main.chat-container:not([hidden]) {
-        min-width: 0;
-        margin-right: 54px;
+@media (max-width: 1180px) {
+    html:has(#output-floating-workspace:not([hidden])):not(:has(#artifacts-sandbox-panel.active)):not(:has(#agent-collaboration-panel:not([hidden]))) .workbench-body {
+        padding-right: calc(var(--right-tab-rail-width) + 8px);
     }
-    html.run-inspector-open main.chat-container:not([hidden]) {
+
+    .output-floating-workspace {
+        top: 72px;
+    }
+
+    .output-floating-panel {
+        width: min(380px, calc(100vw - 58px));
+        max-height: calc(100dvh - 96px - var(--right-compact-bottom-inset));
+    }
+
+    .output-floating-tabs {
+        max-height: calc(100dvh - 98px);
+    }
+
+    html.run-inspector-open:has(#output-floating-workspace:not([hidden])):not(:has(#artifacts-sandbox-panel.active)):not(:has(#agent-collaboration-panel:not([hidden]))) .workbench-body > main:not([hidden]) {
         height: auto;
         min-height: 0;
-        margin-top: calc(clamp(216px, 42vh, 360px) + 40px);
+        margin-top: calc(
+            var(--right-compact-panel-height) + var(--right-compact-panel-offset)
+            + var(--right-compact-panel-gap)
+        );
+        margin-right: 0;
     }
+
     html.run-inspector-open .output-floating-panel {
-        height: clamp(216px, 42vh, 360px);
-        max-height: clamp(216px, 42vh, 360px);
+        height: var(--right-compact-panel-height);
+        max-height: var(--right-compact-panel-height);
     }
+
     html.run-inspector-open .output-panel-card {
         height: 100%;
     }
+
     html.run-inspector-open .output-panel-head {
         flex: 0 0 auto;
     }
+
     html.run-inspector-open .output-panel-pane {
         flex: 1 1 auto;
         max-height: none;
@@ -6083,12 +6405,29 @@ html:not([data-theme="dark"]) ::-webkit-scrollbar-thumb:hover {
 }
 
 @media (max-width: 640px) {
-    html.run-inspector-open main.chat-container:not([hidden]) {
-        margin-top: calc(clamp(216px, 40vh, 300px) + 32px);
+    :root {
+        --right-compact-bottom-inset: 56px;
+        --right-compact-panel-offset: 16px;
+        --right-compact-panel-gap: 16px;
+        --right-compact-main-reserve: clamp(140px, 28dvh, 220px);
+        --right-compact-panel-max: 300px;
     }
-    html.run-inspector-open .output-floating-panel {
-        height: clamp(216px, 40vh, 300px);
-        max-height: clamp(216px, 40vh, 300px);
+
+    .output-floating-workspace {
+        top: 64px;
+    }
+
+    .output-floating-panel {
+        width: calc(100vw - var(--navigation-rail-width));
+        max-height: calc(100dvh - 132px);
+    }
+
+    .output-floating-tab {
+        min-height: clamp(44px, calc((100dvh - 138px) / 3), 66px);
+    }
+
+    .output-floating-tabs {
+        max-height: calc(100dvh - 130px);
     }
 }
 
@@ -6103,7 +6442,7 @@ html:not([data-theme="dark"]) ::-webkit-scrollbar-thumb:hover {
 .project-switcher-btn span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: left; font-size: 13px; font-weight: 600; }
 .project-switcher-btn svg { width: 15px; height: 15px; flex: 0 0 auto; }
 .project-switcher-popover {
-    position: absolute; z-index: 540; top: 42px; left: 0; width: 100%; padding: 6px;
+    position: absolute; z-index: var(--z-popover); top: 42px; left: 0; width: 100%; padding: 6px;
     border: 1px solid var(--panel-border); border-radius: 7px; background: #fbfaf8;
     box-shadow: 0 14px 36px rgba(0, 0, 0, .2); box-sizing: border-box;
 }
@@ -6397,7 +6736,7 @@ html[data-theme="dark"] .project-switcher-popover { background: #171721; }
 }
 .project-skills-add-menu {
     position: fixed;
-    z-index: 540;
+    z-index: var(--z-popover);
     width: min(320px, calc(100vw - 24px));
     min-width: min(280px, calc(100vw - 24px));
     max-width: calc(100vw - 24px);
@@ -6788,7 +7127,7 @@ html[data-theme="dark"] .project-skills-add-menu {
 .project-row.archived { padding-left: 10px; opacity: .8; }
 .sidebar-context-menu {
     position: fixed;
-    z-index: 540;
+    z-index: var(--z-popover);
     width: 190px;
     padding: 5px;
     border: 1px solid var(--panel-border);
@@ -6913,7 +7252,7 @@ html[data-theme="dark"] .sidebar-dialog { background: #171721; }
         left: var(--navigation-rail-width);
         top: 48px;
         bottom: 0;
-        z-index: 205;
+        z-index: var(--z-compact-drawer);
         box-shadow: 12px 0 28px rgba(0, 0, 0, .14);
         transition: transform .22s ease;
     }
@@ -7678,15 +8017,17 @@ html[data-theme="dark"] .sidebar-dialog { background: #171721; }
 .extension-audit-panel {
     position: absolute;
     z-index: 4;
-    top: 62px;
+    top: 86px;
     right: 0;
-    bottom: 57px;
-    width: min(430px, 92%);
+    bottom: 54px;
+    width: min(430px, 100%);
+    max-width: 100%;
     padding: 15px;
     border-left: 1px solid var(--panel-border);
     background: var(--elev-bg);
     box-shadow: -16px 0 38px rgba(0, 0, 0, .18);
     overflow: auto;
+    overscroll-behavior: contain;
 }
 
 .extension-audit-panel[hidden] {
@@ -8030,6 +8371,33 @@ html[data-theme="dark"] .sidebar-dialog { background: #171721; }
         width: calc(100vw - 16px);
         height: calc(100vh - 16px);
         max-height: calc(100vh - 16px);
+    }
+
+    .extensions-workspace-shell {
+        border-inline: 0;
+    }
+
+    .extensions-workspace-shell > .modal-header {
+        min-height: 72px;
+        padding: 12px 14px;
+    }
+
+    .extension-audit-panel {
+        top: 72px;
+    }
+
+    .extension-header-actions span {
+        display: none;
+    }
+
+    .extension-developer-grid,
+    .connector-center {
+        grid-template-columns: 1fr;
+    }
+
+    .connector-center-head {
+        align-items: stretch;
+        flex-direction: column;
     }
 
     .project-settings-body {

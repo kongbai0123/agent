@@ -54,8 +54,35 @@ def build_n8n_runtime_router(
     workflow_status: Optional[Callable[[], Mapping[str, Any]]] = None,
     mail_status: Optional[Callable[[], Mapping[str, Any]]] = None,
     on_stop: Optional[Callable[[], None]] = None,
+    require_extension: Optional[Callable[[str, Optional[str]], Any]] = None,
 ) -> APIRouter:
     router = APIRouter(tags=["n8n-runtime"])
+
+    def require_n8n_extension() -> None:
+        """Gate lifecycle mutations while preserving the legacy no-gate default."""
+
+        if require_extension is None:
+            return
+        try:
+            decision = require_extension("builtin.n8n", None)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=409,
+                detail=error_payload(
+                    str(getattr(exc, "code", "EXTENSION_DISABLED")),
+                    str(exc) or "The n8n extension is disabled.",
+                    recoverable=True,
+                ),
+            ) from exc
+        if decision is False:
+            raise HTTPException(
+                status_code=409,
+                detail=error_payload(
+                    "EXTENSION_DISABLED",
+                    "The n8n extension is disabled.",
+                    recoverable=True,
+                ),
+            )
 
     def readiness() -> Dict[str, Any]:
         try:
@@ -133,6 +160,7 @@ def build_n8n_runtime_router(
     @router.post("/api/integrations/n8n/start")
     def start(request: Request):
         require_local(request)
+        require_n8n_extension()
         try:
             lifecycle.start()
             return status_payload(probe_node=False)
@@ -142,10 +170,24 @@ def build_n8n_runtime_router(
     @router.post("/api/integrations/n8n/stop")
     def stop(request: Request):
         require_local(request)
+        require_n8n_extension()
         try:
             lifecycle.stop()
             if on_stop is not None:
                 on_stop()
+            return status_payload(probe_node=False)
+        except Exception as exc:
+            raise lifecycle_failure(exc) from exc
+
+    @router.post("/api/integrations/n8n/restart")
+    def restart(request: Request):
+        require_local(request)
+        require_n8n_extension()
+        try:
+            lifecycle.stop()
+            if on_stop is not None:
+                on_stop()
+            lifecycle.start()
             return status_payload(probe_node=False)
         except Exception as exc:
             raise lifecycle_failure(exc) from exc

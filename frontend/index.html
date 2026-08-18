@@ -17,7 +17,7 @@
     <link rel="stylesheet" href="katex.min.css">
     <script src="katex.min.js"></script>
     <script src="auto-render.min.js"></script>
-    <link rel="stylesheet" href="style.css?v=0.8.0-n8n-graph-authoring-beta.1">
+    <link rel="stylesheet" href="style.css?v=0.8.0-n8n-graph-authoring-beta.4">
 </head>
 <body class="basic-chat-mode">
     <div class="app-container workbench-shell">
@@ -69,7 +69,8 @@
 
             <!-- ================= 左側 Icon Rail ================= -->
             <nav class="icon-rail" role="navigation" aria-label="主功能導覽">
-                <button class="rail-btn active" id="rail-chat" title="對話" aria-label="對話與歷史紀錄">
+                <button class="rail-btn active" id="rail-chat" title="對話" aria-label="對話與歷史紀錄"
+                    aria-controls="chat-drawer" aria-expanded="true">
                     <i data-lucide="message-square"></i><span class="rail-label">對話</span>
                 </button>
                 <button class="rail-btn" id="rail-workflows" title="工作流程" aria-label="開啟工作流程中心">
@@ -103,7 +104,7 @@
             </nav>
 
             <!-- ================= Chat Drawer（會話清單） ================= -->
-            <aside class="side-drawer" id="chat-drawer" aria-label="對話清單">
+            <aside class="side-drawer" id="chat-drawer" aria-label="對話清單" aria-hidden="false">
                 <div class="drawer-head">
                     <span class="drawer-title">工作區</span>
                     <button class="drawer-close" id="chat-drawer-close" aria-label="收合對話清單"><i data-lucide="panel-left-close"></i></button>
@@ -1346,9 +1347,9 @@
                             </div>
                             <div class="settings-group integration-url-field">
                                 <label class="settings-label" for="setting-mcp-servers">伺服器設定（JSON）</label>
-                                <textarea id="setting-mcp-servers" class="settings-input" rows="6"
-                                    spellcheck="false" placeholder='[{"id":"files","command":["node","server.js"],"timeout_seconds":30}]'></textarea>
-                                <span class="settings-tip">此處只設定啟動命令與逾時；啟用、停用及專案範圍統一由「擴充中心」管理。舊版 enabled 值不在此顯示，手動輸入也不會改變擴充狀態。使用 argv 陣列，不經 shell；請勿在此填入 Token。</span>
+                                <textarea id="setting-mcp-servers" class="settings-input" rows="9"
+                                    spellcheck="false" placeholder='[{"id":"files","label":"Files","transport":"stdio","executable":"D:/tools/mcp-server.exe","expected_executable_sha256":"<sha256>","argv":[],"cwd":"D:/workspace","allowed_cwd_roots":["D:/workspace"],"environment_keys":["PATH"],"secret_aliases":{},"tool_policies":{"read_file":{"access":"read","risk_level":"external_read"}},"timeout_seconds":30}]'></textarea>
+                                <span class="settings-tip">只支援已驗證的本機 stdio 執行檔；必須填入執行檔 SHA-256、允許的工作目錄與逐項工具政策，不會經過 shell。啟用、停用及專案範圍由「外掛程式」管理。秘密只填 alias，實際值由 WORKBENCH_MCP_SECRET_&lt;ALIAS&gt; 環境變數提供，請勿在此貼上 Token。獨立程序提供故障隔離，但不是完整 OS Sandbox。</span>
                             </div>
                             <div class="runtime-metrics" id="mcp-status-metrics" aria-live="polite"></div>
                         </section>
@@ -1599,18 +1600,25 @@
         </div>
     </div>
 
-    <!-- M14 擴充中心：第一版只接受內建與本機受信任 manifest。 -->
-    <div class="modal-overlay" id="extension-center-modal" role="dialog" aria-modal="true"
-        aria-labelledby="extensions-title">
-        <div class="modal extensions-modal-box">
+    <!-- 外掛程式主工作區：只接受內建目錄與本機受信任 manifest。 -->
+    <main class="extension-workspace" id="extension-center-workspace"
+        aria-labelledby="extensions-title" hidden>
+        <div class="extensions-workspace-shell">
             <div class="modal-header">
                 <div>
-                    <h3 id="extensions-title"><i data-lucide="puzzle"></i>擴充中心</h3>
-                    <p class="extension-subtitle">管理內建整合與本機受信任擴充；不提供遠端市集安裝。</p>
+                    <span class="workflow-eyebrow">AGENT EXTENSIONS</span>
+                    <h3 id="extensions-title"><i data-lucide="puzzle"></i>外掛程式</h3>
+                    <p class="extension-subtitle">探索可信外掛、連接帳號，並以 Project 與資源範圍治理 Agent 工具。</p>
                 </div>
-                <button type="button" class="modal-close" id="extensions-close" aria-label="關閉擴充中心">
-                    <i data-lucide="x"></i>
-                </button>
+                <div class="extension-header-actions">
+                    <button type="button" class="btn btn-secondary compact" id="extension-developer-toggle"
+                        aria-label="開啟開發者設定" title="開發者設定">
+                        <i data-lucide="settings-2"></i><span>開發者設定</span>
+                    </button>
+                    <button type="button" class="modal-close" id="extensions-close" aria-label="回到聊天">
+                        <i data-lucide="x"></i>
+                    </button>
+                </div>
             </div>
             <div class="extension-toolbar">
                 <label class="extension-search">
@@ -1630,23 +1638,31 @@
             </div>
             <div class="extension-tabs" role="tablist" aria-label="擴充分類">
                 <button type="button" class="extension-tab-btn active" role="tab" aria-selected="true"
+                    aria-controls="extension-pane-available" data-extension-tab="available">探索</button>
+                <button type="button" class="extension-tab-btn" role="tab" aria-selected="false"
                     aria-controls="extension-pane-installed" data-extension-tab="installed">已安裝</button>
                 <button type="button" class="extension-tab-btn" role="tab" aria-selected="false"
-                    aria-controls="extension-pane-available" data-extension-tab="available">可安裝</button>
+                    aria-controls="extension-pane-connections" data-extension-tab="connections">連線</button>
                 <button type="button" class="extension-tab-btn" role="tab" aria-selected="false"
-                    aria-controls="extension-pane-local" data-extension-tab="local">本機</button>
+                    aria-controls="extension-pane-local" data-extension-tab="local">私人／本機</button>
             </div>
             <div class="extension-body">
-                <section class="extension-tab-panel active" id="extension-pane-installed" role="tabpanel"
-                    data-extension-panel="installed">
+                <section class="extension-tab-panel" id="extension-pane-installed" role="tabpanel"
+                    data-extension-panel="installed" hidden>
                     <div class="extension-list" id="extension-installed-list" aria-live="polite">
                         <div class="extension-state is-loading">載入已安裝擴充中…</div>
                     </div>
                 </section>
-                <section class="extension-tab-panel" id="extension-pane-available" role="tabpanel"
-                    data-extension-panel="available" hidden>
+                <section class="extension-tab-panel active" id="extension-pane-available" role="tabpanel"
+                    data-extension-panel="available">
                     <div class="extension-list" id="extension-available-list" aria-live="polite">
                         <div class="extension-state is-loading">載入可安裝擴充中…</div>
+                    </div>
+                </section>
+                <section class="extension-tab-panel" id="extension-pane-connections" role="tabpanel"
+                    data-extension-panel="connections" hidden>
+                    <div id="connector-center" class="connector-center" aria-live="polite">
+                        <div class="extension-state is-loading">載入連接器中…</div>
                     </div>
                 </section>
                 <section class="extension-tab-panel" id="extension-pane-local" role="tabpanel"
@@ -1668,6 +1684,21 @@
                         <div class="extension-state">輸入 manifest 檔名後，系統會先驗證來源、格式與權限。</div>
                     </div>
                 </section>
+                <section class="extension-tab-panel" id="extension-pane-developer" role="tabpanel"
+                    data-extension-panel="developer" hidden>
+                    <div class="extension-developer-grid">
+                        <article class="extension-developer-card">
+                            <h4><i data-lucide="git-branch"></i>Hook 執行狀態</h4>
+                            <p>內建 Hook 依 priority、extension ID 與 hook ID 決定順序；第三方程式碼不會載入主程序。</p>
+                            <div id="extension-hook-health" class="extension-state">等待後端狀態…</div>
+                        </article>
+                        <article class="extension-developer-card">
+                            <h4><i data-lucide="terminal-square"></i>本機 MCP</h4>
+                            <p>僅允許已信任的 stdio MCP Tools。獨立程序提供故障隔離，但不等同完整 OS Sandbox。</p>
+                            <div id="extension-mcp-health" class="extension-state">尚未設定 MCP Server。</div>
+                        </article>
+                    </div>
+                </section>
             </div>
             <aside class="extension-audit-panel" id="extension-audit-panel" hidden
                 aria-labelledby="extension-audit-title">
@@ -1682,12 +1713,12 @@
                 </div>
                 <div id="extension-audit-list" class="extension-audit-list" aria-live="polite"></div>
             </aside>
-            <div class="modal-footer">
+            <div class="extension-workspace-footer">
                 <span class="extension-safety-note"><i data-lucide="shield-check"></i>安裝與權限變更會留下 audit。</span>
-                <button type="button" class="btn btn-secondary" id="extensions-close-btn">關閉</button>
+                <button type="button" class="btn btn-secondary" id="extensions-close-btn">回到聊天</button>
             </div>
         </div>
-    </div>
+    </main>
 
     <!-- Skill 中心：Skill 是工作流程，不會授予或繞過工具權限。 -->
     <div class="modal-overlay" id="skill-center-modal" role="dialog" aria-modal="true"
@@ -1860,16 +1891,17 @@
         <div class="task-progress-list" id="task-progress-list"></div>
     </section>
 
-    <script src="extension-center.js?v=1.2.3-cloud-editor-layout"></script>
+    <script src="extension-center.js?v=1.3.1-extension-contract"></script>
+    <script src="connector-center.js?v=1.0.1-extension-gate"></script>
     <script src="skill-center.js?v=1.0.2-chat-reset"></script>
     <script src="cloud-llm-center.js?v=1.0.1"></script>
     <script src="agent-collaboration.js?v=1.1.0-model-trace"></script>
     <script src="basic-chat-mode.js?v=1.0.2-sidebar-contract"></script>
     <script src="project-skills-sidebar.js?v=1.2.1-add-menu-a11y"></script>
-    <script src="run-inspector.js?v=1.0.0"></script>
-    <script src="n8n-workflows.js?v=0.8.0-n8n-graph-authoring-beta.1"></script>
-    <script src="n8n-agent-governance.js?v=0.8.0-n8n-graph-authoring-beta.1"></script>
+    <script src="run-inspector.js?v=1.0.2"></script>
+    <script src="n8n-workflows.js?v=0.8.0-n8n-graph-authoring-beta.4"></script>
+    <script src="n8n-agent-governance.js?v=0.8.0-n8n-graph-authoring-beta.3"></script>
     <script src="hermes-settings.js?v=1.1.2-hover-help-dom"></script>
-    <script src="app.js?v=0.8.0-n8n-graph-authoring-beta.1"></script>
+    <script src="app.js?v=0.8.0-n8n-graph-authoring-beta.4"></script>
 </body>
 </html>

@@ -267,6 +267,7 @@ class N8nAgentTaskRuntime:
         skill_resolver: Optional[Callable[[str, str, str], Mapping[str, Any]]] = None,
         credential_resolver: Optional[Callable[[str], Mapping[str, Any]]] = None,
         policy_resolver: Optional[Callable[[str], Mapping[str, Any]]] = None,
+        execution_gate: Optional[Callable[[str], Any]] = None,
         workflow_revision_resolver: Optional[Callable[[str], Any]] = None,
         clock: Callable[[], datetime] = _utcnow,
         id_factory: Callable[[str], str] = lambda prefix: f"{prefix}_{secrets.token_urlsafe(18)}",
@@ -279,6 +280,7 @@ class N8nAgentTaskRuntime:
         self._skill_resolver = skill_resolver
         self._credential_resolver = credential_resolver
         self._policy_resolver = policy_resolver
+        self._execution_gate = execution_gate
         self._workflow_revision_resolver = workflow_revision_resolver
         self._clock = clock
         self._id_factory = id_factory
@@ -292,6 +294,25 @@ class N8nAgentTaskRuntime:
     def _now(self) -> datetime:
         value = self._clock()
         return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+    def _require_execution_enabled(self, project_id: str) -> None:
+        gate = self._execution_gate
+        if gate is None:
+            return
+        try:
+            result = gate(project_id)
+        except Exception as exc:
+            raise N8nAgentTaskError(
+                str(getattr(exc, "code", "EXTENSION_DISABLED"))[:128],
+                "The n8n extension is disabled for this Project.",
+                status_code=409,
+            ) from exc
+        if result is False:
+            raise N8nAgentTaskError(
+                "EXTENSION_DISABLED",
+                "The n8n extension is disabled for this Project.",
+                status_code=409,
+            )
 
     def _ensure_schema(self) -> None:
         with database.get_db_conn() as conn:
@@ -1502,6 +1523,7 @@ class N8nAgentTaskRuntime:
         node_id = _safe_id(value.get("node_id"), "node_id")
         binding_id = _safe_id(value.get("agent_binding_id"), "agent_binding_id")
         project_id, _ = self._workflow_project(workflow_id)
+        self._require_execution_enabled(project_id)
         binding, config = self._resolve_task_binding(
             binding_id=binding_id, workflow_id=workflow_id, workflow_revision=workflow_revision,
             node_id=node_id, project_id=project_id,
@@ -1614,6 +1636,8 @@ class N8nAgentTaskRuntime:
 
     def process_task(self, task_id: str) -> dict[str, Any]:
         task_id = _safe_id(task_id, "task_id")
+        pending = self._task_row(task_id)
+        self._require_execution_enabled(str(pending["project_id"]))
         now = _iso(self._now())
         with database.get_db_conn() as conn:
             claimed = conn.execute(
@@ -1650,6 +1674,9 @@ class N8nAgentTaskRuntime:
                 },
                 "untrusted_input": input_value,
             }
+            # Recheck immediately before model execution.  Approval, queueing,
+            # or decryption time never carries extension authority forward.
+            self._require_execution_enabled(str(row["project_id"]))
             output = self._generator(request)
             output = _bounded_json(output, _MAX_OUTPUT_BYTES, reject_secrets=True)
             schema = config.get("output_schema")
