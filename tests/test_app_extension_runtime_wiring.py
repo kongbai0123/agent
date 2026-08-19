@@ -122,6 +122,50 @@ def test_lifespan_syncs_before_serving_and_stops_after_background_reconcile(monk
     assert workbench_app.application_event_loop is None
 
 
+def test_lifespan_stops_owned_n8n_when_manifest_rereview_closes_gate(monkeypatch):
+    events: list[str] = []
+
+    class Lifecycle:
+        running = True
+
+        def status(self, *, probe_node=False):
+            assert probe_node is False
+            events.append("n8n.status")
+            return {"state": "ready" if self.running else "stopped"}
+
+        def stop(self):
+            events.append("n8n.stop")
+            self.running = False
+            return {"state": "stopped"}
+
+    lifecycle = Lifecycle()
+    _patch_minimal_lifespan_runtime(monkeypatch, _HookRecorder(events))
+    monkeypatch.setattr(workbench_app, "n8n_lifecycle", lifecycle)
+    monkeypatch.setattr(
+        workbench_app,
+        "extension_is_enabled",
+        lambda extension_id, project_id=None: False,
+    )
+    monkeypatch.setattr(
+        workbench_app,
+        "_on_managed_n8n_stop",
+        lambda: events.append("n8n.revoke"),
+    )
+
+    async def exercise() -> None:
+        async with workbench_app.app_lifespan(None):
+            events.append("serving")
+            assert lifecycle.running is False
+
+    asyncio.run(exercise())
+
+    assert events.count("n8n.stop") == 1
+    assert events.index("n8n.status") < events.index("n8n.revoke")
+    assert events.index("n8n.revoke") < events.index("n8n.stop")
+    assert events.index("n8n.stop") < events.index("app.ready")
+    assert events.index("app.ready") < events.index("serving")
+
+
 @pytest.mark.parametrize("fail_event", ["app.starting", "app.stopping"])
 def test_lifespan_restores_provider_gate_after_startup_or_shutdown_failure(
     monkeypatch,

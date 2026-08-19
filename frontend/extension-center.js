@@ -925,11 +925,19 @@ async function saveModelProviderSecrets() {
 (function createTrustedExtensionCenter() {
     'use strict';
 
+    const N8N_EXTENSION_ID = 'builtin.n8n';
+    const N8N_EDITOR_URL = 'http://127.0.0.1:5678/';
+
     const state = {
         deps: null,
-        activeTab: 'available',
+        activeTab: 'installed',
         projectId: null,
         response: { extensions: [], sections: {} },
+        selectedExtensionId: null,
+        detailReturnExtensionId: null,
+        detailReturnTab: 'installed',
+        n8nService: null,
+        n8nServiceLoading: false,
         pendingReview: null,
         settingsProject: null,
         initialized: false
@@ -937,8 +945,9 @@ async function saveModelProviderSecrets() {
 
     const byId = id => document.getElementById(id);
     const encoded = value => encodeURIComponent(String(value || ''));
-    const iconFor = item => ({
+    const iconFor = item => item?.id === N8N_EXTENSION_ID ? 'workflow' : ({
         workflow: 'workflow',
+        integration: 'workflow',
         mcp: 'plug',
         provider: 'cloud',
         model_provider: 'cloud',
@@ -997,7 +1006,7 @@ async function saveModelProviderSecrets() {
     function setTab(tab) {
         state.activeTab = ['installed', 'available', 'connections', 'local', 'developer'].includes(tab)
             ? tab
-            : 'available';
+            : 'installed';
         document.querySelectorAll('.extension-tab-btn[data-extension-tab]').forEach(button => {
             const active = button.dataset.extensionTab === state.activeTab;
             button.classList.toggle('active', active);
@@ -1084,13 +1093,17 @@ async function saveModelProviderSecrets() {
             // release recorded them as installed. Their controls remain
             // fail-closed through extensionControlPolicy().
             const unavailable = normalize(response?.sections?.unavailable);
-            const unique = new Map([...explicit, ...unavailable].map(item => [String(item.id), item]));
+            const unique = new Map(
+                [...explicit, ...unavailable]
+                    .filter(item => item.installed !== true)
+                    .map(item => [String(item.id), item])
+            );
             if (unique.size) return [...unique.values()];
         }
         if (explicit.length) return explicit;
         if (section === 'installed') return all.filter(item => item.installed);
         if (section === 'available') {
-            return all.filter(item => !item.installed && (item.available || item.runtime_available === false));
+            return all.filter(item => item.installed !== true && (item.available || item.runtime_available === false));
         }
         return all.filter(item => item.origin === 'local');
     }
@@ -1152,9 +1165,8 @@ async function saveModelProviderSecrets() {
 
     function createExtensionCard(item) {
         const card = document.createElement('article');
-        card.className = `extension-card ${item.effective_enabled === false ? 'is-disabled' : ''}`.trim();
+        card.className = `extension-card extension-discovery-card ${item.runtime_available === false ? 'is-disabled' : ''}`.trim();
         card.dataset.extensionId = String(item.id);
-        const globalEnabled = !!(item.installed && item.global_enabled === true);
         const controlPolicy = extensionControlPolicy(item);
 
         const head = document.createElement('div');
@@ -1174,81 +1186,31 @@ async function saveModelProviderSecrets() {
         const meta = document.createElement('div');
         meta.className = 'extension-card-meta';
         meta.textContent = [
-            item.publisher || (item.origin === 'builtin' ? 'Workbench' : '本機'),
-            item.version ? `v${item.version}` : '',
-            item.origin === 'local' ? '本機來源' : '內建'
+            item.category || item.kind || '擴充功能',
+            item.publisher || (item.origin === 'builtin' ? 'Workbench' : '本機')
         ].filter(Boolean).join(' · ');
         const description = document.createElement('div');
-        description.className = 'extension-card-meta';
-        description.textContent = item.description || '沒有提供說明。';
+        description.className = 'extension-card-description';
+        description.textContent = item.id === N8N_EXTENSION_ID
+            ? '建立及執行本機自動化工作流程，並以 Workbench 治理 Gmail 草稿與核准。'
+            : item.description || '沒有提供說明。';
         copy.append(title, meta, description);
         head.append(icon, copy);
 
-        const badges = document.createElement('div');
-        badges.className = 'extension-badges';
-        badges.appendChild(badge(item.trusted ? '已信任' : '未信任', item.trusted ? 'is-trusted' : 'is-warning'));
-        if (item.runtime_available === false) {
-            badges.appendChild(badge(
-                controlPolicy.explanation,
-                'is-error'
-            ));
-        }
-        const health = healthInfo(item);
-        const healthClass = ['healthy', 'ready', 'connected', 'ok'].includes(health.status)
-            ? 'is-healthy'
-            : ['error', 'failed', 'unavailable'].includes(health.status) ? 'is-error' : 'is-warning';
-        badges.appendChild(badge(`健康：${health.status}`, healthClass));
-        badges.appendChild(badge(item.effective_enabled ? '有效啟用' : '目前停用'));
-
-        const permissions = document.createElement('div');
-        permissions.className = 'extension-permissions';
-        const permissionItems = (item.permissions || []).map(permissionInfo);
-        if (!permissionItems.length) {
-            const chip = document.createElement('span');
-            chip.className = 'extension-permission-chip';
-            chip.textContent = '未要求額外權限';
-            permissions.appendChild(chip);
-        } else {
-            permissionItems.slice(0, 8).forEach(permission => {
-                const chip = document.createElement('span');
-                chip.className = `extension-permission-chip ${['system', 'irreversible', 'external_write'].includes(permission.risk) ? 'is-danger' : ''}`.trim();
-                chip.textContent = permission.risk ? `${permission.name} · ${permission.risk}` : permission.name;
-                chip.title = permission.description || chip.textContent;
-                permissions.appendChild(chip);
-            });
-        }
-
-        const controls = document.createElement('div');
-        controls.className = 'extension-card-controls';
-        const globalToggle = document.createElement('label');
-        globalToggle.className = 'extension-global-toggle';
-        const checkbox = document.createElement('input');
-        checkbox.type = 'checkbox';
-        checkbox.checked = globalEnabled;
-        checkbox.disabled = !controlPolicy.canToggleGlobal;
-        if (controlPolicy.unavailable) checkbox.title = controlPolicy.explanation;
-        checkbox.dataset.extensionGlobalToggle = String(item.id);
-        globalToggle.append(checkbox, document.createTextNode('全域啟用'));
-        controls.appendChild(globalToggle);
-        if (state.projectId && item.installed) {
-            const select = projectOverrideSelect(item);
-            controls.appendChild(select);
-        } else {
-            const effective = document.createElement('span');
-            effective.className = 'extension-card-meta';
-            effective.textContent = item.installed ? '可在專案範圍設定覆寫' : '安裝後可設定作用範圍';
-            controls.appendChild(effective);
-        }
-
+        const footer = document.createElement('div');
+        footer.className = 'extension-card-summary-footer';
+        const stateLabel = document.createElement('span');
+        stateLabel.className = `extension-card-state ${item.effective_enabled ? 'is-active' : ''}`.trim();
+        stateLabel.textContent = item.runtime_available === false
+            ? '目前無法使用'
+            : item.installed ? (item.effective_enabled ? '已啟用' : '已安裝') : '選用擴充';
         const actions = document.createElement('div');
-        actions.className = 'extension-card-actions';
+        actions.className = 'extension-card-actions extension-card-primary-action';
         if (!item.installed && (item.available || controlPolicy.unavailable)) {
             const install = actionButton(
                 controlPolicy.unavailable
                     ? '目前不可安裝'
-                    : item.origin === 'local' && !item.trusted
-                    ? '信任、安裝並啟用'
-                    : '審查、安裝並啟用',
+                    : '安裝',
                 'install',
                 'download',
                 'btn btn-primary compact'
@@ -1256,55 +1218,20 @@ async function saveModelProviderSecrets() {
             install.disabled = !controlPolicy.canInstall;
             if (controlPolicy.unavailable) install.title = controlPolicy.explanation;
             if (controlPolicy.canInstall) {
-                install.addEventListener('click', () => openPermissionReview(item, 'install'));
+                install.addEventListener('click', () => openPermissionReview(item, 'install', {
+                    onComplete: () => openExtensionDetail(item.id),
+                }));
             }
             actions.appendChild(install);
         }
-        if (item.installed && !item.trusted) {
-            const trust = actionButton('信任', 'trust', 'shield-check');
-            trust.addEventListener('click', () => openPermissionReview(item, 'trust'));
-            actions.appendChild(trust);
-        }
         if (item.installed) {
-            const healthButton = actionButton('健康檢查', 'health', 'activity');
-            healthButton.addEventListener('click', () => refreshHealth(item, healthButton));
-            const auditButton = actionButton('Audit', 'audit', 'scroll-text');
-            auditButton.addEventListener('click', () => openAudit(item));
-            const disableButton = actionButton(
-                globalEnabled ? '停用' : (controlPolicy.unavailable ? '目前無法啟用' : '審查並啟用'),
-                globalEnabled ? 'disable' : 'enable',
-                globalEnabled ? 'power-off' : 'power'
-            );
-            disableButton.disabled = !globalEnabled && !controlPolicy.canEnable;
-            if (controlPolicy.unavailable) disableButton.title = controlPolicy.explanation;
-            if (!disableButton.disabled || globalEnabled) {
-                disableButton.addEventListener('click', () => {
-                    if (globalEnabled) mutateGlobalState(item, false, disableButton);
-                    else openPermissionReview(item, 'enable');
-                });
-            }
-            actions.append(healthButton, auditButton, disableButton);
-        }
-        if (item.installed && item.connection_required) {
-            const connections = actionButton('設定連線', 'connections', 'link');
-            connections.addEventListener('click', () => selectWorkspaceTab('connections'));
-            actions.appendChild(connections);
-        }
-        if (item.removable && item.installed) {
-            const remove = actionButton('移除', 'remove', 'trash-2', 'btn btn-danger compact');
-            remove.addEventListener('click', () => removeExtension(item, remove));
-            actions.appendChild(remove);
+            const openButton = actionButton('查看詳情', 'open', 'chevron-right', 'btn btn-secondary compact');
+            openButton.addEventListener('click', () => openExtensionDetail(item.id));
+            actions.appendChild(openButton);
         }
 
-        checkbox.addEventListener('change', () => {
-            if (checkbox.checked) {
-                checkbox.checked = false;
-                openPermissionReview(item, 'enable');
-            } else {
-                mutateGlobalState(item, false, checkbox);
-            }
-        });
-        card.append(head, badges, permissions, controls, actions);
+        footer.append(stateLabel, actions);
+        card.append(head, footer);
         return card;
     }
 
@@ -1351,8 +1278,410 @@ async function saveModelProviderSecrets() {
         return select;
     }
 
+    function detailElement(tag, className = '', text = null) {
+        const node = document.createElement(tag);
+        if (className) node.className = className;
+        if (text !== null) node.textContent = String(text);
+        return node;
+    }
+
+    function currentDetailItem() {
+        return (state.response.extensions || [])
+            .find(item => String(item.id) === String(state.selectedExtensionId)) || null;
+    }
+
+    function detailSection(stage, eyebrow, title, description = '') {
+        const section = detailElement('section', 'extension-detail-section');
+        section.dataset.extensionDetailStage = stage;
+        const header = detailElement('div', 'extension-detail-section-head');
+        const copy = detailElement('div');
+        if (eyebrow) copy.appendChild(detailElement('span', 'workflow-eyebrow', eyebrow));
+        copy.appendChild(detailElement('h2', '', title));
+        if (description) copy.appendChild(detailElement('p', '', description));
+        header.appendChild(copy);
+        const body = detailElement('div', 'extension-detail-section-body');
+        section.append(header, body);
+        return { section, header, body };
+    }
+
+    function detailSettingRow(title, description = '') {
+        const row = detailElement('div', 'extension-detail-setting-row');
+        const copy = detailElement('div', 'extension-detail-setting-copy');
+        copy.appendChild(detailElement('strong', '', title));
+        if (description) copy.appendChild(detailElement('span', '', description));
+        const actions = detailElement('div', 'extension-detail-setting-actions');
+        row.append(copy, actions);
+        return { row, copy, actions };
+    }
+
+    function capabilityLabel(value) {
+        return ({
+            workflow_automation: ['工作流程管理', '建立、檢視並執行受治理的本機 Workflow。'],
+            gmail_governed_drafts: ['Gmail Workflow', '接收標籤事件並回到 Workbench 編輯與核准草稿。'],
+            local_models: ['本機模型', '在 Workbench 使用本機推論服務。'],
+            repositories: ['Repositories', '在核准範圍內存取程式碼庫。'],
+            issues: ['Issues', '讀取與管理議題。'],
+            pull_requests: ['Pull Requests', '檢視與管理合併請求。'],
+            checks: ['Checks', '讀取自動化檢查結果。'],
+            pages: ['Pages', '讀取與管理頁面內容。'],
+            databases: ['Databases', '存取已授權的資料庫。'],
+            blocks: ['Blocks', '讀取與更新內容區塊。'],
+        })[String(value)] || [String(value).replaceAll('_', ' '), '由此擴充提供的功能。'];
+    }
+
+    function appendExtensionAuthorization(body, item) {
+        const controlPolicy = extensionControlPolicy(item);
+        const globalEnabled = item.global_enabled === true;
+        const authorization = detailSettingRow(
+            'Workbench 擴充權限',
+            globalEnabled ? '已通過全域審查；可再依專案覆寫。' : '目前不會向 Agent 或工作流程提供能力。'
+        );
+        const toggle = detailElement('label', 'extension-detail-toggle');
+        const checkbox = document.createElement('input');
+        checkbox.type = 'checkbox';
+        checkbox.checked = globalEnabled;
+        checkbox.disabled = !controlPolicy.canToggleGlobal;
+        checkbox.dataset.extensionGlobalToggle = String(item.id);
+        toggle.append(checkbox, document.createTextNode(globalEnabled ? '已啟用' : '已停用'));
+        checkbox.addEventListener('change', () => {
+            if (checkbox.checked) {
+                checkbox.checked = false;
+                openPermissionReview(item, 'enable', {
+                    onComplete: () => openExtensionDetail(item.id),
+                });
+            } else {
+                mutateGlobalState(item, false, checkbox);
+            }
+        });
+        authorization.actions.appendChild(toggle);
+        body.appendChild(authorization.row);
+
+        if (state.projectId) {
+            const project = detailSettingRow('專案作用範圍', '覆寫目前專案是否能使用此擴充。');
+            project.actions.appendChild(projectOverrideSelect(item));
+            body.appendChild(project.row);
+        }
+
+        const maintenance = detailSettingRow('檢查與管理', '健康狀態與稽核紀錄只在需要時查看。');
+        const healthButton = actionButton('健康檢查', 'health', 'activity');
+        healthButton.addEventListener('click', () => refreshHealth(item, healthButton));
+        const auditButton = actionButton('查看 Audit', 'audit', 'scroll-text');
+        auditButton.addEventListener('click', () => openAudit(item));
+        maintenance.actions.append(healthButton, auditButton);
+        if (item.removable) {
+            const remove = actionButton('移除擴充', 'remove', 'trash-2', 'btn btn-danger compact');
+            remove.addEventListener('click', () => removeExtension(item, remove));
+            maintenance.actions.appendChild(remove);
+        }
+        body.appendChild(maintenance.row);
+    }
+
+    function appendN8nRuntimeSetting(body, item) {
+        const service = state.n8nService || {};
+        const running = service.running === true || service.reachable === true;
+        const starting = service.starting === true;
+        const runtimeInstalled = service.installed === true;
+        const runtime = detailSettingRow(
+            '本機 n8n 服務',
+            state.n8nServiceLoading
+                ? '正在檢查服務狀態…'
+                : service.load_error || service.message || (running ? '服務已可使用。' : '服務目前未啟動。')
+        );
+        const status = badge(
+            state.n8nServiceLoading ? '檢查中'
+                : running ? '已啟動' : starting ? '啟動中' : runtimeInstalled ? '未啟動' : '執行環境未就緒',
+            running ? 'is-healthy' : service.load_error ? 'is-error' : 'is-warning'
+        );
+        const start = actionButton('啟動', 'n8n-start', 'play', 'btn btn-primary compact');
+        const stop = actionButton('停止', 'n8n-stop', 'square');
+        start.disabled = state.n8nServiceLoading || !item.effective_enabled || !runtimeInstalled || running || service.starting === true;
+        stop.disabled = state.n8nServiceLoading || !item.effective_enabled || !running;
+        start.addEventListener('click', () => runN8nServiceAction('start', start));
+        stop.addEventListener('click', () => runN8nServiceAction('stop', stop));
+        runtime.actions.append(status, start, stop);
+        body.appendChild(runtime.row);
+    }
+
+    function appendN8nFeatures(body, item) {
+        const service = state.n8nService || {};
+        const running = service.running === true || service.reachable === true;
+        const workflow = detailSettingRow('Workflow 管理', '在 Workbench 規劃、核准並管理 n8n 工作流程。');
+        const use = actionButton('立即使用', 'n8n-use', 'arrow-up-right', 'btn btn-primary compact');
+        use.disabled = !item.effective_enabled;
+        use.addEventListener('click', openN8nWorkspace);
+        workflow.actions.appendChild(use);
+        body.appendChild(workflow.row);
+
+        const gmailReady = service.workflow_ready === true;
+        const gmail = detailSettingRow(
+            'Gmail Workflow',
+            gmailReady ? '受治理的 Gmail 工作流程已完成驗證。' : '尚未通過 Workflow 與 Credential readiness 檢查。'
+        );
+        gmail.actions.appendChild(badge(gmailReady ? '已就緒' : '尚未就緒', gmailReady ? 'is-healthy' : 'is-warning'));
+        body.appendChild(gmail.row);
+
+        const editor = detailSettingRow('n8n 編輯器', '在外部瀏覽器開啟固定的本機端點；不會內嵌到 Workbench。');
+        const open = actionButton('在瀏覽器開啟', 'n8n-open', 'external-link');
+        open.disabled = !item.effective_enabled || !running || !service.editor_url;
+        open.addEventListener('click', () => window.workbenchN8nWorkflows?.openEditor?.());
+        editor.actions.appendChild(open);
+        body.appendChild(editor.row);
+    }
+
+    function appendTechnicalDetails(container, item) {
+        const service = item.id === N8N_EXTENSION_ID ? state.n8nService || {} : {};
+        const details = detailElement('details', 'extension-technical-details');
+        details.dataset.extensionDetailStage = 'technical';
+        details.appendChild(detailElement('summary', '', '技術資訊'));
+        const metrics = detailElement('dl', 'extension-detail-metrics');
+        const values = item.id === N8N_EXTENSION_ID ? [
+            ['n8n 版本', service.version || '—'],
+            ['本機端點', service.editor_url || N8N_EDITOR_URL],
+            ['Gmail Workflow', service.workflow_ready === true ? '已就緒' : '尚未就緒'],
+            ['擴充版本', item.version || '—'],
+        ] : [
+            ['版本', item.version || '—'],
+            ['來源', item.publisher || item.origin || '—'],
+            ['類型', item.kind || '—'],
+        ];
+        values.forEach(([label, value]) => {
+            const row = detailElement('div');
+            row.append(detailElement('dt', '', label), detailElement('dd', '', value));
+            metrics.appendChild(row);
+        });
+        details.appendChild(metrics);
+
+        const permissions = detailElement('div', 'extension-detail-permissions');
+        permissions.appendChild(detailElement('strong', '', '權限與安全'));
+        const chips = detailElement('div', 'extension-permissions');
+        const permissionItems = (item.permissions || []).map(permissionInfo);
+        (permissionItems.length ? permissionItems : [{ name: '未要求額外權限', risk: '' }]).forEach(permission => {
+            const chip = detailElement(
+                'span',
+                `extension-permission-chip ${['system', 'irreversible', 'external_write'].includes(permission.risk) ? 'is-danger' : ''}`.trim(),
+                permission.risk ? `${permission.name} · ${permission.risk}` : permission.name
+            );
+            chip.title = permission.description || chip.textContent;
+            chips.appendChild(chip);
+        });
+        permissions.appendChild(chips);
+        const digest = detailElement('code', 'extension-detail-digest', item.manifest_sha256 || '未提供 manifest digest');
+        permissions.appendChild(digest);
+        details.appendChild(permissions);
+        container.appendChild(details);
+    }
+
+    function captureDetailViewState(container) {
+        const snapshot = {
+            technicalOpen: container.querySelector('.extension-technical-details')?.open === true,
+            focus: null,
+        };
+        const active = document.activeElement;
+        if (!active || !container.contains(active)) return snapshot;
+        if (active.id) {
+            snapshot.focus = { type: 'id', value: active.id };
+            return snapshot;
+        }
+        for (const key of ['extensionAction', 'extensionGlobalToggle', 'extensionProjectOverride']) {
+            const value = active.dataset?.[key];
+            if (value) {
+                snapshot.focus = { type: key, value };
+                return snapshot;
+            }
+        }
+        if (active.tagName === 'SUMMARY') snapshot.focus = { type: 'summary', value: '' };
+        return snapshot;
+    }
+
+    function restoreDetailViewState(container, snapshot) {
+        const technical = container.querySelector('.extension-technical-details');
+        if (technical) technical.open = snapshot.technicalOpen;
+        if (!snapshot.focus) return;
+        let target = null;
+        if (snapshot.focus.type === 'id') {
+            const candidate = document.getElementById(snapshot.focus.value);
+            if (candidate && container.contains(candidate)) target = candidate;
+        } else if (snapshot.focus.type === 'summary') {
+            target = technical?.querySelector('summary') || null;
+        } else {
+            target = [...container.querySelectorAll('[data-extension-action], [data-extension-global-toggle], [data-extension-project-override]')]
+                .find(node => node.dataset?.[snapshot.focus.type] === snapshot.focus.value) || null;
+        }
+        if (target?.disabled) target = null;
+        (target || byId('extension-detail-title'))?.focus?.({ preventScroll: true });
+    }
+
+    function renderExtensionDetail() {
+        const container = byId('extension-detail-content');
+        const item = currentDetailItem();
+        if (!container || !item) return;
+        const viewState = captureDetailViewState(container);
+        container.replaceChildren();
+
+        const hero = detailElement('article', 'extension-detail-hero');
+        hero.dataset.extensionDetailStage = 'use';
+        const identity = detailElement('div', 'extension-detail-identity');
+        const icon = detailElement('span', 'extension-detail-icon');
+        const iconNode = detailElement('i');
+        iconNode.dataset.lucide = iconFor(item);
+        icon.appendChild(iconNode);
+        const copy = detailElement('div');
+        copy.appendChild(detailElement('span', 'workflow-eyebrow', item.category || 'EXTENSION'));
+        const title = detailElement('h1', '', item.name || item.id);
+        title.id = 'extension-detail-title';
+        title.tabIndex = -1;
+        copy.appendChild(title);
+        copy.appendChild(detailElement(
+            'p', '',
+            item.id === N8N_EXTENSION_ID
+                ? '將本機自動化工作流程連接至 Workbench，保留人工核准與安全邊界。'
+                : item.description || '由 Workbench 管理的選用擴充功能。'
+        ));
+        identity.append(icon, copy);
+        const heroActions = detailElement('div', 'extension-detail-hero-actions');
+        heroActions.appendChild(badge(
+            item.effective_enabled ? '可使用' : item.installed ? '已安裝，未啟用' : '尚未安裝',
+            item.effective_enabled ? 'is-healthy' : 'is-warning'
+        ));
+        if (!item.installed) {
+            const install = actionButton('安裝', 'install', 'download', 'btn btn-primary');
+            install.disabled = !extensionControlPolicy(item).canInstall;
+            install.addEventListener('click', () => openPermissionReview(item, 'install', {
+                onComplete: () => openExtensionDetail(item.id),
+            }));
+            heroActions.appendChild(install);
+        } else if (!item.effective_enabled) {
+            const enable = actionButton('審查並啟用', 'enable', 'power', 'btn btn-primary');
+            enable.addEventListener('click', () => openPermissionReview(
+                item,
+                state.projectId && item.global_enabled ? 'project_enable' : 'enable',
+                state.projectId && item.global_enabled
+                    ? { projectId: state.projectId, onComplete: () => openExtensionDetail(item.id) }
+                    : { onComplete: () => openExtensionDetail(item.id) }
+            ));
+            heroActions.appendChild(enable);
+        } else if (item.id === N8N_EXTENSION_ID) {
+            const use = actionButton('立即使用', 'n8n-use', 'arrow-up-right', 'btn btn-primary');
+            use.addEventListener('click', openN8nWorkspace);
+            heroActions.appendChild(use);
+        } else if (item.connection_required) {
+            const connect = actionButton('設定連線', 'connections', 'link', 'btn btn-primary');
+            connect.addEventListener('click', () => {
+                closeExtensionDetail();
+                void selectWorkspaceTab('connections');
+            });
+            heroActions.appendChild(connect);
+        }
+        hero.append(identity, heroActions);
+        container.appendChild(hero);
+
+        if (item.installed) {
+            const settings = detailSection('settings', 'SETTINGS', '設定', '先管理服務與擴充權限，再視需要查看其他能力。');
+            if (item.id === N8N_EXTENSION_ID) appendN8nRuntimeSetting(settings.body, item);
+            appendExtensionAuthorization(settings.body, item);
+            container.appendChild(settings.section);
+
+            const features = detailSection('features', 'FEATURES', '功能', '安裝後可使用的主要能力。');
+            if (item.id === N8N_EXTENSION_ID) {
+                appendN8nFeatures(features.body, item);
+            } else {
+                const capabilities = Array.isArray(item.capabilities) ? item.capabilities : [];
+                (capabilities.length ? capabilities : ['extension_capability']).forEach(capability => {
+                    const [label, description] = capabilityLabel(capability);
+                    features.body.appendChild(detailSettingRow(label, description).row);
+                });
+            }
+            container.appendChild(features.section);
+            appendTechnicalDetails(container, item);
+        }
+        restoreDetailViewState(container, viewState);
+        safeCreateIcons();
+    }
+
+    async function refreshN8nService() {
+        state.n8nServiceLoading = true;
+        if (state.selectedExtensionId === N8N_EXTENSION_ID) renderExtensionDetail();
+        try {
+            const workflows = window.workbenchN8nWorkflows;
+            state.n8nService = typeof workflows?.refreshService === 'function'
+                ? await workflows.refreshService()
+                : await request('/api/integrations/n8n/status');
+        } catch (error) {
+            state.n8nService = { load_error: `無法取得 n8n 狀態：${error.message}` };
+        } finally {
+            state.n8nServiceLoading = false;
+            if (state.selectedExtensionId === N8N_EXTENSION_ID) renderExtensionDetail();
+        }
+        return state.n8nService;
+    }
+
+    async function runN8nServiceAction(action, button) {
+        button.disabled = true;
+        try {
+            if (typeof window.workbenchN8nWorkflows?.manageService === 'function') {
+                state.n8nService = await window.workbenchN8nWorkflows.manageService(action, button);
+            } else {
+                state.n8nService = await request(`/api/integrations/n8n/${action}`, { method: 'POST' });
+            }
+            await refreshN8nService();
+        } catch (error) {
+            state.deps?.showToast?.(`n8n 操作失敗：${error.message}`, 'error');
+            button.disabled = false;
+        }
+    }
+
+    function openN8nWorkspace() {
+        close();
+        void window.workbenchN8nWorkflows?.open?.();
+    }
+
+    async function openExtensionDetail(extensionId) {
+        let item = (state.response.extensions || []).find(entry => String(entry.id) === String(extensionId));
+        if (!item) {
+            await loadCatalog().catch(() => {});
+            item = (state.response.extensions || []).find(entry => String(entry.id) === String(extensionId));
+        }
+        if (!item) return;
+        state.selectedExtensionId = String(item.id);
+        state.detailReturnExtensionId = String(item.id);
+        state.detailReturnTab = item.installed ? 'installed' : 'available';
+        byId('extension-center-workspace')?.classList.add('is-detail');
+        document.querySelectorAll('.extension-tab-panel[data-extension-panel]').forEach(panel => {
+            panel.hidden = true;
+            panel.classList.remove('active');
+        });
+        byId('extension-detail-view').hidden = false;
+        renderExtensionDetail();
+        if (item.id === N8N_EXTENSION_ID) await refreshN8nService();
+        setTimeout(() => byId('extension-detail-title')?.focus(), 20);
+    }
+
+    function closeExtensionDetail() {
+        const returnExtensionId = state.detailReturnExtensionId;
+        state.selectedExtensionId = null;
+        state.detailReturnExtensionId = null;
+        state.n8nService = null;
+        state.n8nServiceLoading = false;
+        byId('extension-detail-view').hidden = true;
+        byId('extension-center-workspace')?.classList.remove('is-detail');
+        setTab(state.detailReturnTab || state.activeTab);
+        setTimeout(() => {
+            const list = byId(`extension-${state.activeTab}-list`);
+            const card = [...(list?.querySelectorAll?.('[data-extension-id]') || [])]
+                .find(node => String(node.dataset.extensionId) === String(returnExtensionId));
+            card?.querySelector?.('[data-extension-action="open"], [data-extension-action="install"]')?.focus?.();
+        }, 0);
+    }
+
     function renderLists() {
         const query = (byId('extension-search')?.value || '').trim().toLocaleLowerCase();
+        ['installed', 'available'].forEach(section => {
+            const count = sectionItems(section).length;
+            const node = byId(`extension-${section}-count`);
+            if (!node) return;
+            node.textContent = String(count);
+            node.setAttribute('aria-label', `${count} 個${section === 'installed' ? '已安裝' : '未安裝'}`);
+        });
         ['installed', 'available', 'local'].forEach(section => {
             const list = byId(`extension-${section}-list`);
             if (!list) return;
@@ -1367,7 +1696,7 @@ async function saveModelProviderSecrets() {
             if (!items.length) {
                 list.appendChild(stateBlock(query ? '找不到符合的擴充。' : {
                     installed: '尚未安裝任何擴充。',
-                    available: '目前沒有可安裝的內建擴充。',
+                    available: '目前沒有未安裝的擴充。',
                     local: '尚未註冊本機受信任擴充。'
                 }[section]));
                 return;
@@ -1404,6 +1733,7 @@ async function saveModelProviderSecrets() {
                 sections: data.sections || {}
             };
             renderLists();
+            if (state.selectedExtensionId) renderExtensionDetail();
             return state.response;
         } catch (error) {
             renderError(error);
@@ -1424,6 +1754,10 @@ async function saveModelProviderSecrets() {
             });
             state.deps?.showToast?.(`${item.name || item.id} 已${enabled ? '啟用' : '停用'}。`, 'success');
             await loadCatalog();
+            if (item.id === N8N_EXTENSION_ID) {
+                await window.workbenchN8nWorkflows?.refreshExtensionState?.();
+                await refreshN8nService();
+            }
             await state.deps?.reloadProject?.();
         } catch (error) {
             state.deps?.showToast?.(`更新擴充失敗：${error.message}`, 'error');
@@ -1452,6 +1786,9 @@ async function saveModelProviderSecrets() {
             control.dataset.previousMode = mode;
             state.deps?.showToast?.(`${item.name || item.id} 的專案設定已更新。`, 'success');
             if (!byId('extension-center-workspace')?.hidden) await loadCatalog();
+            if (item.id === N8N_EXTENSION_ID) {
+                await window.workbenchN8nWorkflows?.refreshExtensionState?.();
+            }
             await renderProjectAssignments(byId('project-settings-extension-list'), projectId);
         } catch (error) {
             state.deps?.showToast?.(`更新專案擴充失敗：${error.message}`, 'error');
@@ -1599,6 +1936,9 @@ async function saveModelProviderSecrets() {
             state.deps?.showToast?.(`${item.name || item.id} 的權限操作已完成。`, 'success');
             closePermissionReview();
             if (!byId('extension-center-workspace')?.hidden) await loadCatalog();
+            if (item.id === N8N_EXTENSION_ID) {
+                await window.workbenchN8nWorkflows?.refreshExtensionState?.();
+            }
             if (context.projectId) {
                 await renderProjectAssignments(byId('project-settings-extension-list'), context.projectId);
             }
@@ -1690,7 +2030,11 @@ async function saveModelProviderSecrets() {
         try {
             await request(`/api/extensions/${encoded(item.id)}`, { method: 'DELETE' });
             state.deps?.showToast?.(`${item.name || item.id} 已移除註冊。`, 'success');
+            if (state.selectedExtensionId === item.id) closeExtensionDetail();
             await loadCatalog();
+            if (item.id === N8N_EXTENSION_ID) {
+                await window.workbenchN8nWorkflows?.refreshExtensionState?.();
+            }
             await state.deps?.reloadProject?.();
         } catch (error) {
             state.deps?.showToast?.(`移除擴充失敗：${error.message}`, 'error');
@@ -1867,9 +2211,14 @@ async function saveModelProviderSecrets() {
         });
     }
 
-    async function open(tab = 'available', projectId = null) {
+    async function open(tab = 'installed', projectId = null) {
         if (!state.initialized) return;
         closePermissionReview({ restoreFocus: false });
+        state.selectedExtensionId = null;
+        state.n8nService = null;
+        state.n8nServiceLoading = false;
+        byId('extension-detail-view').hidden = true;
+        byId('extension-center-workspace')?.classList.remove('is-detail');
         const selectedProject = projectId || state.deps?.getActiveProjectId?.() || null;
         projectOptions(selectedProject);
         if (!projectId && tab !== 'connections') {
@@ -1894,8 +2243,34 @@ async function saveModelProviderSecrets() {
         }, 20);
     }
 
+    async function openExtension(extensionId, projectId = null) {
+        await open('available', projectId);
+        const item = (state.response.extensions || [])
+            .find(entry => String(entry.id) === String(extensionId));
+        if (!item) {
+            state.deps?.showToast?.('找不到指定的擴充功能。', 'warning');
+            return;
+        }
+        if (item.installed) {
+            await openExtensionDetail(item.id);
+            return;
+        }
+        setTab('available');
+        renderLists();
+        setTimeout(() => {
+            const card = byId('extension-available-list')?.querySelector?.(`[data-extension-id="${item.id}"]`);
+            card?.scrollIntoView?.({ block: 'center', behavior: 'smooth' });
+            card?.querySelector?.('[data-extension-action="install"]')?.focus?.();
+        }, 20);
+    }
+
     function close() {
         closePermissionReview({ restoreFocus: false });
+        state.selectedExtensionId = null;
+        state.n8nService = null;
+        state.n8nServiceLoading = false;
+        byId('extension-detail-view').hidden = true;
+        byId('extension-center-workspace')?.classList.remove('is-detail');
         if (byId('extension-center-workspace')) byId('extension-center-workspace').hidden = true;
         byId('extension-audit-panel').hidden = true;
         state.deps?.onWorkspaceClose?.();
@@ -1912,6 +2287,7 @@ async function saveModelProviderSecrets() {
         }
         byId('extensions-close')?.addEventListener('click', close);
         byId('extensions-close-btn')?.addEventListener('click', close);
+        byId('extension-detail-back')?.addEventListener('click', closeExtensionDetail);
         byId('extension-refresh')?.addEventListener('click', () => refreshActiveTab().catch(() => {}));
         byId('extension-search')?.addEventListener('input', renderLists);
         byId('extension-scope-select')?.addEventListener('change', async event => {
@@ -1932,6 +2308,11 @@ async function saveModelProviderSecrets() {
             state.projectId = projectId;
             select.value = projectId;
             loadCatalog().catch(() => {});
+        });
+        window.addEventListener('workbench:n8n-service-state', event => {
+            if (!event.detail || typeof event.detail !== 'object') return;
+            state.n8nService = { ...event.detail };
+            if (state.selectedExtensionId === N8N_EXTENSION_ID) renderExtensionDetail();
         });
         byId('extension-local-path')?.addEventListener('input', event => {
             const filename = event.target.value.trim();
@@ -1958,6 +2339,7 @@ async function saveModelProviderSecrets() {
     window.workbenchExtensions = {
         init,
         open,
+        openExtension,
         close,
         closePermissionReview,
         refresh: loadCatalog,
@@ -1967,7 +2349,8 @@ async function saveModelProviderSecrets() {
         __testing: Object.freeze({
             catalogSectionItems,
             extensionControlPolicy,
-            createExtensionCard
+            createExtensionCard,
+            renderExtensionDetail
         })
     };
 }());

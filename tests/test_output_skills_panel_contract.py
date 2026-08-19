@@ -55,7 +55,7 @@ def test_floating_output_uses_its_own_vertical_tab_toggle():
     assert "if (toggle && state.activeTab === name && state.expanded)" in RUN_INSPECTOR_JS
     for key in ("ArrowDown", "ArrowUp", "Home", "End", "Enter"):
         assert key in RUN_INSPECTOR_JS
-    assert "app.js?v=0.8.0-n8n-graph-authoring-beta.4" in INDEX_HTML
+    assert "app.js?v=0.9.0-model-catalog-beta.1" in INDEX_HTML
     assert "run-inspector.js?v=1.0.2" in INDEX_HTML
 
 
@@ -218,10 +218,8 @@ def test_output_panel_tracks_workspace_escape_focus_and_runtime_resize():
         "function setPrimaryWorkspace",
         "function initWorkbench",
     )
-    assert (
-        "workbenchRunInspector?.setAvailable?.(!extensionMode"
-        in workspace
-    )
+    assert "workbenchRunInspector?.setAvailable?.(!managementMode" in workspace
+    assert "const managementMode = extensionMode || modelMode || cloudMode" in workspace
     assert "runInspectorSuspendedWorkspace === primaryWorkspace" in workspace
     assert "workflowMode && !returningToSuspendedWorkspace" in workspace
     assert "syncChatDrawerA11y(drawer)" in workspace

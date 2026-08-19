@@ -9,13 +9,43 @@ APP_JS = (ROOT / "frontend" / "app.js").read_text(encoding="utf-8")
 CSS = (ROOT / "frontend" / "style.css").read_text(encoding="utf-8")
 
 
-def test_cloud_llm_is_an_independent_navigation_feature():
+def test_cloud_llm_is_an_independent_primary_workspace():
     assert 'id="rail-cloud-llm"' in HTML
-    assert 'id="cloud-llm-modal"' in HTML
+    assert 'id="cloud-llm-workspace"' in HTML
+    assert 'id="cloud-llm-modal"' not in HTML
     assert 'id="btn-open-cloud-llm-settings"' in HTML
     assert HTML.count('id="model-provider-list"') == 1
-    assert HTML.index('id="cloud-llm-modal"') < HTML.index('id="model-provider-list"')
+    assert HTML.index('id="cloud-llm-workspace"') < HTML.index('id="model-provider-list"')
+    assert "nextWorkspace === 'cloud'" in APP_JS
+    assert "setPrimaryWorkspace('cloud')" in APP_JS
     assert "window.workbenchCloudLlm?.open()" in APP_JS
+
+
+def test_controller_mounts_workspace_and_uses_navigation_callbacks():
+    assert "const workspace = byId('cloud-llm-workspace')" in CENTER_JS
+    assert "const workbenchBody = document.querySelector('.workbench-body')" in CENTER_JS
+    assert "workbenchBody.appendChild(workspace)" in CENTER_JS
+    assert "state.deps?.onWorkspaceOpen?.()" in CENTER_JS
+    assert "state.deps?.onWorkspaceClose?.()" in CENTER_JS
+    assert "classList.add('active')" not in CENTER_JS
+    assert "classList.remove('active')" in CENTER_JS  # settings entry remains a modal
+
+
+def test_deactivate_discards_an_unsaved_editor_before_hiding_workspace():
+    assert "async function deactivate()" in CENTER_JS
+    assert "const discardEditor = Boolean(state.editingId)" in CENTER_JS
+    assert "if (discardEditor) await state.deps?.reloadProviders?.()" in CENTER_JS
+    assert "if (workspace) workspace.hidden = true" in CENTER_JS
+    assert "if (await deactivate()) state.deps?.onWorkspaceClose?.()" in CENTER_JS
+    assert "{ init, open, close, deactivate, render: renderLibrary }" in CENTER_JS
+
+
+def test_workspace_does_not_restore_modal_backdrop_close_behavior():
+    assert "cloud-llm-modal" not in CENTER_JS
+    assert "event.target === byId('cloud-llm-workspace')" not in CENTER_JS
+    settings_entry = CENTER_JS.split("byId('btn-open-cloud-llm-settings')", 1)[1]
+    assert "byId('settings-modal')?.classList.remove('active')" in settings_entry
+    assert "open()" in settings_entry
 
 
 def test_library_exposes_search_filters_classification_and_delete():
@@ -63,17 +93,15 @@ def test_delete_failure_is_not_silently_reported_as_success():
     assert "removedProviderSecrets.clear()" in delete_block
 
 
-def test_modal_and_lists_are_bounded_and_scrollable():
-    overlay_rule = CSS.split("#cloud-llm-modal {", 1)[1].split("}", 1)[0]
-    modal_rule = CSS.split(".cloud-llm-modal-box {", 1)[1].split("}", 1)[0]
+def test_workspace_and_lists_are_bounded_and_scrollable():
+    workspace_rule = CSS.split(".cloud-llm-workspace {", 1)[1].split("}", 1)[0]
     list_rule = CSS.split(".cloud-llm-library-list {", 1)[1].split("}", 1)[0]
     editor_rule = CSS.split(".cloud-llm-editor-list {", 1)[1].split("}", 1)[0]
     toolbar_rule = CSS.split(".cloud-llm-editor-toolbar {", 1)[1].split("}", 1)[0]
     toolbar_button_rule = CSS.split(".cloud-llm-editor-toolbar > .btn {", 1)[1].split("}", 1)[0]
-    assert "z-index: 900" in overlay_rule
-    assert "calc(100vh - 32px)" in modal_rule
-    assert "padding: 0" in modal_rule
-    assert "overflow: hidden" in modal_rule
+    assert "height: 100%" in workspace_rule
+    assert "min-width: 0" in workspace_rule
+    assert "overflow: hidden" in workspace_rule
     assert "overflow-y: auto" in list_rule
     assert "overflow-y: auto" in editor_rule
     assert "grid-template-columns: auto minmax(0, 1fr)" in toolbar_rule

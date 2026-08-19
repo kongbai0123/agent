@@ -839,7 +839,7 @@ def test_frontend_exposes_simple_multi_api_import_without_routing_ui():
     assert 'data-provider-field="api_key"' in javascript
     assert 'data-provider-field="selected_model"' in javascript
     assert 'class="btn btn-primary compact model-provider-test"' in javascript
-    assert 'id="cloud-llm-modal"' in html
+    assert 'id="cloud-llm-workspace"' in html
     assert 'id="btn-add-model-provider"' in html
     assert 'id="cloud-llm-library-list"' in html
     assert "取得模型回覆" in javascript

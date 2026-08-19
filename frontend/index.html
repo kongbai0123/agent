@@ -17,7 +17,7 @@
     <link rel="stylesheet" href="katex.min.css">
     <script src="katex.min.js"></script>
     <script src="auto-render.min.js"></script>
-    <link rel="stylesheet" href="style.css?v=0.8.0-n8n-graph-authoring-beta.4">
+    <link rel="stylesheet" href="style.css?v=0.9.0-model-catalog-beta.1">
 </head>
 <body class="basic-chat-mode">
     <div class="app-container workbench-shell">
@@ -70,10 +70,11 @@
             <!-- ================= 左側 Icon Rail ================= -->
             <nav class="icon-rail" role="navigation" aria-label="主功能導覽">
                 <button class="rail-btn active" id="rail-chat" title="對話" aria-label="對話與歷史紀錄"
-                    aria-controls="chat-drawer" aria-expanded="true">
+                    aria-controls="chat-drawer" aria-expanded="true" aria-current="page">
                     <i data-lucide="message-square"></i><span class="rail-label">對話</span>
                 </button>
-                <button class="rail-btn" id="rail-workflows" title="工作流程" aria-label="開啟工作流程中心">
+                <button class="rail-btn" id="rail-workflows" title="工作流程" aria-label="開啟工作流程中心"
+                    aria-controls="n8n-workflow-center" aria-current="false">
                     <i data-lucide="workflow"></i><span class="rail-label">流程</span>
                     <span class="rail-notification-badge" id="workflow-rail-badge" aria-hidden="true" hidden>0</span>
                 </button>
@@ -89,13 +90,16 @@
                 <button class="rail-btn" id="rail-artifacts" title="Artifacts 工作區" aria-label="Artifacts 工作區">
                     <i data-lucide="code-xml"></i><span class="rail-label">產物</span>
                 </button>
-                <button class="rail-btn" id="rail-models" title="模型管理" aria-label="模型管理">
+                <button class="rail-btn" id="rail-models" title="模型管理" aria-label="模型管理"
+                    aria-controls="model-manager-workspace" aria-current="false">
                     <i data-lucide="box"></i><span class="rail-label">模型</span>
                 </button>
-                <button class="rail-btn" id="rail-cloud-llm" title="雲端 LLM" aria-label="管理雲端 LLM API">
+                <button class="rail-btn" id="rail-cloud-llm" title="雲端 LLM" aria-label="管理雲端 LLM API"
+                    aria-controls="cloud-llm-workspace" aria-current="false">
                     <i data-lucide="cloud-cog"></i><span class="rail-label">雲端</span>
                 </button>
-                <button class="rail-btn" id="rail-extensions" title="擴充中心" aria-label="擴充中心">
+                <button class="rail-btn" id="rail-extensions" title="擴充中心" aria-label="擴充中心"
+                    aria-controls="extension-center-workspace" aria-current="false">
                     <i data-lucide="puzzle"></i><span class="rail-label">擴充</span>
                 </button>
                 <button class="rail-btn" id="rail-settings" title="設定" aria-label="設定中心">
@@ -295,46 +299,85 @@
             <!-- n8n 僅負責外部流程；Workbench 保有 Project、Agent、核准與稽核邊界。 -->
             <main class="workflow-center" id="n8n-workflow-center" aria-labelledby="workflow-center-title" hidden>
                 <header class="workflow-center-header">
-                    <div>
+                    <div class="workflow-header-main">
                         <span class="workflow-eyebrow">WORKBENCH × N8N</span>
                         <h1 id="workflow-center-title">工作流程</h1>
                         <p>使用本機 n8n 接收 Gmail 標籤事件；草稿必須回到 Workbench 編輯與核准。</p>
+                        <div class="workflow-header-status-row">
+                            <span class="workflow-status-pill" id="workflow-service-state" role="status">檢查中</span>
+                            <span class="workflow-header-status-copy" id="workflow-service-detail">正在確認 n8n 擴充與服務狀態…</span>
+                            <button type="button" class="workflow-header-link" id="workflow-extension-manage">
+                                管理擴充
+                            </button>
+                        </div>
                     </div>
-                    <button type="button" class="btn btn-secondary compact" id="workflow-refresh">
-                        <i data-lucide="refresh-cw" aria-hidden="true"></i>重新整理
-                    </button>
+                    <div class="workflow-header-actions">
+                        <button type="button" class="btn btn-secondary compact" id="workflow-refresh">
+                            <i data-lucide="refresh-cw" aria-hidden="true"></i>重新整理
+                        </button>
+                    </div>
                 </header>
 
                 <div class="workflow-center-body">
-                    <section class="workflow-card workflow-service-card" aria-labelledby="workflow-service-title">
-                        <div class="workflow-card-head">
-                            <div>
-                                <h2 id="workflow-service-title">本機 n8n 服務</h2>
-                                <p id="workflow-service-detail">正在檢查服務狀態…</p>
-                            </div>
-                            <span class="workflow-status-pill" id="workflow-service-state" role="status">檢查中</span>
+                    <section class="workflow-extension-gate" id="workflow-extension-gate"
+                        aria-labelledby="workflow-extension-gate-title" hidden>
+                        <span class="workflow-extension-gate-icon"><i data-lucide="workflow" aria-hidden="true"></i></span>
+                        <div>
+                            <span class="workflow-eyebrow">OPTIONAL EXTENSION</span>
+                            <h2 id="workflow-extension-gate-title">安裝 n8n 擴充後開始使用</h2>
+                            <p id="workflow-extension-gate-detail">工作流程功能會在需要時才加入 Workbench。</p>
                         </div>
-                        <dl class="workflow-service-metrics" id="workflow-service-metrics"></dl>
-                        <div class="workflow-actions">
-                            <button type="button" class="btn btn-primary compact" id="workflow-service-start">
-                                <i data-lucide="play" aria-hidden="true"></i>啟動 n8n
-                            </button>
-                            <button type="button" class="btn btn-secondary compact" id="workflow-service-stop">
-                                <i data-lucide="square" aria-hidden="true"></i>停止 n8n
-                            </button>
-                            <button type="button" class="btn btn-secondary compact" id="workflow-service-open">
-                                <i data-lucide="external-link" aria-hidden="true"></i>在瀏覽器開啟 n8n
-                            </button>
-                        </div>
-                        <p class="workflow-security-note"><i data-lucide="shield-check" aria-hidden="true"></i>不在 Workbench 內嵌 n8n 編輯器；服務只允許本機回送受控事件。</p>
+                        <button type="button" class="btn btn-primary" id="workflow-extension-open">
+                            <i data-lucide="puzzle" aria-hidden="true"></i>前往擴充功能
+                        </button>
                     </section>
 
+                    <div class="workflow-enabled-content" id="workflow-enabled-content">
+                    <section class="workflow-command-bar" aria-labelledby="workflow-command-title">
+                        <div class="workflow-command-main">
+                            <span class="workflow-command-signal" id="workflow-command-signal" aria-hidden="true">
+                                <i data-lucide="power"></i>
+                            </span>
+                            <div class="workflow-command-copy">
+                                <span class="workflow-eyebrow">N8N CONTROL</span>
+                                <h2 id="workflow-command-title">正在確認 n8n 狀態</h2>
+                                <p id="workflow-command-detail">確認完成後，可直接從這裡啟動、停止或開啟 n8n。</p>
+                                <div class="workflow-command-facts" aria-label="n8n 服務摘要">
+                                    <span id="workflow-command-version">版本檢查中</span>
+                                    <span id="workflow-command-gmail">Gmail Workflow 檢查中</span>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="workflow-command-actions" aria-label="n8n 主要操作">
+                            <button type="button" class="btn btn-primary workflow-command-primary"
+                                id="workflow-service-start">
+                                <i data-lucide="power" aria-hidden="true"></i><span id="workflow-service-start-label">啟動 n8n</span>
+                            </button>
+                            <button type="button" class="btn btn-primary workflow-command-primary"
+                                id="workflow-service-open" hidden>
+                                <i data-lucide="external-link" aria-hidden="true"></i>開啟 n8n
+                            </button>
+                            <button type="button" class="btn btn-secondary" id="workflow-service-stop" hidden>
+                                <i data-lucide="square" aria-hidden="true"></i>停止服務
+                            </button>
+                            <button type="button" class="btn btn-secondary" id="workflow-service-settings">
+                                <i data-lucide="settings-2" aria-hidden="true"></i>服務設定
+                            </button>
+                        </div>
+                        <div class="workflow-command-guide" aria-label="建議操作順序">
+                            <span><strong>1</strong>啟動服務</span>
+                            <i data-lucide="chevron-right" aria-hidden="true"></i>
+                            <span><strong>2</strong>說出需求</span>
+                            <i data-lucide="chevron-right" aria-hidden="true"></i>
+                            <span><strong>3</strong>確認執行</span>
+                        </div>
+                    </section>
                     <section class="workflow-card n8n-plan-mode" aria-labelledby="n8n-plan-title">
                         <div class="workflow-card-head">
                             <div>
-                                <span class="workflow-eyebrow">TWO-STAGE PLAN</span>
-                                <h2 id="n8n-plan-title">Agent n8n 操作助理</h2>
-                                <p>先選擇 2–3 個輕量架構之一，再產生唯一節點圖。Graph Compiler 驗證及人工核准前不會操作 n8n。</p>
+                                <span class="workflow-eyebrow">直接說出需求</span>
+                                <h2 id="n8n-plan-title">想讓 n8n 幫你做什麼？</h2>
+                                <p>直接描述想達成的結果，不必先理解節點或流程設定。只有外部寫入或敏感動作時，Workbench 才會請你確認。</p>
                             </div>
                             <span class="workflow-status-pill" id="n8n-plan-state" role="status" aria-live="polite">尚未開始</span>
                         </div>
@@ -348,27 +391,40 @@
                                 <div id="n8n-plan-messages" class="n8n-plan-messages" role="log" aria-live="polite" aria-relevant="additions text" aria-label="n8n 規劃對話">
                                     <article class="n8n-plan-message is-agent">
                                         <strong>Agent</strong>
-                                        <p>請描述你想完成的流程。我會先說明可行做法、可能結果、風險與需要開放的權限。</p>
+                                        <p>告訴我你希望自動完成什麼。我會先整理做法；真正寫入、寄送或刪除前才會請你確認。</p>
                                     </article>
                                 </div>
                                 <div id="n8n-plan-options" class="n8n-plan-options" role="group" aria-label="Agent 建議選項" hidden></div>
                                 <form id="n8n-plan-form" class="workflow-form n8n-plan-form">
-                                    <label for="n8n-plan-session">
-                                        <span>操作 Session</span>
-                                        <select id="n8n-plan-session" required>
-                                            <option value="">請先選擇此 Project 的 Session</option>
-                                        </select>
-                                        <small>計畫、提案與核准都會固定綁定此 Session，避免跨 Project 操作。</small>
-                                    </label>
                                     <label for="n8n-plan-input">
-                                        <span>告訴 Agent 你想完成甚麼</span>
+                                        <span>告訴 n8n 你想完成什麼</span>
                                         <textarea id="n8n-plan-input" maxlength="4000" rows="3" placeholder="例如：收到指定客戶的 Gmail 後，整理內容並建立回覆草稿。" required></textarea>
-                                        <small>Shift+Enter 換行。本階段先整理方案；建立並核准提案後，Broker 才會實際操作 n8n。</small>
+                                        <small>按 Enter 送出、Shift+Enter 換行。Workbench 會先整理方案，不會直接執行敏感動作。</small>
                                     </label>
+                                    <details class="n8n-plan-scope" id="n8n-plan-scope">
+                                        <summary>
+                                            <span><i data-lucide="folder-check" aria-hidden="true"></i>工作範圍</span>
+                                            <small id="n8n-plan-scope-summary">會自動使用目前範圍；全新環境會在首次送出時建立個人工作區</small>
+                                        </summary>
+                                        <div class="workflow-grid n8n-plan-scope-grid">
+                                            <label for="n8n-agent-project">
+                                                <span>Project</span>
+                                                <select id="n8n-agent-project"><option value="">請選擇 Project</option></select>
+                                                <small>限制 Agent 只能使用這個專案的資料與工具。</small>
+                                            </label>
+                                            <label for="n8n-plan-session">
+                                                <span>對話</span>
+                                                <select id="n8n-plan-session">
+                                                    <option value="">請先選擇此 Project 的 Session</option>
+                                                </select>
+                                                <small>避免不同對話的提案與確認互相混用。</small>
+                                            </label>
+                                        </div>
+                                    </details>
                                     <div class="workflow-actions workflow-actions-end">
                                         <button type="button" class="btn btn-secondary" id="n8n-plan-reset" disabled>重新規劃</button>
                                         <button type="submit" class="btn btn-primary" id="n8n-plan-send">
-                                            <i data-lucide="send" aria-hidden="true"></i>送出給 Agent
+                                            <i data-lucide="send" aria-hidden="true"></i>送出需求
                                         </button>
                                     </div>
                                 </form>
@@ -436,19 +492,25 @@
                         </div>
                     </section>
 
+                    <details class="n8n-progressive-panel" id="n8n-advanced-settings">
+                        <summary>
+                            <span class="n8n-progressive-icon"><i data-lucide="shield-check" aria-hidden="true"></i></span>
+                            <span><strong>權限與進階管理</strong><small>一般使用維持安全模式即可；只有發布、刪除或連接外部帳號時才需要調整。</small></span>
+                            <span class="n8n-progressive-tag">需要時設定</span>
+                        </summary>
+                        <div class="n8n-progressive-body">
                     <section class="workflow-card n8n-agent-governance" aria-labelledby="n8n-agent-policy-title">
                         <div class="workflow-card-head">
                             <div>
                                 <h2 id="n8n-agent-policy-title">Agent 管理權限</h2>
-                                <p>以 Project 隔離 n8n 管理能力；Secret 永遠不會交給 Agent。</p>
+                                <p>選擇 Agent 可以做到哪一步；Secret 永遠不會交給 Agent。</p>
                             </div>
-                            <span class="workflow-status-pill" id="n8n-agent-policy-state">限制權限</span>
+                            <span class="workflow-status-pill" id="n8n-agent-policy-state">安全模式</span>
                         </div>
                         <form id="n8n-agent-policy-form" class="workflow-form">
                             <div class="workflow-grid n8n-agent-policy-grid">
-                                <label><span>Project</span><select id="n8n-agent-project" required><option value="">請選擇 Project</option></select></label>
-                                <label><span>權限模式</span><select id="n8n-agent-mode"><option value="off">停用</option><option value="restricted">限制權限</option><option value="full_audit">完整管理／完全審核</option></select></label>
-                                <label><span>完整模式有效期限</span><select id="n8n-agent-duration"><option value="one_hour">一小時</option><option value="session">目前 Session</option><option value="persistent">直到手動關閉</option><option value="smart">智慧模式（閒置 30 分鐘自動降級）</option></select></label>
+                                <label><span>Agent 可操作範圍</span><select id="n8n-agent-mode"><option value="off">只規劃，不允許操作</option><option value="restricted">安全模式（敏感動作逐次確認）</option><option value="full_audit">進階管理</option></select></label>
+                                <label id="n8n-agent-duration-field" hidden><span>進階管理有效期限</span><select id="n8n-agent-duration"><option value="one_hour">一小時</option><option value="session">目前對話</option><option value="persistent">直到手動關閉</option><option value="smart">閒置 30 分鐘後回到安全模式</option></select></label>
                             </div>
                             <div class="workflow-risk-callout" id="n8n-agent-risk-callout" role="alert">
                                 <strong>風險提醒</strong>
@@ -530,7 +592,16 @@
                     </div>
 
                     <section class="workflow-card" aria-labelledby="n8n-agent-audits-title"><div class="workflow-card-head"><div><h2 id="n8n-agent-audits-title">完整稽核紀錄</h2><p>只保存安全摘要與 digest，不保存 Secret。</p></div></div><div id="n8n-agent-audits-list" class="mail-run-list" aria-live="polite"><div class="workflow-empty">尚無稽核紀錄。</div></div></section>
+                        </div>
+                    </details>
 
+                    <details class="n8n-progressive-panel" id="n8n-gmail-settings">
+                        <summary>
+                            <span class="n8n-progressive-icon"><i data-lucide="mail" aria-hidden="true"></i></span>
+                            <span><strong>Gmail 自動化</strong><small>選用功能。只有要依 Gmail 標籤建立或寄送草稿時才需要設定。</small></span>
+                            <span class="n8n-progressive-tag">選用</span>
+                        </summary>
+                        <div class="n8n-progressive-body">
                     <div class="workflow-grid">
                         <section class="workflow-card" aria-labelledby="mail-profile-title">
                             <div class="workflow-card-head">
@@ -642,6 +713,9 @@
                             <div class="workflow-empty">尚無郵件執行紀錄。</div>
                         </div>
                     </section>
+                        </div>
+                    </details>
+                    </div>
                 </div>
             </main>
 
@@ -885,42 +959,74 @@
         </div>
     </div>
 
-    <!-- ================= Model Manager ================= -->
-    <div class="modal-overlay" id="model-manager-modal" role="dialog" aria-modal="true" aria-label="模型管理">
-        <div class="modal mm-modal">
-            <div class="modal-header">
-                <h3><i data-lucide="box" style="margin-right: 8px; color: var(--primary-color);"></i>Model Manager</h3>
-                <button class="modal-close" id="mm-close" aria-label="關閉模型管理"><i data-lucide="x"></i></button>
+    <!-- ================= Model Manager workspace ================= -->
+    <main class="model-workspace" id="model-manager-workspace" aria-labelledby="model-manager-title" hidden>
+        <div class="management-workspace-shell model-workspace-shell">
+            <div class="workspace-header">
+                <h1 id="model-manager-title" tabindex="-1"><i data-lucide="box"></i>模型管理</h1>
+                <button class="workspace-close" id="mm-close" aria-label="返回聊天"><i data-lucide="x"></i></button>
             </div>
             <div class="mm-tabs" role="tablist">
-                <button class="mm-tab active" data-mmtab="installed" role="tab">Installed</button>
-                <button class="mm-tab" data-mmtab="recommended" role="tab">Recommended</button>
-                <button class="mm-tab" data-mmtab="available" role="tab">Available</button>
-                <button class="mm-tab" data-mmtab="benchmark" role="tab">Benchmark</button>
+                <button class="mm-tab active" id="mm-tab-installed" data-mmtab="installed" role="tab"
+                    aria-controls="mm-pane-installed" aria-selected="true" tabindex="0">已安裝</button>
+                <button class="mm-tab" id="mm-tab-recommended" data-mmtab="recommended" role="tab"
+                    aria-controls="mm-pane-recommended" aria-selected="false" tabindex="-1">推薦</button>
+                <button class="mm-tab" id="mm-tab-available" data-mmtab="available" role="tab"
+                    aria-controls="mm-pane-available" aria-selected="false" tabindex="-1">可安裝</button>
+                <button class="mm-tab" id="mm-tab-benchmark" data-mmtab="benchmark" role="tab"
+                    aria-controls="mm-pane-benchmark" aria-selected="false" tabindex="-1">效能測試</button>
             </div>
-            <div class="modal-body mm-body">
-                <div class="mm-pane active" id="mm-pane-installed"><div class="mm-list" id="mm-installed-list">載入中...</div></div>
-                <div class="mm-pane" id="mm-pane-recommended">
+            <div class="mm-body">
+                <section class="mm-pane active" id="mm-pane-installed" role="tabpanel"
+                    aria-labelledby="mm-tab-installed"><div class="mm-list" id="mm-installed-list">載入中...</div></section>
+                <section class="mm-pane" id="mm-pane-recommended" role="tabpanel"
+                    aria-labelledby="mm-tab-recommended" hidden>
                     <div class="mm-hw-card" id="mm-hw-card">正在讀取硬體資訊...</div>
                     <div class="mm-list" id="mm-recommended-list"></div>
                     <div class="mm-note">安裝會顯示即時進度；下載期間可隨時按「停止安裝」。</div>
-                </div>
-                <div class="mm-pane" id="mm-pane-available">
-                    <input type="text" id="mm-search" class="settings-input" placeholder="搜尋模型..." aria-label="搜尋可安裝模型">
+                </section>
+                <section class="mm-pane" id="mm-pane-available" role="tabpanel"
+                    aria-labelledby="mm-tab-available" hidden>
+                    <div class="mm-catalog-toolbar">
+                        <input type="search" id="mm-search" class="settings-input" placeholder="搜尋名稱、用途或開發者..." aria-label="搜尋可安裝模型">
+                        <select id="mm-category-filter" class="settings-input" aria-label="依用途篩選模型">
+                            <option value="">所有用途</option>
+                            <option value="chat">一般對話</option>
+                            <option value="code">程式開發</option>
+                            <option value="reasoning">推理</option>
+                            <option value="vision">圖片理解</option>
+                            <option value="tools">工具操作</option>
+                            <option value="multilingual">多語言</option>
+                            <option value="rag">知識庫／RAG</option>
+                            <option value="edge">輕量裝置</option>
+                        </select>
+                    </div>
+                    <div class="mm-catalog-summary" id="mm-catalog-summary" aria-live="polite">正在讀取可安裝模型...</div>
                     <div class="mm-list" id="mm-available-list"></div>
-                </div>
-                <div class="mm-pane" id="mm-pane-benchmark">
+                    <details class="mm-custom-install">
+                        <summary>找不到模型？使用 Ollama 標籤安裝</summary>
+                        <p>可輸入 Ollama 官方模型標籤，例如 <code>qwen3.5:4b</code>。目前只建議安裝可對話、程式、推理或圖片理解的生成模型。</p>
+                        <div class="mm-custom-install-row">
+                            <input type="text" id="mm-custom-model" class="settings-input" maxlength="200"
+                                placeholder="模型名稱:版本，例如 qwen3.5:4b" aria-label="Ollama 模型標籤">
+                            <button class="btn btn-primary" id="mm-custom-install-btn" type="button">安裝此模型</button>
+                        </div>
+                        <a href="https://ollama.com/library" target="_blank" rel="noopener noreferrer">查看 Ollama 官方模型庫</a>
+                    </details>
+                </section>
+                <section class="mm-pane" id="mm-pane-benchmark" role="tabpanel"
+                    aria-labelledby="mm-tab-benchmark" hidden>
                     <div class="mm-note">對目前選用模型執行一次短提示測速（實際呼叫本機模型）。</div>
                     <button class="btn btn-primary" id="mm-run-benchmark" style="width:auto; margin: 10px 0;">執行測速</button>
                     <div class="mm-list" id="mm-benchmark-result">尚無測速結果。</div>
-                </div>
+                </section>
             </div>
-            <div class="modal-footer">
+            <div class="workspace-footer">
                 <button class="btn btn-secondary" id="mm-refresh">重新整理</button>
-                <button class="btn btn-secondary" id="mm-close-btn">關閉</button>
+                <button class="btn btn-secondary" id="mm-close-btn">回到聊天</button>
             </div>
         </div>
-    </div>
+    </main>
 
     <!-- ================= 模型切換確認 ================= -->
     <div class="modal-overlay" id="model-switch-modal" role="dialog" aria-modal="true" aria-label="切換模型確認">
@@ -1608,7 +1714,7 @@
                 <div>
                     <span class="workflow-eyebrow">AGENT EXTENSIONS</span>
                     <h3 id="extensions-title"><i data-lucide="puzzle"></i>外掛程式</h3>
-                    <p class="extension-subtitle">探索可信外掛、連接帳號，並以 Project 與資源範圍治理 Agent 工具。</p>
+                    <p class="extension-subtitle">先分清楚已安裝與未安裝；連線與本機來源則在需要時再使用。</p>
                 </div>
                 <div class="extension-header-actions">
                     <button type="button" class="btn btn-secondary compact" id="extension-developer-toggle"
@@ -1620,7 +1726,7 @@
                     </button>
                 </div>
             </div>
-            <div class="extension-toolbar">
+            <div class="extension-toolbar" id="extension-toolbar">
                 <label class="extension-search">
                     <i data-lucide="search"></i>
                     <span class="sr-only">搜尋擴充</span>
@@ -1636,27 +1742,59 @@
                     <i data-lucide="refresh-cw"></i>重新整理
                 </button>
             </div>
-            <div class="extension-tabs" role="tablist" aria-label="擴充分類">
-                <button type="button" class="extension-tab-btn active" role="tab" aria-selected="true"
-                    aria-controls="extension-pane-available" data-extension-tab="available">探索</button>
-                <button type="button" class="extension-tab-btn" role="tab" aria-selected="false"
-                    aria-controls="extension-pane-installed" data-extension-tab="installed">已安裝</button>
-                <button type="button" class="extension-tab-btn" role="tab" aria-selected="false"
-                    aria-controls="extension-pane-connections" data-extension-tab="connections">連線</button>
-                <button type="button" class="extension-tab-btn" role="tab" aria-selected="false"
-                    aria-controls="extension-pane-local" data-extension-tab="local">私人／本機</button>
+            <div class="extension-tabs" id="extension-tabs" role="tablist" aria-label="擴充分類">
+                <div class="extension-primary-tabs" role="presentation">
+                    <button type="button" class="extension-tab-btn is-primary active" role="tab" aria-selected="true"
+                        aria-controls="extension-pane-installed" data-extension-tab="installed">
+                        <i data-lucide="check-circle-2" aria-hidden="true"></i><span>已安裝</span>
+                        <span class="extension-tab-count" id="extension-installed-count" aria-label="0 個已安裝">0</span>
+                    </button>
+                    <button type="button" class="extension-tab-btn is-primary" role="tab" aria-selected="false"
+                        aria-controls="extension-pane-available" data-extension-tab="available">
+                        <i data-lucide="download" aria-hidden="true"></i><span>未安裝</span>
+                        <span class="extension-tab-count" id="extension-available-count" aria-label="0 個未安裝">0</span>
+                    </button>
+                </div>
+                <div class="extension-secondary-tabs" role="presentation">
+                    <span class="extension-secondary-label" aria-hidden="true">其他</span>
+                    <button type="button" class="extension-tab-btn is-secondary" role="tab" aria-selected="false"
+                        aria-controls="extension-pane-connections" data-extension-tab="connections">
+                        <i data-lucide="link" aria-hidden="true"></i><span>連線</span>
+                    </button>
+                    <button type="button" class="extension-tab-btn is-secondary" role="tab" aria-selected="false"
+                        aria-controls="extension-pane-local" data-extension-tab="local">
+                        <i data-lucide="folder-lock" aria-hidden="true"></i><span>私人／本機</span>
+                    </button>
+                </div>
             </div>
             <div class="extension-body">
-                <section class="extension-tab-panel" id="extension-pane-installed" role="tabpanel"
-                    data-extension-panel="installed" hidden>
+                <section class="extension-detail-view" id="extension-detail-view"
+                    aria-labelledby="extension-detail-title" hidden>
+                    <div class="extension-detail-nav">
+                        <button type="button" class="extension-detail-back" id="extension-detail-back">
+                            <i data-lucide="arrow-left" aria-hidden="true"></i>返回擴充列表
+                        </button>
+                    </div>
+                    <div id="extension-detail-content"></div>
+                </section>
+                <section class="extension-tab-panel active" id="extension-pane-installed" role="tabpanel"
+                    data-extension-panel="installed">
+                    <header class="extension-section-intro">
+                        <div><span class="workflow-eyebrow">INSTALLED</span><h4>已安裝</h4></div>
+                        <p>這些擴充已加入 Workbench；點開後才會顯示啟用、權限與技術設定。</p>
+                    </header>
                     <div class="extension-list" id="extension-installed-list" aria-live="polite">
                         <div class="extension-state is-loading">載入已安裝擴充中…</div>
                     </div>
                 </section>
-                <section class="extension-tab-panel active" id="extension-pane-available" role="tabpanel"
-                    data-extension-panel="available">
+                <section class="extension-tab-panel" id="extension-pane-available" role="tabpanel"
+                    data-extension-panel="available" hidden>
+                    <header class="extension-section-intro">
+                        <div><span class="workflow-eyebrow">NOT INSTALLED</span><h4>未安裝</h4></div>
+                        <p>只顯示尚未加入的擴充；安裝前會先讓你確認用途與必要權限。</p>
+                    </header>
                     <div class="extension-list" id="extension-available-list" aria-live="polite">
-                        <div class="extension-state is-loading">載入可安裝擴充中…</div>
+                        <div class="extension-state is-loading">載入未安裝擴充中…</div>
                     </div>
                 </section>
                 <section class="extension-tab-panel" id="extension-pane-connections" role="tabpanel"
@@ -1798,15 +1936,15 @@
         </div>
     </div>
 
-    <div class="modal-overlay" id="cloud-llm-modal" role="dialog" aria-modal="true"
-        aria-labelledby="cloud-llm-title">
-        <div class="modal cloud-llm-modal-box">
-            <div class="modal-header cloud-llm-header">
+    <main class="cloud-llm-workspace" id="cloud-llm-workspace"
+        aria-labelledby="cloud-llm-title" hidden>
+        <div class="management-workspace-shell cloud-llm-workspace-shell">
+            <div class="workspace-header cloud-llm-header">
                 <div>
-                    <h3 id="cloud-llm-title"><i data-lucide="cloud-cog"></i>雲端 LLM</h3>
+                    <h1 id="cloud-llm-title" tabindex="-1"><i data-lucide="cloud-cog"></i>雲端 LLM</h1>
                     <p>集中管理已導入的 API 與模型；每筆連線及金鑰皆獨立保存。</p>
                 </div>
-                <button type="button" class="modal-close" id="cloud-llm-close" aria-label="關閉雲端 LLM">
+                <button type="button" class="workspace-close" id="cloud-llm-close" aria-label="返回聊天">
                     <i data-lucide="x"></i>
                 </button>
             </div>
@@ -1849,7 +1987,7 @@
                     <span id="cloud-llm-count">0 / 0 筆</span>
                 </div>
                 <div id="cloud-llm-library-list" class="cloud-llm-library-list" aria-live="polite"></div>
-                <div class="modal-footer">
+                <div class="workspace-footer">
                     <span class="cloud-llm-security-note"><i data-lucide="shield-check"></i>金鑰由 Windows DPAPI 加密，不會顯示完整內容。</span>
                     <button type="button" class="btn btn-secondary" id="cloud-llm-close-btn">關閉</button>
                 </div>
@@ -1866,13 +2004,13 @@
                     </div>
                 </div>
                 <div id="model-provider-list" class="model-provider-list cloud-llm-editor-list"></div>
-                <div class="modal-footer">
+                <div class="workspace-footer">
                     <button type="button" class="btn btn-secondary" id="cloud-llm-editor-cancel">取消</button>
                     <button type="button" class="btn btn-primary" id="cloud-llm-save">儲存 API</button>
                 </div>
             </section>
         </div>
-    </div>
+    </main>
 
     <!-- 相容性佔位：舊版沙盒切換鈕（新 UI 由 Rail 的 Artifacts 取代，保留 id 供既有邏輯） -->
     <button id="btn-sandbox-toggle" class="btn-settings-trigger btn-sandbox-toggle" hidden aria-hidden="true"></button>
@@ -1891,17 +2029,17 @@
         <div class="task-progress-list" id="task-progress-list"></div>
     </section>
 
-    <script src="extension-center.js?v=1.3.1-extension-contract"></script>
+    <script src="extension-center.js?v=1.5.0-install-status"></script>
     <script src="connector-center.js?v=1.0.1-extension-gate"></script>
     <script src="skill-center.js?v=1.0.2-chat-reset"></script>
-    <script src="cloud-llm-center.js?v=1.0.1"></script>
+    <script src="cloud-llm-center.js?v=1.1.0-workspace"></script>
     <script src="agent-collaboration.js?v=1.1.0-model-trace"></script>
     <script src="basic-chat-mode.js?v=1.0.2-sidebar-contract"></script>
     <script src="project-skills-sidebar.js?v=1.2.1-add-menu-a11y"></script>
     <script src="run-inspector.js?v=1.0.2"></script>
-    <script src="n8n-workflows.js?v=0.8.0-n8n-graph-authoring-beta.4"></script>
-    <script src="n8n-agent-governance.js?v=0.8.0-n8n-graph-authoring-beta.3"></script>
+    <script src="n8n-workflows.js?v=0.9.1-hmi-controls"></script>
+    <script src="n8n-agent-governance.js?v=0.9.1-personal-scope"></script>
     <script src="hermes-settings.js?v=1.1.2-hover-help-dom"></script>
-    <script src="app.js?v=0.8.0-n8n-graph-authoring-beta.4"></script>
+    <script src="app.js?v=0.9.0-model-catalog-beta.1"></script>
 </body>
 </html>

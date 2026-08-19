@@ -6,6 +6,7 @@ ROOT = Path(__file__).resolve().parents[1]
 FRONTEND = ROOT / "frontend"
 INDEX_HTML = (FRONTEND / "index.html").read_text(encoding="utf-8")
 STYLE_CSS = (FRONTEND / "style.css").read_text(encoding="utf-8")
+APP_JS = (FRONTEND / "app.js").read_text(encoding="utf-8")
 
 
 def _rule(selector: str, *, start: int = 0) -> str:
@@ -199,4 +200,17 @@ def test_right_surface_z_index_layers_are_ordered_and_cache_is_bumped():
     assert values["z-popover"] < values["z-modal"] < values["z-toast"]
     assert "z-index: var(--z-popover)" in _rule(".slash-commands-menu {")
     assert "z-index: var(--z-modal)" in _rule(".modal-overlay {")
-    assert "style.css?v=0.8.0-n8n-graph-authoring-beta.4" in INDEX_HTML
+    assert "style.css?v=0.9.0-model-catalog-beta.1" in INDEX_HTML
+
+
+def test_compact_primary_navigation_scrolls_instead_of_clipping_features():
+    responsive = STYLE_CSS.split("/* --- Workbench Responsive --- */", 1)[1]
+    compact = responsive.split("@media (max-width: 640px) {", 1)[1]
+    rail = compact.split(".icon-rail {", 1)[1].split("}", 1)[0]
+    button = compact.split(".rail-btn {", 1)[1].split("}", 1)[0]
+    assert "justify-content: flex-start" in rail
+    assert "overflow-x: auto" in rail
+    assert "overscroll-behavior-x: contain" in rail
+    assert "scrollbar-width: none" in rail
+    assert "flex: 0 0 56px" in button
+    assert "scrollIntoView?.({ block: 'nearest', inline: 'nearest' })" in APP_JS

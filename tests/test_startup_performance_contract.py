@@ -52,6 +52,11 @@ def test_n8n_startup_requires_explicit_profile_auto_start(monkeypatch):
     monkeypatch.setattr(workbench_app, "hermes_health_supervisor", None)
     monkeypatch.setattr(workbench_app, "hermes_manager_cache", None)
     monkeypatch.setattr(workbench_app, "n8n_gmail_service", None)
+    monkeypatch.setattr(
+        workbench_app,
+        "extension_is_enabled",
+        lambda extension_id, project_id=None: extension_id == "builtin.n8n",
+    )
 
     async def exercise(auto_start):
         lifecycle = FakeLifecycle()
@@ -93,7 +98,9 @@ def test_launcher_exposes_core_before_waiting_for_hermes_readiness():
 
 def test_n8n_frontend_work_is_deferred_off_the_critical_chat_path():
     init_slice = N8N_UI[N8N_UI.index("function init(options"):N8N_UI.index("window.workbenchN8nWorkflows")]
-    assert "window.setTimeout(startBackgroundSync, 2500)" in init_slice
+    assert "window.setTimeout(() => void startBackgroundSyncWhenEnabled(), 2500)" in init_slice
+    assert "if (n8nExtensionReady()) startBackgroundSync()" in N8N_UI
+    assert "if (!n8nExtensionReady() && state.backgroundStarted) stopBackgroundSync()" in N8N_UI
     assert "void refreshRuns({ quiet: true })" not in init_slice
     governance_init = GOVERNANCE_UI[GOVERNANCE_UI.index("function init(options"):GOVERNANCE_UI.index("window.workbenchN8nGovernance")]
     assert "state.initialized = true; renderProjects();" in governance_init

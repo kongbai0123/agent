@@ -1,12 +1,16 @@
+import asyncio
 import os
 import sys
 import threading
 import unittest
 from unittest.mock import patch
 
+from pydantic import ValidationError
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "backend"))
 
 import app as workbench_app
+from api.schemas.models import ModelInstallRequest
 
 
 class FakePullResponse:
@@ -83,6 +87,51 @@ class ModelInstallWorkerTests(unittest.TestCase):
         self.assertEqual(job["downloaded_bytes"], 25)
         self.assertTrue(response.closed)
         self.assertFalse(workbench_app.models_router.has_model_install_control(job_id))
+
+    def test_terminal_install_event_stream_emits_progress_and_done_frames(self):
+        job = {
+            "job_id": "job_stream",
+            "model": "qwen3.5:4b",
+            "status": "ready",
+            "progress": 100,
+            "downloaded_bytes": 42,
+            "total_bytes": 42,
+            "message": "Model installed.",
+        }
+        endpoint = next(
+            route.endpoint
+            for route in workbench_app.models_router.routes
+            if route.path == "/api/models/install/{job_id}/events"
+        )
+        with patch.object(workbench_app.database, "get_model_install_job", return_value=job):
+            response = endpoint("job_stream")
+
+            async def collect_frames():
+                return [frame async for frame in response.body_iterator]
+
+            frames = asyncio.run(collect_frames())
+
+        text = "".join(
+            frame.decode("utf-8") if isinstance(frame, bytes) else frame
+            for frame in frames
+        )
+        self.assertIn("event: model_install_progress", text)
+        self.assertIn('"model": "qwen3.5:4b"', text)
+        self.assertIn("event: done", text)
+
+
+class ModelInstallRequestTests(unittest.TestCase):
+    def test_safe_ollama_reference_is_trimmed_and_accepted(self):
+        request = ModelInstallRequest(model="  hf.co/acme/model-name:Q4_K_M  ")
+        self.assertEqual(request.model, "hf.co/acme/model-name:Q4_K_M")
+
+    def test_unsafe_or_non_model_references_are_rejected(self):
+        for value in (
+            "", "https://ollama.com/library/qwen3", "../model:latest",
+            "owner//model:latest", "model name:latest", "model:$bad",
+        ):
+            with self.subTest(value=value), self.assertRaises(ValidationError):
+                ModelInstallRequest(model=value)
 
 
 if __name__ == "__main__":

@@ -115,11 +115,19 @@ def test_catalog_models_connectors_and_hard_unavailable_adapters(registry_env):
     assert by_id["connector.github"]["installed"] is False
     assert by_id["connector.github"]["trusted"] is True
     assert by_id["connector.notion"]["connector_id"] == "notion"
-    for extension_id in ("builtin.n8n", "builtin.ollama"):
-        assert any(
-            audit["action"] == "migration_existing_user_configuration"
-            for audit in registry.audits(extension_id)
-        )
+    n8n = by_id["builtin.n8n"]
+    assert n8n["installed"] is False
+    assert n8n["global_enabled"] is False
+    assert n8n["effective_enabled"] is False
+    assert n8n in catalog["sections"]["available"]
+    assert not any(
+        audit["action"] == "migration_existing_user_configuration"
+        for audit in registry.audits("builtin.n8n")
+    )
+    assert any(
+        audit["action"] == "migration_existing_user_configuration"
+        for audit in registry.audits("builtin.ollama")
+    )
 
     for extension_id, reason in (
         ("builtin.cursor", "cursor_adapter_not_implemented"),
@@ -414,6 +422,14 @@ def test_project_grant_handler_failure_restores_previous_disabled_override(
 
 def test_n8n_disable_handler_failure_never_reopens_global_gate(registry_env):
     registry, _settings, _local_dir = registry_env
+    n8n = registry.get("builtin.n8n")
+    registry.install("builtin.n8n", n8n["manifest_sha256"])
+    n8n = registry.get("builtin.n8n")
+    registry.set_global(
+        "builtin.n8n",
+        True,
+        expected_sha256=n8n["manifest_sha256"],
+    )
     assert registry.get("builtin.n8n")["global_enabled"] is True
     events: list[bool] = []
 

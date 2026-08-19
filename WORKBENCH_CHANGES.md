@@ -1,5 +1,27 @@
 # Local AI Workbench 改版紀錄
 
+## 2026-08-19 — `0.9.0-model-catalog-beta.1`
+
+### 模型管理
+
+- 將本機 Ollama 型錄由 4 個擴充為 62 個經官方 Library 核對的生成模型，涵蓋 Qwen 3.5／3.6、Gemma 4、Granite 4、Ministral 3、DeepSeek R1、gpt-oss、Phi-4、Llama、程式模型與多模態模型。
+- 型錄只收錄可本機下載的明確 tag，不納入 cloud-only、重複量化、社群 namespace、Embedding、Reranker、Guard 或分類器，避免專用模型被誤當一般聊天模型。
+- 「可安裝」新增名稱／開發者搜尋、用途篩選、友善名稱、發布者、授權、Context、硬體需求與收錄數量；找不到的官方生成模型可用安全的 Ollama tag 手動安裝。
+- 修正硬體資料格式接錯而把所有模型判為不適合、已安裝模型仍出現在可安裝清單、安裝完成後快取未更新，以及下載進度 SSE 使用未定義 formatter 的問題。
+- 自訂模型名稱加入長度、字元與路徑片段驗證；安裝仍只透過本機、受擴充權限保護的 Ollama API。
+
+### 擴充功能與 n8n HMI
+
+- 擴充中心改以「已安裝／未安裝」為主要分類，連線與私人本機工具降為次要入口，並避免相同擴充同時出現在兩邊。
+- n8n 操作改為「啟動服務 → 說出需求 → 確認執行」；單人本機首次使用會自動準備個人 Project／Session，權限與 Gmail 進階設定預設收合。
+- 保留既有人工核准、Credential 隔離、稽核、Extension gate、受管理 runtime ownership 與本機 Editor URL allowlist。
+
+### 驗證
+
+- Python、JavaScript、Public-tree、模型型錄／安裝串流、Extension／n8n 及完整 deterministic suite 的最終結果以本版發布報告為準。
+
+---
+
 ## 2026-08-14 — `0.8.0-n8n-graph-authoring-beta.1`
 
 ### 已完成

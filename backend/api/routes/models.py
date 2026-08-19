@@ -15,55 +15,9 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 from api.schemas.models import BenchmarkRequest, ModelInstallRequest, SelectModelRequest
+from chat.events import encode_sse
+from model_catalog import MODEL_CATALOG
 from system_resources import detect_gpus as _detect_gpus, detect_ram as _detect_ram
-
-
-MODEL_CATALOG: List[Dict[str, Any]] = [
-    {
-        "name": "qwen2.5-coder:7b",
-        "display_name": "Qwen2.5 Coder 7B",
-        "category": ["code", "chat", "rag"],
-        "size_gb_estimated": 4.7,
-        "min_ram_gb": 8,
-        "recommended_ram_gb": 16,
-        "min_vram_gb": 0,
-        "recommended_vram_gb": 6,
-        "context_window": 32768,
-    },
-    {
-        "name": "llama3.1:8b",
-        "display_name": "Llama 3.1 8B",
-        "category": ["chat", "rag"],
-        "size_gb_estimated": 4.9,
-        "min_ram_gb": 8,
-        "recommended_ram_gb": 16,
-        "min_vram_gb": 0,
-        "recommended_vram_gb": 6,
-        "context_window": 131072,
-    },
-    {
-        "name": "qwen2.5-coder:14b",
-        "display_name": "Qwen2.5 Coder 14B",
-        "category": ["code", "chat", "rag"],
-        "size_gb_estimated": 9.0,
-        "min_ram_gb": 16,
-        "recommended_ram_gb": 32,
-        "min_vram_gb": 0,
-        "recommended_vram_gb": 12,
-        "context_window": 32768,
-    },
-    {
-        "name": "llava:7b",
-        "display_name": "LLaVA 7B",
-        "category": ["vision", "chat"],
-        "size_gb_estimated": 4.7,
-        "min_ram_gb": 8,
-        "recommended_ram_gb": 16,
-        "min_vram_gb": 0,
-        "recommended_vram_gb": 6,
-        "context_window": 32768,
-    },
-]
 
 
 def _run_model_benchmark(
@@ -160,7 +114,7 @@ def build_models_router(
     create_id: Callable[[str], str],
     require_local_workbench: Callable[[Request], None],
     rag_stats: Callable[[], Dict[str, Any]],
-    ollama_models: Callable[[], List[Dict[str, Any]]],
+    ollama_models: Callable[[], List[str]],
     require_extension: Callable[[str, Optional[str]], Any],
     app_version: str,
     agent_protocol_version: int,
@@ -222,9 +176,12 @@ def build_models_router(
     def _catalog_entry_for_frontend(entry: Dict[str, Any], installed: set[str], hardware: Dict[str, Any]) -> Dict[str, Any]:
         fit = _model_fit(entry, hardware.get("ram_total_gb"), hardware.get("gpu") or [])
         purposes = entry.get("category") or []
+        install_names = [entry["name"], *(entry.get("aliases") or [])]
+        installed_as = next((name for name in install_names if name in installed), None)
         return {
             **entry,
-            "installed": entry["name"] in installed,
+            "installed": installed_as is not None,
+            "installed_as": installed_as,
             "purposes": purposes,
             "size_gb": entry.get("size_gb_estimated"),
             "rec_vram_gb": entry.get("recommended_vram_gb"),
@@ -237,10 +194,14 @@ def build_models_router(
     @router.get("/api/models/catalog")
     def get_models_catalog():
         installed = set(ollama_models())
-        hardware = get_hardware_legacy()
+        hardware = get_environment_hardware()
         catalog = [_catalog_entry_for_frontend(m, installed, hardware) for m in MODEL_CATALOG]
         recommended = [m for m in catalog if not m["installed"] and m["compatibility"]["fit"] in {"good", "ok"}]
-        recommended.sort(key=lambda m: {"good": 0, "ok": 1, "poor": 2}.get(m["compatibility"]["fit"], 3))
+        recommended.sort(key=lambda m: (
+            {"good": 0, "ok": 1, "poor": 2}.get(m["compatibility"]["fit"], 3),
+            int(m.get("recommendation_priority") or 1000),
+            float(m.get("size_gb_estimated") or 0),
+        ))
         return {
             "models": catalog,
             "catalog": catalog,
@@ -258,8 +219,15 @@ def build_models_router(
         for item in MODEL_CATALOG:
             fit = _model_fit(item, ram_total, gpu)
             if fit["fit"] in {"good", "ok"}:
-                ranked.append({"name": item["name"], **fit})
-        ranked.sort(key=lambda r: {"good": 0, "ok": 1, "poor": 2}.get(r["fit"], 3))
+                ranked.append({
+                    "name": item["name"],
+                    "recommendation_priority": item.get("recommendation_priority", 1000),
+                    **fit,
+                })
+        ranked.sort(key=lambda r: (
+            {"good": 0, "ok": 1, "poor": 2}.get(r["fit"], 3),
+            int(r.get("recommendation_priority") or 1000),
+        ))
         return {"hardware_summary": {"ram_total_gb": ram_total, "gpu_best": gpu[0]["name"] if gpu else None}, "recommended": ranked[:4]}
 
 
@@ -438,7 +406,7 @@ def build_models_router(
             for _ in range(3600):
                 job = database.get_model_install_job(job_id)
                 if not job:
-                    yield sse("error", error_payload("MODEL_INSTALL_JOB_NOT_FOUND", "Model install job not found.", recoverable=False))
+                    yield encode_sse("error", error_payload("MODEL_INSTALL_JOB_NOT_FOUND", "Model install job not found.", recoverable=False))
                     return
                 payload = {
                     "job_id": job_id,
@@ -453,13 +421,13 @@ def build_models_router(
                     "message": job.get("message"),
                 }
                 if payload != last_payload:
-                    yield sse("model_install_progress", payload)
+                    yield encode_sse("model_install_progress", payload)
                     last_payload = payload
                 if job["status"] in _MODEL_INSTALL_TERMINAL_STATES:
-                    yield sse("done", {"job_id": job_id, "status": job["status"]})
+                    yield encode_sse("done", {"job_id": job_id, "status": job["status"]})
                     return
                 await asyncio.sleep(1)
-            yield sse("error", error_payload("MODEL_INSTALL_TIMEOUT", "Model install did not finish within the streaming window."))
+            yield encode_sse("error", error_payload("MODEL_INSTALL_TIMEOUT", "Model install did not finish within the streaming window."))
 
         return StreamingResponse(event_stream(), media_type="text/event-stream")
 
@@ -482,7 +450,7 @@ def build_models_router(
             for _ in range(3600):
                 job = database.get_model_install_job(job_id)
                 if not job:
-                    yield sse("error", {"message": "找不到模型安裝工作。"})
+                    yield encode_sse("error", {"message": "找不到模型安裝工作。"})
                     return
                 payload = {
                     "job_id": job_id,
@@ -497,16 +465,16 @@ def build_models_router(
                     "message": job.get("message"),
                 }
                 if payload != last_payload:
-                    yield sse("pull_progress", payload)
+                    yield encode_sse("pull_progress", payload)
                     last_payload = payload
                 if job["status"] == "ready":
-                    yield sse("done", {"job_id": job_id, "status": "ready"})
+                    yield encode_sse("done", {"job_id": job_id, "status": "ready"})
                     return
                 if job["status"] in {"failed", "cancelled"}:
-                    yield sse("error", {"message": job.get("error") or job.get("message") or "模型安裝失敗。"})
+                    yield encode_sse("error", {"message": job.get("error") or job.get("message") or "模型安裝失敗。"})
                     return
                 await asyncio.sleep(1)
-            yield sse("error", {"message": "模型安裝逾時。"})
+            yield encode_sse("error", {"message": "模型安裝逾時。"})
 
         return StreamingResponse(event_stream(), media_type="text/event-stream")
 

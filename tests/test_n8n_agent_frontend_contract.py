@@ -17,7 +17,7 @@ def test_workflow_center_has_policy_workflows_operations_and_audits():
         'id="n8n-agent-audits-list"', 'id="n8n-agent-api-key-form"',
     ):
         assert marker in HTML
-    assert "n8n-agent-governance.js?v=0.8.0-n8n-graph-authoring-beta.3" in HTML
+    assert "n8n-agent-governance.js?v=0.9.1-personal-scope" in HTML
 
 
 def test_project_scoped_credential_alias_ui_never_renders_credential_id():
@@ -166,11 +166,55 @@ def test_workflow_center_has_project_scoped_agent_plan_mode():
     assert "/api/integrations/n8n/plans" in JS
     assert "project_id: id, session_id: sessionId() || null" in JS
     assert "state.deps.getSessions?.()" in JS
-    assert "session.project_id === project" in JS
+    assert "String(session.project_id) === String(id || '')" in JS
     assert "expected_digest: plan.digest, explicit_confirmation: true" in JS
-    assert "Agent n8n 操作助理" in HTML
-    assert "先選擇 2–3 個輕量架構之一" in HTML
+    assert "想讓 n8n 幫你做什麼？" in HTML
+    assert "直接描述想達成的結果" in HTML
     assert "核准後 Broker 才會依提案內容實際操作 n8n" in HTML
+
+
+def test_simple_mode_auto_selects_a_single_scope_and_only_expands_when_needed():
+    assert 'id="n8n-plan-scope"' in HTML
+    assert 'id="n8n-plan-scope-summary"' in HTML
+    assert HTML.index('id="n8n-agent-project"') < HTML.index('id="n8n-plan-session"')
+    assert "projects.length === 1 ? String(projects[0].id) : ''" in JS
+    assert "sessions.length === 1 ? String(sessions[0].id) : ''" in JS
+    assert "if ((!hasProject || !hasSession) && !canAutoProvisionScope()) state.dom.planScope.open = true" in JS
+    assert "全新環境會在首次送出時建立個人工作區" in HTML
+
+
+def test_empty_single_user_workspace_is_prepared_on_first_request_without_weakening_permissions():
+    assert "function ensurePersonalScope()" in JS
+    assert "if ((!projectId() || !sessionId()) && !await ensurePersonalScope()) return" in JS
+    assert "scopeCanBePrepared = canAutoProvisionScope()" in JS
+    assert "(!hasScope && !scopeCanBePrepared)" in JS
+    assert "api('/api/projects'" in JS
+    assert "name: '個人自動化'" in JS
+    assert "root_kind: 'managed'" in JS
+    assert "permission_mode: 'read_only'" in JS
+    assert "api('/api/sessions'" in JS
+    assert "title: 'n8n 自動化'" in JS
+    assert "refreshWorkspaceScope: () => loadSessions" in APP_JS
+    assert '<select id="n8n-agent-project" required' not in HTML
+    assert '<select id="n8n-plan-session" required' not in HTML
+
+
+def test_advanced_permission_and_gmail_controls_stay_available_but_collapsed():
+    assert '<details class="n8n-progressive-panel" id="n8n-advanced-settings">' in HTML
+    assert '<details class="n8n-progressive-panel" id="n8n-gmail-settings">' in HTML
+    assert 'id="n8n-advanced-settings" open' not in HTML
+    assert 'id="n8n-gmail-settings" open' not in HTML
+    for marker in (
+        'id="n8n-agent-policy-form"', 'id="n8n-agent-api-key-form"',
+        'id="n8n-credential-alias-form"', 'id="n8n-runtime-approvals-list"',
+        'id="n8n-managed-workflows-list"', 'id="n8n-operation-requests-list"',
+        'id="n8n-agent-audits-list"', 'id="mail-profile-form"',
+        'id="mail-compose-form"', 'id="mail-runs-list"',
+    ):
+        assert HTML.count(marker) == 1
+    assert "安全模式（敏感動作逐次確認）" in HTML
+    assert 'id="n8n-agent-duration-field" hidden' in HTML
+    assert "state.dom.duration.closest('label').hidden = !advanced" in JS
 
 
 def test_plan_mode_requires_explicit_confirmation_and_only_two_or_three_choices():

@@ -177,7 +177,7 @@ from workspace import (
 )
 
 
-APP_VERSION = "0.8.0-n8n-graph-authoring-beta.1"
+APP_VERSION = "0.9.0-model-catalog-beta.1"
 SETTINGS_PATH = str(
     Path(
         os.environ.get("WORKBENCH_SETTINGS_PATH")
@@ -1138,6 +1138,27 @@ def _on_managed_n8n_stop() -> None:
     _revoke_n8n_runtime_grants("n8n_stopped")
 
 
+def _reconcile_n8n_extension_runtime(lifecycle: Any) -> None:
+    """Stop an owned runtime when the current extension grant is closed.
+
+    Catalog synchronization can invalidate an older manifest approval before
+    the lifecycle object exists, so the normal extension state-change callback
+    cannot perform its cleanup during that transition.  Re-check the persisted
+    grant at application startup and rely on ``status``/``stop`` to retain the
+    lifecycle's strict process-ownership checks.
+    """
+
+    if extension_is_enabled("builtin.n8n"):
+        return
+    state = lifecycle.status(probe_node=False)
+    if str(state.get("state") or "") not in {"ready", "starting", "degraded"}:
+        return
+    try:
+        _on_managed_n8n_stop()
+    finally:
+        lifecycle.stop()
+
+
 def _extension_project_ids() -> tuple[str, ...]:
     """Return stable project identities used for project-scoped runtimes."""
 
@@ -1222,6 +1243,13 @@ async def _app_runtime_lifespan(_app: FastAPI):
             print(f"[HERMES] Health supervisor failed: {type(exc).__name__}")
     lifecycle = n8n_lifecycle
     mail_service = n8n_gmail_service
+    if lifecycle is not None:
+        try:
+            await asyncio.to_thread(_reconcile_n8n_extension_runtime, lifecycle)
+        except Exception as exc:
+            # Authorization remains disabled even if ownership-safe cleanup
+            # cannot complete; never broaden the stop target as a fallback.
+            print(f"[N8N] Disabled runtime reconciliation incomplete: {type(exc).__name__}")
     profile = database.get_n8n_gmail_profile()
     if (
         lifecycle is not None

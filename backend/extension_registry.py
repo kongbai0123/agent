@@ -164,7 +164,7 @@ class ExtensionRegistry:
                     source_ref=record.entrypoint.adapter,
                     implicit_trust=True,
                     migrate_existing_configuration=record.id
-                    in {"builtin.n8n", "builtin.ollama"},
+                    in {"builtin.ollama"},
                     configuration_enabled=True,
                 )
 

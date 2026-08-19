@@ -132,6 +132,8 @@ def builtin_manifests() -> tuple[ExtensionManifest, ...]:
                 ),
             ],
             "health_probe": "n8n",
+            "default_installed": False,
+            "default_enabled": False,
         },
         {
             **common,

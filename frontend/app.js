@@ -963,6 +963,7 @@ function renderAgentCollaboration() {
 }
 
 function openAgentCollaboration(force = false) {
+    if (primaryWorkspace !== 'chat') return false;
     if (!agentCollaborationPanel || (!force && agentPanelDismissedForRun)) return;
     setOutputFloatingPanelOpen(false);
     closeInspectorPanel();
@@ -970,6 +971,7 @@ function openAgentCollaboration(force = false) {
     agentCollaborationPanel.hidden = false;
     document.getElementById('rail-agents')?.classList.add('active');
     renderAgentCollaboration();
+    return true;
 }
 
 function closeAgentCollaboration(dismissForRun = true, { focusTarget = null } = {}) {
@@ -1289,6 +1291,7 @@ function initAgentCollaboration() {
     if (BASIC_CHAT_MODE) return hideBasicAgentCollaborationUi(railAgents);
     railAgents?.addEventListener('click', () => {
         if (agentCollaborationPanel.hidden) {
+            activateChatForAuxiliaryPanel();
             agentPanelDismissedForRun = false;
             openAgentCollaboration(true);
         } else {
@@ -4567,8 +4570,8 @@ function parseAndLoadArtifacts(text, forceRenderIframe = false) {
 }
 
 function showArtifactsPanel(forceRenderIframe = false) {
-    openInspector('artifact');
-    if (btnSandboxToggle) {
+    const opened = openInspector('artifact');
+    if (opened && btnSandboxToggle) {
         btnSandboxToggle.classList.add('active');
     }
     sandboxTitle.textContent = activeArtifactTitle;
@@ -5897,8 +5900,9 @@ function closeInspectorPanel({ focusTarget = null } = {}) {
 }
 
 function openInspector(tab) {
+    if (primaryWorkspace !== 'chat') return false;
     const pane = document.getElementById(`inspector-pane-${tab}`);
-    if (!pane) return;
+    if (!pane) return false;
     setOutputFloatingPanelOpen(false);
     closeAgentCollaboration(false);
     collapseCompactChatDrawer();
@@ -5920,6 +5924,7 @@ function openInspector(tab) {
     if (tab === 'safir') renderSafirPane();
     if (tab === 'models') renderModelsPane();
     if (tab === 'logs') renderLogsPane();
+    return true;
 }
 
 function renderContextPane() {
@@ -6038,6 +6043,26 @@ function riskLabel(risk) {
     return RISK_LABELS[key] ? `${RISK_LABELS[key]}（${key}）` : key;
 }
 
+const MODEL_PURPOSE_LABELS = {
+    chat: '一般對話', code: '程式開發', rag: '知識庫', vision: '圖片理解',
+    tools: '工具操作', reasoning: '推理', math: '數學', multilingual: '多語言',
+    edge: '輕量裝置', research: '開放研究', documents: '文件理解'
+};
+
+function formatCatalogSize(sizeGb) {
+    const value = Number(sizeGb || 0);
+    if (!value) return '大小未知';
+    return value < 1 ? `約 ${Math.round(value * 1000)}MB` : `約 ${value}GB`;
+}
+
+function formatCatalogContext(context) {
+    const value = Number(context || 0);
+    if (!value) return '未知';
+    if (value >= 1_048_576) return `${Math.round(value / 1_048_576 * 10) / 10}M`;
+    if (value >= 1_024) return `${Math.round(value / 1_024)}K`;
+    return String(value);
+}
+
 function normalizeCatalogEntry(item) {
     const compatibility = item.compatibility || {};
     const level = compatibility.level || compatibility.fit || 'unknown';
@@ -6045,19 +6070,31 @@ function normalizeCatalogEntry(item) {
     const sizeGb = item.size_gb ?? item.size_gb_estimated;
     const recRam = item.recommended_ram_gb;
     const recVram = item.rec_vram_gb ?? item.recommended_vram_gb;
+    const publisher = item.publisher || '';
+    const license = item.license || '';
+    const displayName = item.display_name || item.name;
+    const purposeLabels = purposes.map(purpose => MODEL_PURPOSE_LABELS[purpose] || purpose);
     return {
         name: item.name,
-        display_name: item.display_name || item.name,
+        display_name: displayName,
         installed: !!item.installed,
-        use: purposes.join(' / ') || '一般用途',
-        size: sizeGb ? `約 ${sizeGb}GB` : '大小未知',
+        installed_as: item.installed_as || '',
+        purposes,
+        use: purposeLabels.join(' / ') || '一般用途',
+        size: formatCatalogSize(sizeGb),
         need: [recRam ? `建議 ${recRam}GB RAM` : '', recVram ? `${recVram}GB VRAM` : '']
             .filter(Boolean).join(' / ') || '硬體需求未知',
         fit: level === 'good' ? 'good' : (level === 'ok' ? 'slow' : 'bad'),
         fitLabel: compatibility.label || (level === 'good' ? '相容性：良好' : level === 'ok' ? '可運行但偏慢' : '相容性未知'),
         fitReason: compatibility.reason || '',
         context: item.context ?? item.context_window,
-        description: item.description || ''
+        contextLabel: formatCatalogContext(item.context ?? item.context_window),
+        publisher,
+        license,
+        source_url: item.source_url || '',
+        description: item.description || '',
+        searchText: [item.name, displayName, publisher, license, purposeLabels.join(' '), item.description || '']
+            .join(' ').toLowerCase()
     };
 }
 
@@ -6093,21 +6130,71 @@ let pendingSwitchModel = null;
 const validatedExternalModels = new Set();
 const modelInstallJobs = new Map();
 const modelInstallStreams = new Map();
+const customCatalogModels = new Map();
 const MODEL_INSTALL_ACTIVE = new Set(['queued', 'starting', 'downloading', 'cancelling']);
+const OLLAMA_MODEL_REFERENCE = /^[A-Za-z0-9][A-Za-z0-9._/-]*(?::[A-Za-z0-9][A-Za-z0-9._-]*)?$/;
+
+function isSafeOllamaModelReference(value) {
+    const model = String(value || '').trim();
+    if (!model || model.length > 200 || !OLLAMA_MODEL_REFERENCE.test(model) || model.includes('//')) return false;
+    const repository = model.split(':', 1)[0];
+    return repository.split('/').every(segment => segment && segment !== '.' && segment !== '..');
+}
+
+function customCatalogEntry(name) {
+    return {
+        name,
+        display_name: name,
+        installed: false,
+        installed_as: '',
+        purposes: ['chat'],
+        use: '自訂 Ollama 模型',
+        size: '由 Ollama 回報',
+        need: '請先查看模型頁面的硬體需求',
+        fit: 'slow',
+        fitLabel: '尚未評估',
+        fitReason: '自訂標籤不在 Workbench 已驗證型錄中。',
+        context: null,
+        contextLabel: '未知',
+        publisher: 'Ollama Library',
+        license: '請查看模型頁面',
+        source_url: 'https://ollama.com/library',
+        description: '',
+        searchText: `${name} 自訂 ollama 模型`.toLowerCase(),
+        custom: true
+    };
+}
 
 function openModelManager(tab = 'installed') {
-    document.getElementById('model-manager-modal').classList.add('active');
+    setPrimaryWorkspace('models');
     switchMmTab(tab);
     renderMmInstalled();
     renderMmRecommended();
-    renderMmAvailable();
+    renderMmAvailable(
+        document.getElementById('mm-search')?.value || '',
+        document.getElementById('mm-category-filter')?.value || ''
+    );
     syncModelInstallJobs();
+    window.requestAnimationFrame(() => document.getElementById('model-manager-title')?.focus({ preventScroll: true }));
 }
+
+function closeModelManager({ restoreFocus = true } = {}) {
+    setPrimaryWorkspace('chat');
+    if (restoreFocus) document.getElementById('rail-chat')?.focus();
+}
+
 function switchMmTab(tab) {
-    document.querySelectorAll('.mm-tab[data-mmtab]').forEach(t => t.classList.toggle('active', t.dataset.mmtab === tab));
-    document.querySelectorAll('.mm-pane').forEach(p => p.classList.remove('active'));
-    const pane = document.getElementById(`mm-pane-${tab}`);
-    if (pane) pane.classList.add('active');
+    document.querySelectorAll('.mm-tab[data-mmtab]').forEach(button => {
+        const active = button.dataset.mmtab === tab;
+        button.classList.toggle('active', active);
+        button.setAttribute('aria-selected', active ? 'true' : 'false');
+        button.tabIndex = active ? 0 : -1;
+    });
+    document.querySelectorAll('.mm-pane').forEach(pane => {
+        const active = pane.id === `mm-pane-${tab}`;
+        pane.classList.toggle('active', active);
+        pane.hidden = !active;
+    });
 }
 function mmCard({ title, meta, badge, actions, progress }) {
     const card = document.createElement('div');
@@ -6161,13 +6248,17 @@ function modelInstallActions(model) {
             onClick: () => stopModelInstall(job.job_id)
         }];
     }
+    if (model.installed) return [{ label: '已安裝', disabled: true }];
     if (job?.status === 'ready') return [];
     return [{ label: job?.status === 'failed' || job?.status === 'cancelled' ? '重新安裝' : '開始安裝', primary: true, onClick: () => startModelInstall(model.name) }];
 }
 
 function refreshModelInstallCards() {
     renderMmRecommended();
-    renderMmAvailable(document.getElementById('mm-search')?.value || '');
+    renderMmAvailable(
+        document.getElementById('mm-search')?.value || '',
+        document.getElementById('mm-category-filter')?.value || ''
+    );
 }
 
 async function syncModelInstallJobs() {
@@ -6196,9 +6287,45 @@ async function startModelInstall(model) {
         refreshModelInstallCards();
         monitorModelInstall(data.job_id);
         showToast(`已開始安裝 ${model}`, 'info');
+        return true;
     } catch (error) {
         showToast(`無法開始安裝：${error.message}`, 'error');
+        return false;
     }
+}
+
+async function installCustomOllamaModel() {
+    const input = document.getElementById('mm-custom-model');
+    const model = String(input?.value || '').trim();
+    if (!isSafeOllamaModelReference(model)) {
+        showToast('請輸入有效的 Ollama 模型標籤，例如 qwen3.5:4b。', 'error');
+        input?.focus();
+        return;
+    }
+    try {
+        const catalog = await loadModelCatalog();
+        if (catalog.items.some(item => item.name === model || item.installed_as === model)) {
+            const known = catalog.items.find(item => item.name === model || item.installed_as === model);
+            if (known?.installed) {
+                showToast(`${model} 已經安裝`, 'info');
+                return;
+            }
+        } else {
+            customCatalogModels.set(model, customCatalogEntry(model));
+        }
+    } catch (error) {
+        // The install endpoint will provide the authoritative connectivity
+        // error; keep the requested tag visible so its progress can render.
+        customCatalogModels.set(model, customCatalogEntry(model));
+    }
+    const search = document.getElementById('mm-search');
+    const category = document.getElementById('mm-category-filter');
+    if (search) search.value = model;
+    if (category) category.value = '';
+    renderMmAvailable(model, '');
+    const started = await startModelInstall(model);
+    if (!started) customCatalogModels.delete(model);
+    if (started && input) input.value = '';
 }
 
 async function stopModelInstall(jobId) {
@@ -6231,12 +6358,20 @@ function monitorModelInstall(jobId) {
     });
     stream.addEventListener('done', async event => {
         const result = JSON.parse(event.data);
+        const finishedJob = [...modelInstallJobs.values()].find(item => item.job_id === jobId);
         stream.close();
         modelInstallStreams.delete(jobId);
         await syncModelInstallJobs();
         if (result.status === 'ready') {
+            if (finishedJob?.model) customCatalogModels.delete(finishedJob.model);
             await loadModels();
+            await loadModelCatalog(true);
             renderMmInstalled();
+            renderMmRecommended();
+            renderMmAvailable(
+                document.getElementById('mm-search')?.value || '',
+                document.getElementById('mm-category-filter')?.value || ''
+            );
             showToast('模型安裝完成', 'success');
         }
     });
@@ -6311,7 +6446,7 @@ function mmCatalogCard(m, meta) {
     const job = modelInstallJobs.get(m.name);
     const badge = `<span class="mm-badge ${m.fit}" title="${escapeHtml(m.fitReason)}">${escapeHtml(m.fitLabel)}</span>`;
     return mmCard({
-        title: m.name,
+        title: m.display_name || m.name,
         badge,
         meta,
         actions: modelInstallActions(m),
@@ -6328,7 +6463,9 @@ async function renderMmRecommended() {
         hw.innerHTML = `<strong>你的硬體（後端偵測）</strong><br>${escapeHtml(hardwareSummaryText(catalog.hardware))}`;
         list.innerHTML = '';
         catalog.recommended.slice(0, 4).forEach(m => {
-            list.appendChild(mmCatalogCard(m, `用途：${m.use} · ${m.size} · ${m.need}`));
+            list.appendChild(mmCatalogCard(m,
+                `模型標籤：${escapeHtml(m.name)} · 用途：${escapeHtml(m.use)} · ${escapeHtml(m.size)} · ${escapeHtml(m.need)}`
+            ));
         });
         if (!list.children.length) list.innerHTML = '<div class="mm-note">目前沒有適合這台機器且尚未安裝的模型。</div>';
     } catch (e) {
@@ -6336,22 +6473,37 @@ async function renderMmRecommended() {
         list.innerHTML = '<div class="mm-note">無法載入模型型錄：後端未連線。</div>';
     }
 }
-async function renderMmAvailable(filter = '') {
+async function renderMmAvailable(filter = '', category = '') {
     const list = document.getElementById('mm-available-list');
+    const summary = document.getElementById('mm-catalog-summary');
     if (!list) return;
     list.innerHTML = '<div class="mm-note">載入模型型錄中...</div>';
     const q = filter.trim().toLowerCase();
+    const selectedCategory = String(category || '').trim().toLowerCase();
     try {
         const catalog = await loadModelCatalog();
+        const customItems = [...customCatalogModels.values()]
+            .filter(item => !catalog.items.some(known => known.name === item.name));
+        const available = [...catalog.items, ...customItems].filter(m => !m.installed);
+        const matches = available.filter(m => {
+            const matchesText = !q || m.searchText.includes(q);
+            const matchesCategory = !selectedCategory || m.purposes.includes(selectedCategory);
+            return matchesText && matchesCategory;
+        });
         list.innerHTML = '';
-        catalog.items
-            .filter(m => !q || m.name.toLowerCase().includes(q) || m.use.toLowerCase().includes(q))
-            .forEach(m => {
-                list.appendChild(mmCatalogCard(m, `下載大小：${m.size} · 需求：${m.need} · 用途：${m.use}`));
-            });
+        matches.forEach(m => {
+            const provenance = [m.publisher, m.license].filter(Boolean).map(escapeHtml).join(' · ');
+            list.appendChild(mmCatalogCard(m,
+                `模型標籤：${escapeHtml(m.name)} · 下載：${escapeHtml(m.size)} · Context：${escapeHtml(m.contextLabel)} · 需求：${escapeHtml(m.need)} · 用途：${escapeHtml(m.use)}${provenance ? ` · ${provenance}` : ''}`
+            ));
+        });
+        if (summary) {
+            summary.textContent = `已驗證 ${catalog.items.length} 個 Ollama 官方生成模型；目前有 ${available.length} 個尚未安裝，顯示 ${matches.length} 個。`;
+        }
         if (!list.children.length) list.innerHTML = '<div class="mm-note">找不到符合的模型。</div>';
     } catch (e) {
         list.innerHTML = '<div class="mm-note">無法載入模型型錄：後端未連線。</div>';
+        if (summary) summary.textContent = '暫時無法取得模型型錄。';
     }
 }
 async function runBenchmark(modelName) {
@@ -6614,7 +6766,7 @@ const PALETTE_ACTIONS = [
     { label: '管理雲端 LLM API', icon: 'cloud-cog', run: () => window.workbenchCloudLlm?.open() },
     { label: '開啟 Knowledge Center', icon: 'book-open', run: () => openKnowledgeCenter('documents') },
     { label: '執行檢索測試', icon: 'search', run: () => openKnowledgeCenter('retrieval') },
-    { label: '開啟 Artifact 工作區', icon: 'code-xml', run: () => { artifactsSandboxPanel.classList.add('active'); openInspector('artifact'); } },
+    { label: '開啟 Artifact 工作區', icon: 'code-xml', run: () => { activateChatForAuxiliaryPanel(); openInspector('artifact'); } },
     { label: '開新任務（新對話）', icon: 'plus', run: () => createNewSession() },
     { label: '清空知識庫', icon: 'trash-2', run: () => confirmModal.classList.add('active') },
     { label: '切換淺色 / 深色主題', icon: 'moon', run: () => document.getElementById('btn-theme-toggle').click() },
@@ -6674,13 +6826,16 @@ function initA11y() {
                 else if (top.id === 'extension-permission-modal') {
                     window.workbenchExtensions?.closePermissionReview?.();
                 }
-                else if (top.id === 'cloud-llm-modal') {
-                    window.workbenchCloudLlm?.close?.();
-                }
                 else top.classList.remove('active');
             } else if (primaryWorkspace === 'extensions') {
                 e.preventDefault();
                 window.workbenchExtensions?.close?.();
+            } else if (primaryWorkspace === 'models') {
+                e.preventDefault();
+                closeModelManager();
+            } else if (primaryWorkspace === 'cloud') {
+                e.preventDefault();
+                window.workbenchCloudLlm?.close?.();
             } else if (window.workbenchRunInspector?.isOpen?.()) {
                 e.preventDefault();
                 setOutputFloatingPanelOpen(false, { restoreFocus: true });
@@ -6739,47 +6894,78 @@ function initA11y() {
 let primaryWorkspace = 'chat';
 let runInspectorSuspendedWorkspace = null;
 
+function activateChatForAuxiliaryPanel() {
+    if (primaryWorkspace !== 'chat') setPrimaryWorkspace('chat');
+}
+
 function setPrimaryWorkspace(workspace = 'chat') {
-    const workflowMode = workspace === 'workflows';
-    const extensionMode = workspace === 'extensions';
+    const supportedWorkspaces = new Set(['chat', 'workflows', 'extensions', 'models', 'cloud']);
+    const nextWorkspace = supportedWorkspaces.has(workspace) ? workspace : 'chat';
+    const workflowMode = nextWorkspace === 'workflows';
+    const extensionMode = nextWorkspace === 'extensions';
+    const modelMode = nextWorkspace === 'models';
+    const cloudMode = nextWorkspace === 'cloud';
+    const managementMode = extensionMode || modelMode || cloudMode;
     const chatWorkspace = document.querySelector('main.chat-container');
     const workflowCenter = document.getElementById('n8n-workflow-center');
     const extensionCenter = document.getElementById('extension-center-workspace');
+    const modelCenter = document.getElementById('model-manager-workspace');
+    const cloudCenter = document.getElementById('cloud-llm-workspace');
     const drawer = document.getElementById('chat-drawer');
     const railChat = document.getElementById('rail-chat');
     const railWorkflows = document.getElementById('rail-workflows');
     const railExtensions = document.getElementById('rail-extensions');
-    if (!chatWorkspace || !workflowCenter || !extensionCenter || !drawer
-        || !railChat || !railWorkflows || !railExtensions) return;
+    const railModels = document.getElementById('rail-models');
+    const railCloud = document.getElementById('rail-cloud-llm');
+    if (!chatWorkspace || !workflowCenter || !extensionCenter || !modelCenter || !cloudCenter || !drawer
+        || !railChat || !railWorkflows || !railExtensions || !railModels || !railCloud) return;
 
     const previousWorkspace = primaryWorkspace;
-    primaryWorkspace = workflowMode ? 'workflows' : (extensionMode ? 'extensions' : 'chat');
-    if (extensionMode && previousWorkspace !== 'extensions') {
+    const previousManagementMode = ['extensions', 'models', 'cloud'].includes(previousWorkspace);
+    if (previousWorkspace === 'cloud' && nextWorkspace !== 'cloud' && !cloudCenter.hidden) {
+        void window.workbenchCloudLlm?.deactivate?.();
+    }
+    primaryWorkspace = nextWorkspace;
+    if (managementMode && !previousManagementMode) {
         runInspectorSuspendedWorkspace = previousWorkspace;
     }
-    window.workbenchRunInspector?.setAvailable?.(!extensionMode, {
-        focusTarget: extensionMode ? railExtensions : null,
+    const activeManagementRail = extensionMode ? railExtensions : (modelMode ? railModels : railCloud);
+    window.workbenchRunInspector?.setAvailable?.(!managementMode, {
+        focusTarget: managementMode ? activeManagementRail : null,
     });
-    const returningToSuspendedWorkspace = previousWorkspace === 'extensions'
+    const returningToSuspendedWorkspace = previousManagementMode
         && runInspectorSuspendedWorkspace === primaryWorkspace;
     if (workflowMode && !returningToSuspendedWorkspace) setOutputFloatingPanelOpen(false);
-    if (!extensionMode) runInspectorSuspendedWorkspace = null;
-    chatWorkspace.hidden = workflowMode || extensionMode;
+    if (!managementMode) runInspectorSuspendedWorkspace = null;
+    if (managementMode) setTaskProgressCollapsed(true);
+
+    chatWorkspace.hidden = nextWorkspace !== 'chat';
     workflowCenter.hidden = !workflowMode;
     extensionCenter.hidden = !extensionMode;
-    drawer.hidden = workflowMode || extensionMode;
+    modelCenter.hidden = !modelMode;
+    cloudCenter.hidden = !cloudMode;
+    drawer.hidden = nextWorkspace !== 'chat';
     syncChatDrawerA11y(drawer);
-    railChat.classList.toggle('active', !workflowMode && !extensionMode);
-    railWorkflows.classList.toggle('active', workflowMode);
-    railExtensions.classList.toggle('active', extensionMode);
-    railChat.setAttribute('aria-current', (!workflowMode && !extensionMode) ? 'page' : 'false');
-    railWorkflows.setAttribute('aria-current', workflowMode ? 'page' : 'false');
-    railExtensions.setAttribute('aria-current', extensionMode ? 'page' : 'false');
+    const workspaceRails = new Map([
+        ['chat', railChat],
+        ['workflows', railWorkflows],
+        ['extensions', railExtensions],
+        ['models', railModels],
+        ['cloud', railCloud],
+    ]);
+    workspaceRails.forEach((rail, name) => {
+        const active = name === nextWorkspace;
+        rail.classList.toggle('active', active);
+        rail.setAttribute('aria-current', active ? 'page' : 'false');
+    });
+    if (window.matchMedia('(max-width: 640px)').matches) {
+        workspaceRails.get(nextWorkspace)?.scrollIntoView?.({ block: 'nearest', inline: 'nearest' });
+    }
 
-    if (workflowMode || extensionMode) {
+    if (nextWorkspace !== 'chat') {
         closeInspectorPanel();
         closeAgentCollaboration(true);
-        if (extensionMode) {
+        if (managementMode) {
             window.workbenchN8nWorkflows?.close?.();
             window.workbenchN8nGovernance?.releaseInspectorContext?.();
             window.workbenchN8nWorkflows?.useChatInspectorContext?.({ open: false });
@@ -6802,6 +6988,11 @@ function setPrimaryWorkspace(workspace = 'chat') {
 
 // ---- Workbench 初始化 ----
 function initWorkbench(status) {
+    const workbenchBody = document.querySelector('.workbench-body');
+    const modelWorkspace = document.getElementById('model-manager-workspace');
+    if (workbenchBody && modelWorkspace && modelWorkspace.parentElement !== workbenchBody) {
+        workbenchBody.appendChild(modelWorkspace);
+    }
     window.workbenchExtensions?.init({
         apiFetch,
         apiBase: API_BASE,
@@ -6833,7 +7024,12 @@ function initWorkbench(status) {
         reloadProviders: () => loadModelProviderSettings(currentSettings.model_providers || []),
         getSecretStatus: () => modelProviderSecretStatus,
         inferModelKind: inferredProviderModelKind,
-        createIcons: safeCreateIcons
+        createIcons: safeCreateIcons,
+        onWorkspaceOpen: () => setPrimaryWorkspace('cloud'),
+        onWorkspaceClose: () => {
+            setPrimaryWorkspace('chat');
+            document.getElementById('rail-chat')?.focus();
+        }
     });
     window.workbenchN8nWorkflows?.init({
         apiFetch,
@@ -6856,6 +7052,7 @@ function initWorkbench(status) {
         getSessions: () => sidebarSessions,
         getActiveProjectId: () => activeProjectId,
         getCurrentSessionId: () => currentSessionId,
+        refreshWorkspaceScope: () => loadSessions(searchSessionsInput.value.trim()),
     });
     // Rail 導覽
     const drawer = document.getElementById('chat-drawer');
@@ -6882,17 +7079,21 @@ function initWorkbench(status) {
         document.getElementById('rail-chat').classList.add('active');
     });
     document.getElementById('rail-knowledge').addEventListener('click', () => openKnowledgeCenter('documents'));
-    document.getElementById('rail-runs').addEventListener('click', () => openInspector('run'));
+    document.getElementById('rail-runs').addEventListener('click', () => {
+        activateChatForAuxiliaryPanel();
+        openInspector('run');
+    });
     document.getElementById('rail-artifacts').addEventListener('click', () => {
         if (artifactsSandboxPanel.classList.contains('active') && document.getElementById('inspector-pane-artifact').classList.contains('active')) {
             closeInspectorPanel();
         } else {
+            activateChatForAuxiliaryPanel();
             openInspector('artifact');
         }
     });
     document.getElementById('rail-models').addEventListener('click', () => openModelManager('installed'));
     document.getElementById('rail-cloud-llm').addEventListener('click', () => window.workbenchCloudLlm?.open());
-    document.getElementById('rail-extensions').addEventListener('click', () => window.workbenchExtensions?.open('available'));
+    document.getElementById('rail-extensions').addEventListener('click', () => window.workbenchExtensions?.open('installed'));
     document.getElementById('rail-settings').addEventListener('click', () => document.getElementById('btn-settings-trigger').click());
     setPrimaryWorkspace('chat');
 
@@ -6900,8 +7101,8 @@ function initWorkbench(status) {
     document.getElementById('chip-model').addEventListener('click', () => openModelManager('installed'));
     document.getElementById('chip-rag').addEventListener('click', () => openKnowledgeCenter('documents'));
     document.getElementById('chip-docs').addEventListener('click', () => openKnowledgeCenter('documents'));
-    document.getElementById('chip-speed').addEventListener('click', () => { openInspector('models'); });
-    document.getElementById('chip-ctx').addEventListener('click', () => { openInspector('context'); });
+    document.getElementById('chip-speed').addEventListener('click', () => { activateChatForAuxiliaryPanel(); openInspector('models'); });
+    document.getElementById('chip-ctx').addEventListener('click', () => { activateChatForAuxiliaryPanel(); openInspector('context'); });
     const setupWizardTrigger = document.getElementById('btn-setup-wizard-trigger');
     if (setupWizardTrigger) setupWizardTrigger.addEventListener('click', openWizard);
 
@@ -6914,11 +7115,46 @@ function initWorkbench(status) {
     updateRagChip();
 
     // Model Manager 事件
-    document.getElementById('mm-close').addEventListener('click', () => document.getElementById('model-manager-modal').classList.remove('active'));
-    document.getElementById('mm-close-btn').addEventListener('click', () => document.getElementById('model-manager-modal').classList.remove('active'));
-    document.getElementById('mm-refresh').addEventListener('click', async () => { await loadModels(); renderMmInstalled(); showToast('已重新整理模型清單', 'success'); });
-    document.querySelectorAll('.mm-tab[data-mmtab]').forEach(t => t.addEventListener('click', () => switchMmTab(t.dataset.mmtab)));
-    document.getElementById('mm-search').addEventListener('input', (e) => renderMmAvailable(e.target.value));
+    document.getElementById('mm-close').addEventListener('click', () => closeModelManager());
+    document.getElementById('mm-close-btn').addEventListener('click', () => closeModelManager());
+    document.getElementById('mm-refresh').addEventListener('click', async () => {
+        await Promise.all([loadModels(), loadModelCatalog(true), syncModelInstallJobs()]);
+        renderMmInstalled();
+        renderMmRecommended();
+        renderMmAvailable(
+            document.getElementById('mm-search')?.value || '',
+            document.getElementById('mm-category-filter')?.value || ''
+        );
+        showToast('已重新整理模型清單', 'success');
+    });
+    const modelTabs = [...document.querySelectorAll('.mm-tab[data-mmtab]')];
+    modelTabs.forEach(tab => {
+        tab.addEventListener('click', () => switchMmTab(tab.dataset.mmtab));
+        tab.addEventListener('keydown', event => {
+            if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+            event.preventDefault();
+            const current = modelTabs.indexOf(tab);
+            const next = event.key === 'Home' ? 0
+                : event.key === 'End' ? modelTabs.length - 1
+                    : (current + (event.key === 'ArrowRight' ? 1 : modelTabs.length - 1)) % modelTabs.length;
+            switchMmTab(modelTabs[next].dataset.mmtab);
+            modelTabs[next].focus();
+        });
+    });
+    document.getElementById('mm-search').addEventListener('input', (event) => renderMmAvailable(
+        event.target.value,
+        document.getElementById('mm-category-filter')?.value || ''
+    ));
+    document.getElementById('mm-category-filter').addEventListener('change', (event) => renderMmAvailable(
+        document.getElementById('mm-search')?.value || '',
+        event.target.value
+    ));
+    document.getElementById('mm-custom-install-btn').addEventListener('click', installCustomOllamaModel);
+    document.getElementById('mm-custom-model').addEventListener('keydown', event => {
+        if (event.key !== 'Enter') return;
+        event.preventDefault();
+        void installCustomOllamaModel();
+    });
     document.getElementById('mm-run-benchmark').addEventListener('click', () => runBenchmark());
     // 模型切換確認
     document.getElementById('ms-apply-session').addEventListener('click', () => applyModelSwitch(false));

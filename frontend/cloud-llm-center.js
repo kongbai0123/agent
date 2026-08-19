@@ -5,7 +5,8 @@
     const state = {
         deps: null,
         initialized: false,
-        editingId: null
+        editingId: null,
+        lifecycleRevision: 0
     };
 
     const byId = id => document.getElementById(id);
@@ -151,7 +152,7 @@
         const editor = byId('cloud-llm-editor-view');
         if (library) library.hidden = view !== 'library';
         if (editor) editor.hidden = view !== 'editor';
-        byId('cloud-llm-modal')?.classList.toggle('is-editing', view === 'editor');
+        byId('cloud-llm-workspace')?.classList.toggle('is-editing', view === 'editor');
     }
 
     function showLibrary() {
@@ -262,15 +263,37 @@
     }
 
     function open() {
-        byId('cloud-llm-modal')?.classList.add('active');
+        state.lifecycleRevision += 1;
+        state.deps?.onWorkspaceOpen?.();
+        const workspace = byId('cloud-llm-workspace');
+        if (workspace) workspace.hidden = false;
         showLibrary();
         setTimeout(() => byId('cloud-llm-search')?.focus(), 20);
     }
 
-    async function close() {
-        if (state.editingId) await state.deps?.reloadProviders?.();
-        byId('cloud-llm-modal')?.classList.remove('active');
+    async function deactivate() {
+        const revision = ++state.lifecycleRevision;
+        const discardEditor = Boolean(state.editingId);
+        try {
+            if (discardEditor) await state.deps?.reloadProviders?.();
+        } catch (error) {
+            state.deps?.showToast?.(`無法重新載入 API 設定：${error.message}`, 'error');
+        }
+        // A rapid re-open supersedes this close. The settings reload still
+        // discarded the stale form, so refresh the visible library without
+        // hiding the newly opened workspace.
+        if (revision !== state.lifecycleRevision) {
+            renderLibrary();
+            return false;
+        }
+        const workspace = byId('cloud-llm-workspace');
+        if (workspace) workspace.hidden = true;
         showLibrary();
+        return true;
+    }
+
+    async function close() {
+        if (await deactivate()) state.deps?.onWorkspaceClose?.();
     }
 
     function bindEvents() {
@@ -283,9 +306,6 @@
         byId('btn-open-cloud-llm-settings')?.addEventListener('click', () => {
             byId('settings-modal')?.classList.remove('active');
             open();
-        });
-        byId('cloud-llm-modal')?.addEventListener('click', event => {
-            if (event.target === byId('cloud-llm-modal')) close();
         });
         ['cloud-llm-search', 'cloud-llm-provider-filter', 'cloud-llm-kind-filter', 'cloud-llm-status-filter']
             .forEach(id => byId(id)?.addEventListener(id === 'cloud-llm-search' ? 'input' : 'change', renderLibrary));
@@ -301,9 +321,14 @@
         if (state.initialized) return;
         state.deps = deps;
         state.initialized = true;
+        const workspace = byId('cloud-llm-workspace');
+        const workbenchBody = document.querySelector('.workbench-body');
+        if (workspace && workbenchBody && workspace.parentElement !== workbenchBody) {
+            workbenchBody.appendChild(workspace);
+        }
         bindEvents();
         renderLibrary();
     }
 
-    window.workbenchCloudLlm = { init, open, close, render: renderLibrary };
+    window.workbenchCloudLlm = { init, open, close, deactivate, render: renderLibrary };
 })();

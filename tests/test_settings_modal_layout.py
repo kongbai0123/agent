@@ -42,13 +42,15 @@ class SettingsModalLayoutTests(unittest.TestCase):
         self.assertIn("@media (max-height: 680px) and (min-width: 641px)", CSS)
         self.assertIn(".settings-modal-box > .modal-footer", CSS)
 
-    def test_model_manager_stays_in_viewport_and_scrolls_its_content(self):
-        modal = CSS.split(".mm-modal {", 1)[1].split("}", 1)[0]
+    def test_model_manager_is_a_bounded_workspace_and_scrolls_its_content(self):
+        shell = CSS.split(".management-workspace-shell {", 1)[1].split("}", 1)[0]
         body = CSS.split(".mm-body {", 1)[1].split("}", 1)[0]
         pane = CSS.split(".mm-pane.active {", 1)[1].split("}", 1)[0]
-        self.assertIn("height: min(720px, calc(100vh - 32px))", modal)
-        self.assertIn("max-height: calc(100vh - 32px)", modal)
-        self.assertIn("overflow: hidden", modal)
+        self.assertIn('id="model-manager-workspace"', HTML)
+        self.assertNotIn('id="model-manager-modal"', HTML)
+        self.assertIn("height: 100%", shell)
+        self.assertIn("min-height: 0", shell)
+        self.assertIn("overflow: hidden", shell)
         self.assertIn("min-height: 0", body)
         self.assertIn("overflow: hidden", body)
         self.assertIn("overflow-y: auto", pane)

@@ -79,6 +79,18 @@ def test_launcher_opens_the_backend_origin_for_the_main_ui():
     assert '$encodedTarget = [Uri]::EscapeDataString($websiteUrl)' in launcher
 
 
+def test_frontend_cache_keys_match_the_application_version():
+    app = _text(ROOT / "backend" / "app.py")
+    html = _text(FRONTEND / "index.html")
+    launcher = _text(ROOT / "scripts" / "start_workbench.ps1")
+    version = re.search(r'^APP_VERSION = "([^"]+)"$', app, re.MULTILINE)
+    assert version
+    expected = version.group(1)
+    assert f'style.css?v={expected}' in html
+    assert f'app.js?v={expected}' in html
+    assert f'$frontendVersion = "{expected}"' in launcher
+
+
 def test_artifact_iframe_stays_origin_isolated():
     html = _text(FRONTEND / "index.html")
     match = re.search(r'<iframe[^>]+id="sandbox-iframe"[^>]*>', html)

@@ -10,6 +10,7 @@ APP_JS = (FRONTEND / "app.js").read_text(encoding="utf-8")
 BASIC_MODE_JS = (FRONTEND / "basic-chat-mode.js").read_text(encoding="utf-8")
 INDEX_HTML = (FRONTEND / "index.html").read_text(encoding="utf-8")
 WORKFLOW_JS = (FRONTEND / "n8n-workflows.js").read_text(encoding="utf-8")
+EXTENSION_JS = (FRONTEND / "extension-center.js").read_text(encoding="utf-8")
 STYLE_CSS = (FRONTEND / "style.css").read_text(encoding="utf-8")
 
 
@@ -26,11 +27,72 @@ def test_basic_chat_exposes_a_dedicated_workflow_workspace():
     assert 'id="mail-profile-model"' in INDEX_HTML
     assert 'id="mail-compose-model"' in INDEX_HTML
     assert 'id="mail-runs-list"' in INDEX_HTML
+    assert 'id="workflow-extension-manage"' in INDEX_HTML
+    assert 'id="workflow-extension-gate"' in INDEX_HTML
+    assert 'id="workflow-enabled-content"' in INDEX_HTML
+    for control_id in (
+        "workflow-command-title",
+        "workflow-command-detail",
+        "workflow-service-start",
+        "workflow-service-stop",
+        "workflow-service-open",
+        "workflow-service-settings",
+    ):
+        assert f'id="{control_id}"' in INDEX_HTML
+    assert 'workflow-service-card' not in INDEX_HTML
+    assert 'id="workflow-service-metrics"' not in INDEX_HTML
     assert "rail-workflows" not in BASIC_MODE_JS
     assert "window.workbenchN8nWorkflows?.init" in APP_JS
     assert "window.workbenchN8nWorkflows?.open?.()" in APP_JS
     assert "onWorkspaceOpen: () => setPrimaryWorkspace('workflows')" in APP_JS
     assert ".workflow-center[hidden]" in STYLE_CSS
+
+
+def test_workflow_header_keeps_its_natural_height_and_does_not_clip_copy():
+    header = _slice(STYLE_CSS, ".workflow-center-header {", ".workflow-header-main")
+    assert "min-height: 0" in header
+    assert "flex: 0 0 auto" in header
+    assert "align-items: flex-start" in header
+    body = _slice(STYLE_CSS, ".workflow-center-body {", ".workflow-enabled-content")
+    assert "min-height: 0" in body
+    assert "flex: 1 1 auto" in body
+
+
+def test_workflow_hmi_directly_controls_the_real_managed_n8n_service():
+    command_bar = _slice(WORKFLOW_JS, "function renderServiceCommandBar", "function renderService() {")
+    assert "n8n 已就緒，等待啟動" in command_bar
+    assert "按下「啟動 n8n」即可直接啟動本機服務" in command_bar
+    assert "state.dom.serviceStart.disabled" in command_bar
+    assert "service.isolation_ready === true" in command_bar
+    assert "safeEditorUrl(service.editor_url)" in command_bar
+
+    service_action = _slice(WORKFLOW_JS, "async function serviceAction", "function openEditor")
+    assert "request(`/api/integrations/n8n/${action}`, { method: 'POST' })" in service_action
+    assert "action === 'start'" in service_action
+    assert "starting: true" in service_action
+
+    wiring = _slice(WORKFLOW_JS, "function init(options", "window.workbenchN8nWorkflows")
+    assert "serviceAction('start', state.dom.serviceStart)" in wiring
+    assert "serviceAction('stop', state.dom.serviceStop)" in wiring
+    assert "state.dom.serviceOpen.addEventListener('click', openEditor)" in wiring
+
+
+def test_workflow_defaults_to_a_conversational_hmi_and_defers_advanced_settings():
+    for copy in (
+        "想讓 n8n 幫你做什麼？",
+        "直接描述想達成的結果",
+        "說出需求",
+        "確認執行",
+        "送出需求",
+    ):
+        assert copy in INDEX_HTML
+    assert 'id="n8n-plan-scope"' in INDEX_HTML
+    assert 'id="n8n-plan-scope-summary"' in INDEX_HTML
+    assert '<details class="n8n-progressive-panel" id="n8n-advanced-settings">' in INDEX_HTML
+    assert '<details class="n8n-progressive-panel" id="n8n-gmail-settings">' in INDEX_HTML
+    assert 'id="n8n-advanced-settings" open' not in INDEX_HTML
+    assert 'id="n8n-gmail-settings" open' not in INDEX_HTML
+    assert "n8n-plan-layout:has(.n8n-plan-impact:not([hidden]))" in STYLE_CSS
 
 
 def test_single_profile_has_fixed_label_recipient_and_project_sources():
@@ -117,7 +179,10 @@ def test_n8n_editor_is_external_and_exactly_allowlisted():
     assert "url.hostname !== '127.0.0.1'" in safe_url
     assert "url.port !== '5678'" in safe_url
     assert "url.username || url.password || url.search || url.hash || url.pathname !== '/'" in safe_url
-    assert "window.open(url, '_blank', 'noopener,noreferrer')" in WORKFLOW_JS
+    open_editor = _slice(WORKFLOW_JS, "function openEditor", "function scheduleRunsRefresh")
+    assert "if (!n8nExtensionReady())" in open_editor
+    assert "state.service?.running === true || state.service?.reachable === true" in open_editor
+    assert "window.open(url, '_blank', 'noopener,noreferrer')" in open_editor
     assert "iframe" not in WORKFLOW_JS.lower()
 
 
@@ -132,8 +197,11 @@ def test_frontend_uses_only_the_narrow_mail_and_service_apis():
         "/api/integrations/n8n/events",
     ):
         assert route in WORKFLOW_JS
-    assert "serviceAction('start'" in WORKFLOW_JS
-    assert "serviceAction('stop'" in WORKFLOW_JS
+    assert "/api/extensions" in WORKFLOW_JS
+    assert "manageService: serviceAction" in WORKFLOW_JS
+    assert "openEditor," in WORKFLOW_JS
+    assert "runN8nServiceAction('start'" in EXTENSION_JS
+    assert "runN8nServiceAction('stop'" in EXTENSION_JS
     assert "new EventSource(apiPath('/api/integrations/n8n/events'))" in WORKFLOW_JS
     assert "source.addEventListener('status', handleEvent)" in WORKFLOW_JS
     assert "state.eventRetryTimer = window.setTimeout(connectEvents, 5000)" in WORKFLOW_JS
@@ -142,17 +210,43 @@ def test_frontend_uses_only_the_narrow_mail_and_service_apis():
 
 def test_workflow_workspace_starts_n8n_on_demand_only_after_safe_status_probe():
     ensure = _slice(WORKFLOW_JS, "async function ensureServiceForWorkspace", "function open()")
+    assert "if (!n8nExtensionReady()) return" in ensure
     assert "await refreshService()" in ensure
     assert "service.installed !== true" in ensure
     assert "service.isolation_ready !== true" in ensure
     assert "request('/api/integrations/n8n/start', { method: 'POST' })" in ensure
     open_workspace = _slice(WORKFLOW_JS, "function open()", "function startBackgroundSync")
+    assert "await refreshExtensionState()" in open_workspace
+    assert "if (!n8nExtensionReady())" in open_workspace
     assert "await ensureServiceForWorkspace()" in open_workspace
     assert "const ready = (async () =>" in open_workspace
     assert "return ready" in open_workspace
 
 
+def test_workflow_header_uses_extension_state_while_details_keep_core_service_controls():
+    renderer = _slice(WORKFLOW_JS, "function renderService", "function renderProfile")
+    assert "extension.installed === true" in renderer
+    assert "extension.effective_enabled === true" in renderer
+    assert "state.dom.extensionGate.hidden = extensionEnabled" in renderer
+    assert "state.dom.enabledContent.hidden = !extensionEnabled" in renderer
+    assert "service.load_error" in renderer
+    assert "workflow-status-pill is-error" in renderer
+    assert "Gmail Workflow 已就緒" in renderer
+    for label in ("本機 n8n 服務", "Workflow 管理", "Gmail Workflow", "在瀏覽器開啟", "技術資訊"):
+        assert label in EXTENSION_JS
+
+
+def test_service_status_updates_are_published_for_the_open_extension_detail():
+    assert "workbench:n8n-service-state" in WORKFLOW_JS
+    refresh = _slice(WORKFLOW_JS, "async function refreshService", "async function refreshAll")
+    assert "publishServiceState()" in refresh
+    events = _slice(WORKFLOW_JS, "function handleStatusSnapshot", "function connectEvents")
+    assert "publishServiceState()" in events
+
+
 def test_chat_email_handoff_creates_only_a_fixed_recipient_draft_before_approval():
+    compose_gate = _slice(WORKFLOW_JS, "function composeAllowed", "function syncComposeGate")
+    assert "n8nExtensionReady()" in compose_gate
     compose = _slice(WORKFLOW_JS, "async function createComposeDraft", "async function serviceAction")
     assert "mentionedRecipients" in compose
     assert "value !== state.profile.recipient" in compose

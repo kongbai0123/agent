@@ -24,7 +24,7 @@ def test_project_skills_module_is_loaded_before_app_and_not_mounted_in_sidebar()
     assert "Skills" not in project_block
     assert "const matching = sessions.filter(session => session.project_id === project.id" in project_block
     assert 'project-skills-sidebar.js?v=1.2.1-add-menu-a11y' in INDEX_HTML
-    assert 'style.css?v=0.8.0-n8n-graph-authoring-beta.4' in INDEX_HTML
+    assert 'style.css?v=0.9.0-model-catalog-beta.1' in INDEX_HTML
 
 
 def test_project_skills_use_only_project_and_session_scoped_apis():
