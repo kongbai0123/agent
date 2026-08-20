@@ -39,6 +39,7 @@ $hermesStartScript = Join-Path $projectRoot "scripts\start_hermes_sidecar.ps1"
 $hermesProductionOps = Join-Path $projectRoot "scripts\hermes_production_ops.py"
 $backendUrl = "http://127.0.0.1:$BackendPort"
 $frontendVersion = "0.9.0-model-catalog-beta.1"
+$launcherShutdownHandoffMilliseconds = 75000
 $websiteUrl = "$backendUrl/index.html?v=$frontendVersion"
 $discoveryConfigPath = Join-Path $runtimeDir "server-discovery-config.json"
 $discoveryCachePath = Join-Path $runtimeDir "server-discovery-cache.json"
@@ -538,24 +539,31 @@ function Find-HealthyWorkbenchBackendPort {
 }
 
 function Open-ExistingWorkbenchWindow {
-    param([int]$RequestedPort)
+    param(
+        [int]$RequestedPort,
+        [switch]$ExistingWindowOnly
+    )
 
-    $existingBrowser = Get-LauncherBrowserProcess
-    if ($null -ne $existingBrowser -and -not $existingBrowser.HasExited) {
-        $existingBrowser.Refresh()
-        if ($existingBrowser.MainWindowHandle -ne [IntPtr]::Zero) {
-            try {
-                Add-Type -AssemblyName Microsoft.VisualBasic -ErrorAction Stop
-                if ([Microsoft.VisualBasic.Interaction]::AppActivate($existingBrowser.Id)) {
-                    Write-LauncherLog "Existing workbench window activated (PID $($existingBrowser.Id))."
-                    return $true
-                }
+    $existingBrowser = Get-ReadyLauncherBrowserProcess
+    if ($null -ne $existingBrowser) {
+        try {
+            Add-Type -AssemblyName Microsoft.VisualBasic -ErrorAction Stop
+            if ([Microsoft.VisualBasic.Interaction]::AppActivate($existingBrowser.Id)) {
+                Write-LauncherLog "Existing workbench window activated (PID $($existingBrowser.Id))."
             }
-            catch {
-                Write-LauncherLog "Existing window activation warning: $($_.Exception.Message)"
+            else {
+                # Windows can reject foreground activation even though the
+                # tracked app window is healthy. Treat detection as success so
+                # a second launcher never creates a duplicate lifecycle owner.
+                Write-LauncherLog "Existing workbench window is ready (PID $($existingBrowser.Id)); Windows did not foreground it."
             }
         }
+        catch {
+            Write-LauncherLog "Existing window activation warning: $($_.Exception.Message)"
+        }
+        return $true
     }
+    if ($ExistingWindowOnly) { return $false }
 
     $healthyPort = Find-HealthyWorkbenchBackendPort -RequestedPort $RequestedPort
     if ($null -eq $healthyPort) {
@@ -613,6 +621,40 @@ function Wait-ForLauncherMutex {
     catch [Threading.AbandonedMutexException] {
         return $true
     }
+}
+
+function Get-ReadyLauncherBrowserProcess {
+    $candidate = Get-LauncherBrowserProcess
+    if ($null -eq $candidate) { return $null }
+    try {
+        if ($candidate.HasExited) { return $null }
+        $candidate.Refresh()
+        if ($candidate.MainWindowHandle -eq [IntPtr]::Zero) { return $null }
+        return $candidate
+    }
+    catch {
+        return $null
+    }
+}
+
+function Wait-ForInteractiveLauncherHandoff {
+    param(
+        [Parameter(Mandatory = $true)] [Threading.Mutex]$Mutex,
+        [int]$TimeoutMilliseconds = 75000
+    )
+
+    $deadline = (Get-Date).AddMilliseconds($TimeoutMilliseconds)
+    do {
+        if (Wait-ForLauncherMutex -Mutex $Mutex -TimeoutMilliseconds 250) {
+            return [PSCustomObject]@{ state = "mutex_acquired"; browser = $null }
+        }
+        $readyBrowser = Get-ReadyLauncherBrowserProcess
+        if ($null -ne $readyBrowser) {
+            return [PSCustomObject]@{ state = "window_ready"; browser = $readyBrowser }
+        }
+    } while ((Get-Date) -lt $deadline)
+
+    return [PSCustomObject]@{ state = "timed_out"; browser = $null }
 }
 
 function Get-ServiceWorker {
@@ -1026,16 +1068,42 @@ try {
                 }
             }
             if (-not $hasMutex) {
-                if (-not (Open-ExistingWorkbenchWindow -RequestedPort $BackendPort)) {
+                # A launcher can still own a healthy backend while it is
+                # gracefully stopping n8n and the remaining services. Opening
+                # a new browser against that transient backend leaves a stale
+                # window as soon as the owner finishes cleanup. Wait until an
+                # existing window becomes ready or ownership is fully released.
+                Write-LauncherLog "Another launcher owns the service lifecycle; waiting for a window or a clean shutdown handoff."
+                $handoff = Wait-ForInteractiveLauncherHandoff `
+                    -Mutex $mutex `
+                    -TimeoutMilliseconds $launcherShutdownHandoffMilliseconds
+                if ($handoff.state -eq "mutex_acquired") {
+                    $hasMutex = $true
+                    Write-LauncherLog "Previous launcher cleanup completed; starting a fresh workbench session."
+                }
+                elseif ($handoff.state -eq "window_ready") {
+                    if (-not (Open-ExistingWorkbenchWindow -RequestedPort $BackendPort -ExistingWindowOnly)) {
+                        Add-Type -AssemblyName PresentationFramework -ErrorAction SilentlyContinue
+                        [System.Windows.MessageBox]::Show(
+                            "Local AI Workbench 視窗正在切換中，暫時無法啟用。請稍候數秒後再試。`n`nDetails: $launcherLog",
+                            "Local AI Workbench",
+                            "OK",
+                            "Warning"
+                        ) | Out-Null
+                    }
+                    exit 0
+                }
+                else {
+                    Write-LauncherLog "Timed out waiting for the existing launcher to finish its lifecycle transition."
                     Add-Type -AssemblyName PresentationFramework -ErrorAction SilentlyContinue
                     [System.Windows.MessageBox]::Show(
-                        "Local AI Workbench 正在背景啟動，但目前找不到可開啟的服務。請稍候數秒後再試。`n`nDetails: $launcherLog",
+                        "Local AI Workbench 仍在完成上一個工作階段的關閉。請稍候數秒後再試。`n`nDetails: $launcherLog",
                         "Local AI Workbench",
                         "OK",
                         "Warning"
                     ) | Out-Null
+                    exit 0
                 }
-                exit 0
             }
         }
         else {

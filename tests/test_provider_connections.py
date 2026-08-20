@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
 import sys
@@ -9,6 +10,7 @@ from unittest.mock import Mock, patch
 import pytest
 import requests
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -19,6 +21,7 @@ import app as workbench_app
 import local_session
 import model_client as model_client_module
 from api.routes.system import configured_model_summaries
+from api.schemas.settings import ProviderModelTestRequest
 from provider_connections import (
     ProviderConnectionFailure,
     catalog_payload,
@@ -280,6 +283,51 @@ def test_source_scoped_connection_returns_only_the_url_model():
     assert result["models"] == [target]
 
 
+def test_nvidia_ocr_source_requires_capability_test_after_key_verification():
+    with patch(
+        "provider_connections.requests.get",
+        return_value=_response(200, {"data": []}),
+    ):
+        result = run_connection_test(
+            provider_type="nvidia",
+            base_url="https://integrate.api.nvidia.com/v1",
+            api_key="nvapi-accepted-secret",
+            source_url="https://build.nvidia.com/nvidia/nemotron-ocr-v2",
+        )
+
+    assert result["status"] == "capability_test_required"
+    assert result["credential_verified"] is True
+    assert result["capability_test_required"] is True
+    assert result["models"] == ["nvidia/nemotron-ocr-v2"]
+    assert result["model_profile"]["kind"] == "vision"
+    assert result["capability_endpoint"] == (
+        "https://ai.api.nvidia.com/v1/cv/nvidia/nemotron-ocr-v2"
+    )
+    assert "nvapi-accepted-secret" not in json.dumps(result)
+
+
+def test_nvidia_source_missing_from_openai_catalog_has_stable_neutral_error():
+    with patch(
+        "provider_connections.requests.get",
+        return_value=_response(200, {"data": [{"id": "other/model"}]}),
+    ), pytest.raises(ProviderConnectionFailure) as failure:
+        run_connection_test(
+            provider_type="nvidia",
+            base_url="https://integrate.api.nvidia.com/v1",
+            api_key="nvapi-accepted-secret",
+            source_url=(
+                "https://build.nvidia.com/nvidia/downloadable-instruct-model"
+            ),
+        )
+
+    assert failure.value.code == "PROVIDER_MODEL_NOT_IN_CATALOG"
+    assert failure.value.status_code == 409
+    assert "NVIDIA 已接受此 API Key" in str(failure.value)
+    assert "Hosted Endpoint" in str(failure.value)
+    assert "download-only" in str(failure.value)
+    assert "nvapi-accepted-secret" not in str(failure.value)
+
+
 def test_connection_test_lists_models_without_sending_project_content():
     response = _response(200, {"data": [{"id": "model-a"}, {"id": "model-b"}]})
     with patch("provider_connections.requests.get", return_value=response) as get:
@@ -294,6 +342,294 @@ def test_connection_test_lists_models_without_sending_project_content():
     assert get.call_args.args == ("https://integrate.api.nvidia.com/v1/models",)
     assert get.call_args.kwargs["headers"]["Authorization"] == "Bearer nvapi-test-secret"
     assert "data" not in get.call_args.kwargs
+
+
+def test_rerank_model_test_never_calls_chat_completions():
+    with patch("provider_connections.requests.get") as get, patch(
+        "provider_connections.requests.post"
+    ) as post, pytest.raises(ProviderConnectionFailure) as failure:
+        run_model_test(
+            provider_type="nvidia",
+            base_url="https://integrate.api.nvidia.com/v1",
+            api_key="nvapi-test-secret",
+            model="nvidia/llama-nemotron-rerank-1b-v2",
+            system_prompt="",
+            prompt="Hello.",
+        )
+
+    assert failure.value.code == "PROVIDER_SPECIALIZED_ENDPOINT_REQUIRED"
+    assert failure.value.status_code == 409
+    get.assert_not_called()
+    post.assert_not_called()
+
+
+def test_nemotron_ocr_v2_uses_exact_endpoint_payload_and_bounded_result():
+    image_data_url = "data:image/png;base64," + base64.b64encode(
+        b"\x89PNG\r\n\x1a\nsmall-test-image"
+    ).decode("ascii")
+    long_text = "x" * 13_000
+    listed = _response(200, {"data": []})
+    completed = _response(200, {
+        "data": [{
+            "text_detections": [
+                {
+                    "text_prediction": {
+                        "text": long_text,
+                        "confidence": 1.5,
+                    },
+                    "bounding_box": {
+                        "points": [
+                            {"x": -0.5, "y": 0.25},
+                            {"x": 1.5, "y": 2.0},
+                        ],
+                    },
+                },
+                {
+                    "text_prediction": {"text": "second", "confidence": 0.5},
+                },
+            ],
+        }],
+    })
+    with patch(
+        "provider_connections.requests.get",
+        return_value=listed,
+    ) as get, patch(
+        "provider_connections.requests.post",
+        return_value=completed,
+    ) as post:
+        result = run_model_test(
+            provider_type="nvidia",
+            base_url="https://integrate.api.nvidia.com/v1",
+            api_key="nvapi-ocr-secret",
+            model="nvidia/nemotron-ocr-v2",
+            system_prompt="",
+            prompt="",
+            image_data_url=image_data_url,
+        )
+
+    assert result["status"] == "responded"
+    assert result["model_profile"]["kind"] == "vision"
+    assert len(result["response"]) == 12_000
+    assert result["detection_count"] == 2
+    assert result["detections_truncated"] is True
+    assert len(result["detections"][0]["text"]) == 1_000
+    assert result["detections"][0]["confidence"] == 1.0
+    assert result["detections"][0]["bounding_box"]["points"] == [
+        {"x": 0.0, "y": 0.25},
+        {"x": 1.0, "y": 1.0},
+    ]
+    assert get.call_args.args == (
+        "https://integrate.api.nvidia.com/v1/models",
+    )
+    assert post.call_args.args == (
+        "https://ai.api.nvidia.com/v1/cv/nvidia/nemotron-ocr-v2",
+    )
+    assert post.call_args.kwargs["json"] == {
+        "input": [{"type": "image_url", "url": image_data_url}],
+        "merge_levels": ["paragraph"],
+    }
+    assert post.call_args.kwargs["headers"]["Authorization"] == (
+        "Bearer nvapi-ocr-secret"
+    )
+    assert "nvapi-ocr-secret" not in json.dumps(result)
+
+
+def test_nemotron_ocr_v2_accepts_blank_detection_result():
+    image_data_url = "data:image/jpeg;base64," + base64.b64encode(
+        b"\xff\xd8\xffsmall-test-image"
+    ).decode("ascii")
+    with patch(
+        "provider_connections.requests.get",
+        return_value=_response(200, {"data": []}),
+    ), patch(
+        "provider_connections.requests.post",
+        return_value=_response(200, {"data": [{"text_detections": []}]}),
+    ):
+        result = run_model_test(
+            provider_type="nvidia",
+            base_url="https://integrate.api.nvidia.com/v1",
+            api_key="nvapi-ocr-secret",
+            model="nvidia/nemotron-ocr-v2",
+            system_prompt="",
+            prompt="",
+            image_data_url=image_data_url,
+        )
+
+    assert result["response"] == ""
+    assert result["detections"] == []
+    assert result["detection_count"] == 0
+    assert result["detections_truncated"] is False
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"data": None},
+        {"data": []},
+        {"data": [{}]},
+        {"data": ["not-an-ocr-page"]},
+    ],
+)
+def test_nemotron_ocr_v2_rejects_incomplete_success_payload(payload):
+    image_data_url = "data:image/png;base64," + base64.b64encode(
+        b"\x89PNG\r\n\x1a\nsmall-test-image"
+    ).decode("ascii")
+    with patch(
+        "provider_connections.requests.get",
+        return_value=_response(200, {"data": []}),
+    ), patch(
+        "provider_connections.requests.post",
+        return_value=_response(200, payload),
+    ), pytest.raises(ProviderConnectionFailure) as failure:
+        run_model_test(
+            provider_type="nvidia",
+            base_url="https://integrate.api.nvidia.com/v1",
+            api_key="nvapi-ocr-secret",
+            model="nvidia/nemotron-ocr-v2",
+            system_prompt="",
+            prompt="",
+            image_data_url=image_data_url,
+        )
+
+    assert failure.value.code == "PROVIDER_OCR_INVALID_RESPONSE"
+
+
+def test_nemotron_ocr_upstream_error_never_echoes_image_or_secret():
+    image_data_url = "data:image/png;base64," + base64.b64encode(
+        b"\x89PNG\r\n\x1a\nprivate-image-content"
+    ).decode("ascii")
+    rejected = _response(400)
+    rejected.text = json.dumps({
+        "error": {
+            "message": (
+                f"invalid input {image_data_url}; "
+                "credential nvapi-private-ocr-secret"
+            ),
+        },
+    })
+    with patch(
+        "provider_connections.requests.get",
+        return_value=_response(200, {"data": []}),
+    ), patch(
+        "provider_connections.requests.post",
+        return_value=rejected,
+    ), pytest.raises(ProviderConnectionFailure) as failure:
+        run_model_test(
+            provider_type="nvidia",
+            base_url="https://integrate.api.nvidia.com/v1",
+            api_key="nvapi-private-ocr-secret",
+            model="nvidia/nemotron-ocr-v2",
+            system_prompt="",
+            prompt="",
+            image_data_url=image_data_url,
+        )
+
+    message = str(failure.value)
+    assert failure.value.code == "PROVIDER_OCR_REQUEST_REJECTED"
+    assert image_data_url not in message
+    assert "data:image" not in message
+    assert "private-image-content" not in message
+    assert "nvapi-private-ocr-secret" not in message
+
+
+@pytest.mark.parametrize(
+    ("image_data_url", "expected_code"),
+    [
+        ("", "PROVIDER_OCR_IMAGE_REQUIRED"),
+        (
+            "data:image/png;base64," + base64.b64encode(b"not-a-png").decode(),
+            "PROVIDER_OCR_IMAGE_INVALID",
+        ),
+        (
+            "data:image/gif;base64," + base64.b64encode(b"GIF89a").decode(),
+            "PROVIDER_OCR_IMAGE_INVALID",
+        ),
+        (
+            "data:image/png;base64," + ("A" * 180_000),
+            "PROVIDER_OCR_IMAGE_TOO_LARGE",
+        ),
+        (
+            "data:image/png;base64," + base64.b64encode(
+                b"\x89PNG\r\n\x1a\n" + (b"x" * (128 * 1024))
+            ).decode(),
+            "PROVIDER_OCR_IMAGE_TOO_LARGE",
+        ),
+    ],
+    ids=[
+        "missing",
+        "mime-mismatch",
+        "unsupported-gif",
+        "base64-limit",
+        "decoded-limit",
+    ],
+)
+def test_nemotron_ocr_v2_rejects_unsafe_images_before_network(
+    image_data_url,
+    expected_code,
+):
+    with patch("provider_connections.requests.get") as get, patch(
+        "provider_connections.requests.post"
+    ) as post, pytest.raises(ProviderConnectionFailure) as failure:
+        run_model_test(
+            provider_type="nvidia",
+            base_url="https://integrate.api.nvidia.com/v1",
+            api_key="nvapi-test-secret",
+            model="nvidia/nemotron-ocr-v2",
+            system_prompt="",
+            prompt="",
+            image_data_url=image_data_url,
+        )
+
+    assert failure.value.code == expected_code
+    get.assert_not_called()
+    post.assert_not_called()
+
+
+def test_model_test_schema_allows_empty_prompt_only_for_nvidia_ocr_v2():
+    common = {
+        "provider_id": "nvidia",
+        "provider_type": "nvidia",
+        "base_url": "https://integrate.api.nvidia.com/v1",
+    }
+    with pytest.raises(ValidationError, match="prompt must not be empty"):
+        ProviderModelTestRequest(
+            **common,
+            model="nvidia/chat-instruct",
+            prompt=" ",
+        )
+    with pytest.raises(ValidationError, match="image_data_url is required"):
+        ProviderModelTestRequest(
+            **common,
+            model="nvidia/nemotron-ocr-v2",
+            prompt="",
+        )
+
+    request = ProviderModelTestRequest(
+        **common,
+        model="nvidia/nemotron-ocr-v2",
+        prompt="",
+        image_data_url="data:image/png;base64,AA==",
+    )
+    assert request.prompt == ""
+
+
+def test_empty_chat_prompt_is_rejected_before_network():
+    with patch("provider_connections.requests.get") as get, patch(
+        "provider_connections.requests.post"
+    ) as post, pytest.raises(ProviderConnectionFailure) as failure:
+        run_model_test(
+            provider_type="nvidia",
+            base_url="https://integrate.api.nvidia.com/v1",
+            api_key="nvapi-test-secret",
+            model="nvidia/chat-instruct",
+            system_prompt="",
+            prompt=" ",
+        )
+
+    assert failure.value.code == "PROVIDER_MODEL_PROMPT_REQUIRED"
+    get.assert_not_called()
+    post.assert_not_called()
 
 
 def test_model_test_selects_exact_model_and_returns_its_reply():
@@ -709,6 +1045,150 @@ def test_provider_catalog_and_test_api_never_return_secret(tmp_path):
         assert secret not in tested.text
 
 
+@pytest.mark.parametrize(
+    ("path", "extra_payload"),
+    [
+        ("/api/settings/providers/test", {}),
+        (
+            "/api/settings/providers/model-test",
+            {"model": "nvidia/chat-instruct", "prompt": "Hello."},
+        ),
+        (
+            "/api/settings/providers/tool-test",
+            {
+                "model": "nvidia/chat-instruct",
+                "model_kind": "chat",
+                "supports_tools": True,
+            },
+        ),
+    ],
+)
+def test_provider_test_routes_never_reuse_secret_across_provider_contexts(
+    tmp_path,
+    path,
+    extra_payload,
+):
+    settings_path = tmp_path / "settings.json"
+    secret_path = tmp_path / "provider-secrets.json"
+    headers = {
+        "Origin": "http://127.0.0.1:8080",
+        "X-Workbench-Token": local_session.session_token(),
+    }
+    with patch.dict(
+        os.environ,
+        {
+            "WORKBENCH_SETTINGS_PATH": str(settings_path),
+            "WORKBENCH_SECRET_STORE_PATH": str(secret_path),
+        },
+        clear=False,
+    ), patch("provider_connections.requests.get") as get, patch(
+        "provider_connections.requests.post"
+    ) as post, TestClient(workbench_app.app) as client:
+        configured = client.post(
+            "/api/settings",
+            headers=headers,
+            json={
+                "model_providers": [{
+                    "id": "shared",
+                    "provider_type": "gemini",
+                    "label": "Gemini",
+                    "base_url": (
+                        "https://generativelanguage.googleapis.com/"
+                        "v1beta/openai"
+                    ),
+                }],
+            },
+        )
+        assert configured.status_code == 200
+        stored = client.post(
+            "/api/settings/secrets",
+            headers=headers,
+            json={"provider_id": "shared", "api_key": "gemini-stored-secret"},
+        )
+        assert stored.status_code == 200
+
+        get.reset_mock()
+        post.reset_mock()
+        response = client.post(
+            path,
+            headers=headers,
+            json={
+                "provider_id": "shared",
+                "provider_type": "nvidia",
+                "base_url": "https://integrate.api.nvidia.com/v1",
+                **extra_payload,
+            },
+        )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == (
+        "PROVIDER_SECRET_CONTEXT_MISMATCH"
+    )
+    assert "gemini-stored-secret" not in response.text
+    get.assert_not_called()
+    post.assert_not_called()
+
+
+def test_provider_test_never_reuses_secret_after_compatible_endpoint_change(
+    tmp_path,
+):
+    settings_path = tmp_path / "settings.json"
+    secret_path = tmp_path / "provider-secrets.json"
+    headers = {
+        "Origin": "http://127.0.0.1:8080",
+        "X-Workbench-Token": local_session.session_token(),
+    }
+    with patch.dict(
+        os.environ,
+        {
+            "WORKBENCH_SETTINGS_PATH": str(settings_path),
+            "WORKBENCH_SECRET_STORE_PATH": str(secret_path),
+        },
+        clear=False,
+    ), patch("provider_connections.requests.get") as get, patch(
+        "provider_connections.requests.post"
+    ) as post, TestClient(workbench_app.app) as client:
+        configured = client.post(
+            "/api/settings",
+            headers=headers,
+            json={
+                "model_providers": [{
+                    "id": "remote",
+                    "provider_type": "openai_compatible",
+                    "label": "Remote A",
+                    "base_url": "https://provider-a.example/v1",
+                }],
+            },
+        )
+        assert configured.status_code == 200
+        stored = client.post(
+            "/api/settings/secrets",
+            headers=headers,
+            json={"provider_id": "remote", "api_key": "provider-a-secret"},
+        )
+        assert stored.status_code == 200
+
+        get.reset_mock()
+        post.reset_mock()
+        response = client.post(
+            "/api/settings/providers/test",
+            headers=headers,
+            json={
+                "provider_id": "remote",
+                "provider_type": "openai_compatible",
+                "base_url": "https://provider-b.example/v1",
+            },
+        )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == (
+        "PROVIDER_SECRET_CONTEXT_MISMATCH"
+    )
+    assert "provider-a-secret" not in response.text
+    get.assert_not_called()
+    post.assert_not_called()
+
+
 def test_provider_test_api_rejects_nonlocal_mutation(tmp_path):
     settings_path = tmp_path / "settings.json"
     with patch.dict(
@@ -767,6 +1247,94 @@ def test_provider_model_test_api_returns_reply_without_echoing_secret(tmp_path):
     assert response.json()["response"] == "已由指定模型回覆"
     assert "tool_attestation" not in response.json()
     assert secret not in response.text
+
+
+def test_nemotron_ocr_model_test_api_accepts_128_kib_image_with_local_cors(
+    tmp_path,
+):
+    """Exercise the browser-sized JSON request through the complete API stack.
+
+    The maximum accepted direct-upload image expands to roughly 175 KiB once
+    base64 encoded.  This guards against an accidental ASGI/body/schema limit
+    and also verifies that the local-origin CORS preflight and response headers
+    remain valid for the browser request used by the provider center.
+    """
+
+    image_bytes = b"\x89PNG\r\n\x1a\n" + (b"x" * ((128 * 1024) - 8))
+    image_data_url = (
+        "data:image/png;base64,"
+        + base64.b64encode(image_bytes).decode("ascii")
+    )
+    request_payload = {
+        "provider_id": "nvidia",
+        "provider_type": "nvidia",
+        "base_url": "https://integrate.api.nvidia.com/v1",
+        "source_url": (
+            "https://build.nvidia.com/nvidia/nemotron-ocr-v2"
+            "?integrate_nim=true"
+        ),
+        "api_key": "nvapi-route-ocr-secret",
+        "model": "nvidia/nemotron-ocr-v2",
+        "model_kind": "vision",
+        "image_data_url": image_data_url,
+    }
+    encoded_request = json.dumps(request_payload).encode("utf-8")
+    assert 170_000 < len(encoded_request) < 180_032
+
+    origin = "http://127.0.0.1:8080"
+    headers = {
+        "Origin": origin,
+        "X-Workbench-Token": local_session.session_token(),
+        "Content-Type": "application/json",
+    }
+    with patch.dict(
+        os.environ,
+        {"WORKBENCH_SETTINGS_PATH": str(tmp_path / "settings.json")},
+        clear=False,
+    ), patch(
+        "provider_connections.requests.get",
+        return_value=_response(200, {"data": []}),
+    ), patch(
+        "provider_connections.requests.post",
+        return_value=_response(200, {
+            "data": [{
+                "text_detections": [{
+                    "text_prediction": {
+                        "text": "route-sized OCR result",
+                        "confidence": 0.99,
+                    },
+                }],
+            }],
+        }),
+    ) as upstream_post, TestClient(workbench_app.app) as client:
+        preflight = client.options(
+            "/api/settings/providers/model-test",
+            headers={
+                "Origin": origin,
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": (
+                    "content-type,x-workbench-token"
+                ),
+            },
+        )
+        response = client.post(
+            "/api/settings/providers/model-test",
+            headers=headers,
+            content=encoded_request,
+        )
+
+    assert preflight.status_code == 200
+    assert preflight.headers["access-control-allow-origin"] == origin
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == origin
+    assert response.json()["response"] == "route-sized OCR result"
+    assert upstream_post.call_args.args == (
+        "https://ai.api.nvidia.com/v1/cv/nvidia/nemotron-ocr-v2",
+    )
+    assert upstream_post.call_args.kwargs["json"]["input"] == [{
+        "type": "image_url",
+        "url": image_data_url,
+    }]
 
 
 def test_provider_tool_test_api_returns_only_passed_attestation(tmp_path):

@@ -1,6 +1,6 @@
 from typing import Optional
 
-from pydantic import BaseModel, Field, SecretStr
+from pydantic import BaseModel, Field, SecretStr, model_validator
 
 
 class ProviderSecretRequest(BaseModel):
@@ -28,4 +28,20 @@ class ProviderToolTestRequest(ProviderConnectionTestRequest):
 class ProviderModelTestRequest(ProviderConnectionTestRequest):
     model: str = Field(min_length=1, max_length=200)
     system_prompt: str = Field(default="", max_length=1000)
-    prompt: str = Field(min_length=1, max_length=4000)
+    prompt: str = Field(default="", max_length=4000)
+    # The NVIDIA hosted direct-upload API requires base64 content below
+    # 180,000 characters. Runtime validation also checks MIME and magic bytes.
+    image_data_url: str = Field(default="", max_length=180_032)
+
+    @model_validator(mode="after")
+    def validate_model_test_input(self):
+        is_nvidia_ocr_v2 = (
+            self.provider_type.strip().casefold() == "nvidia"
+            and self.model.strip().casefold() == "nvidia/nemotron-ocr-v2"
+        )
+        if is_nvidia_ocr_v2:
+            if not self.image_data_url.strip():
+                raise ValueError("image_data_url is required for Nemotron OCR v2.")
+        elif not self.prompt.strip():
+            raise ValueError("prompt must not be empty for non-OCR model tests.")
+        return self

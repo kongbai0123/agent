@@ -89,6 +89,31 @@ class WindowsLauncherTests(unittest.TestCase):
         self.assertIn('"--wait"', updater)
         self.assertIn("[System.IO.DirectoryInfo]::new($venvJunction).Delete()", updater)
 
+    def test_interactive_relaunch_waits_for_launcher_lifecycle_handoff(self):
+        script = START_SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("$launcherShutdownHandoffMilliseconds = 75000", script)
+        self.assertIn("function Wait-ForInteractiveLauncherHandoff", script)
+        self.assertIn('state = "mutex_acquired"', script)
+        self.assertIn('state = "window_ready"', script)
+        self.assertIn('state = "timed_out"', script)
+        self.assertIn(
+            "Treat detection as success so",
+            script,
+        )
+
+        mutex_branch = script.split(
+            'Write-LauncherLog "Another launcher owns the service lifecycle;',
+            1,
+        )[1].split("if (-not (Test-Path -LiteralPath $pythonPath))", 1)[0]
+        wait_position = mutex_branch.index("Wait-ForInteractiveLauncherHandoff")
+        open_position = mutex_branch.index("Open-ExistingWorkbenchWindow")
+        self.assertLess(wait_position, open_position)
+        self.assertIn(
+            'if ($handoff.state -eq "mutex_acquired")',
+            mutex_branch,
+        )
+        self.assertNotIn("Find-HealthyWorkbenchBackendPort", mutex_branch[:wait_position])
+
     @unittest.skipUnless(
         os.name == "nt" and POWERSHELL.exists(),
         "Windows launcher mutex behavior",

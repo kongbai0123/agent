@@ -271,7 +271,9 @@ function inferredProviderModelKind(model, explicit = '') {
     if (/rerank|re-rank|ranker/.test(value)) return 'rerank';
     if (/(?:\/|-)(?:embed|embedding)|text-embedding|\/bge-|(?:^|\/)e5-/.test(value)) return 'embedding';
     if (/llama-guard|nemoguard|safety-guard|moderation|classifier/.test(value)) return 'unknown';
-    if (/vision|(?:\/|-)(?:vl)(?:-|$)|llava|vila|image-to-text/.test(value)) return 'vision';
+    if (/ocr|optical[-_ ]character|vision|(?:\/|-)(?:vl)(?:-|$)|llava|vila|image-to-text/.test(value)) {
+        return 'vision';
+    }
     if (/chat|instruct|assistant|llama|nemotron|qwen|mistral|mixtral|gemma|deepseek|gpt-|claude|command-r/.test(value)) {
         return 'chat';
     }
@@ -282,13 +284,199 @@ function inferredProviderModelKind(model, explicit = '') {
     return 'unknown';
 }
 
+const providerDedicatedAdapterKinds = new Set(['embedding', 'rerank', 'vision', 'unknown']);
+
+function providerModelRequiresDedicatedAdapter(kind) {
+    return providerDedicatedAdapterKinds.has(String(kind || '').trim().toLowerCase());
+}
+
+function providerModelUsesNemotronOcrAdapter(kind, model) {
+    return String(kind || '').trim().toLowerCase() === 'vision'
+        && String(model || '').trim().toLowerCase() === 'nvidia/nemotron-ocr-v2';
+}
+
+function providerModelBlocksTest(kind, model) {
+    return providerModelRequiresDedicatedAdapter(kind)
+        && !providerModelUsesNemotronOcrAdapter(kind, model);
+}
+
+function providerModelAdapterStatus(kind, model = '') {
+    const normalizedKind = String(kind || '').trim().toLowerCase();
+    const modelLabel = String(model || '').trim();
+    const prefix = modelLabel ? `${modelLabel}：` : '';
+    const adapterLabels = {
+        embedding: '\u5411\u91cf\u5d4c\u5165',
+        rerank: '\u6587\u4ef6\u91cd\u6392',
+        vision: '\u8996\u89ba\uff0fOCR'
+    };
+    if (providerModelUsesNemotronOcrAdapter(normalizedKind, modelLabel)) {
+        return `${prefix}\u5c08\u7528 adapter \u72c0\u614b\uff1a\u53ef\u4e0a\u50b3 PNG \u6216 JPEG \u5716\u7247\u9032\u884c OCR \u80fd\u529b\u6e2c\u8a66\uff1b\u4e0d\u6703\u9001\u51fa\u4e00\u822c\u804a\u5929\u8acb\u6c42\u3002`;
+    }
+    if (normalizedKind === 'unknown') {
+        return `${prefix}\u5c08\u7528 adapter \u72c0\u614b\uff1a\u5c1a\u672a\u5206\u985e\u3002\u8acb\u5148\u78ba\u8a8d\u6a21\u578b\u7528\u9014\u8207\u5c0d\u61c9 adapter\uff1b\u4e00\u822c\u804a\u5929\u6e2c\u8a66\u5df2\u505c\u7528\u3002`;
+    }
+    const adapterLabel = adapterLabels[normalizedKind] || '\u5c08\u7528';
+    const inputHint = normalizedKind === 'vision' ? '\uff0c\u4e26\u4f7f\u7528\u5716\u7247\u8f38\u5165' : '';
+    return `${prefix}\u5c08\u7528 adapter \u72c0\u614b\uff1a\u9700\u8981 ${adapterLabel} adapter${inputHint}\uff1b\u6b64\u756b\u9762\u5c1a\u672a\u63d0\u4f9b\uff0c\u4e00\u822c\u804a\u5929\u6e2c\u8a66\u5df2\u505c\u7528\u3002`;
+}
+
+// The hosted direct-call contract requires image_b64 to stay below 180,000
+// characters. A 128 KiB raw file remains safely below that after base64 growth.
+const nemotronOcrMaxFileBytes = 128 * 1024;
+const nemotronOcrMimeTypes = new Set(['image/png', 'image/jpeg']);
+const providerApiRequestTimeoutMs = 45 * 1000;
+
+function providerApiError(message, code, cause = null) {
+    const error = new Error(message);
+    error.code = code;
+    if (cause) error.cause = cause;
+    return error;
+}
+
+function providerBackendErrorMessage(data, status) {
+    const detail = data?.detail;
+    return detail?.message
+        || (typeof detail === 'string' ? detail : '')
+        || data?.message
+        || `本機 Agent API 請求失敗（HTTP ${status}）。`;
+}
+
+async function providerJsonRequest(url, options = {}, timeoutMs = providerApiRequestTimeoutMs) {
+    let timeoutHandle = null;
+    let timedOut = false;
+    let controller = null;
+    const requestOptions = { ...options };
+    if (!requestOptions.signal && typeof AbortController === 'function') {
+        controller = new AbortController();
+        requestOptions.signal = controller.signal;
+        timeoutHandle = setTimeout(() => {
+            timedOut = true;
+            controller.abort();
+        }, Math.max(1, Number(timeoutMs) || providerApiRequestTimeoutMs));
+    }
+
+    try {
+        let response;
+        try {
+            response = await apiFetch(url, requestOptions);
+        } catch (error) {
+            if (timedOut) {
+                throw providerApiError(
+                    '本機 Agent API 回應逾時。請確認 Workbench 後端仍在執行，再重試一次。',
+                    'LOCAL_API_TIMEOUT',
+                    error
+                );
+            }
+            if (error?.name === 'AbortError') {
+                throw providerApiError('本機 Agent API 請求已取消。', 'LOCAL_API_ABORTED', error);
+            }
+            if (
+                error?.name === 'TypeError'
+                || /failed to fetch|fetch failed|networkerror|load failed/i.test(String(error?.message || ''))
+            ) {
+                throw providerApiError(
+                    '無法連上本機 Agent API。請確認 Workbench 後端仍在執行，或重新啟動軟體後再試。',
+                    'LOCAL_API_UNREACHABLE',
+                    error
+                );
+            }
+            throw error;
+        }
+
+        let data;
+        try {
+            data = await response.json();
+        } catch (error) {
+            const status = Number(response?.status) || 0;
+            throw providerApiError(
+                response?.ok
+                    ? '本機 Agent API 回傳了無法解析的回應。請重新啟動 Workbench 後再試。'
+                    : `本機 Agent API 回傳 HTTP ${status || '未知'}，但沒有可讀取的錯誤說明。`,
+                'LOCAL_API_INVALID_JSON',
+                error
+            );
+        }
+        if (!response.ok || data?.success === false) {
+            const error = providerApiError(
+                providerBackendErrorMessage(data, Number(response.status) || 0),
+                data?.detail?.code || data?.code || 'LOCAL_API_REQUEST_FAILED'
+            );
+            error.status = Number(response.status) || 0;
+            error.payload = data;
+            throw error;
+        }
+        return data;
+    } finally {
+        if (timeoutHandle !== null) clearTimeout(timeoutHandle);
+    }
+}
+
+function providerOcrFileValidation(file) {
+    if (!file) {
+        return { valid: false, message: '\u8acb\u9078\u64c7 PNG \u6216 JPEG \u5716\u7247\u3002' };
+    }
+    if (!nemotronOcrMimeTypes.has(String(file.type || '').toLowerCase())) {
+        return { valid: false, message: '\u6a94\u6848\u683c\u5f0f\u4e0d\u652f\u63f4\uff1b\u8acb\u9078\u64c7 PNG \u6216 JPEG\u3002' };
+    }
+    if (!Number.isFinite(file.size) || file.size <= 0 || file.size > nemotronOcrMaxFileBytes) {
+        return { valid: false, message: '\u5716\u7247\u5fc5\u9808\u5927\u65bc 0 bytes \u4e14\u4e0d\u8d85\u904e 128 KiB\u3002' };
+    }
+    return { valid: true, message: `\u5df2\u9078\u64c7 ${file.name || '\u5716\u7247'}\uff0c\u53ef\u958b\u59cb OCR \u80fd\u529b\u6e2c\u8a66\u3002` };
+}
+
+function syncProviderOcrFileState(card) {
+    const input = card.querySelector('[data-provider-ocr-file]');
+    const state = card.querySelector('[data-provider-ocr-file-status]');
+    const button = card.querySelector('[data-test-provider-model]');
+    const validation = providerOcrFileValidation(input?.files?.[0]);
+    if (state) state.textContent = validation.message;
+    if (button) button.disabled = Boolean(card.providerModelTestPending) || !validation.valid;
+    return validation.valid;
+}
+
+function clearProviderOcrFile(card) {
+    const input = card.querySelector('[data-provider-ocr-file]');
+    const state = card.querySelector('[data-provider-ocr-file-status]');
+    if (input) input.value = '';
+    if (state) state.textContent = '\u8acb\u9078\u64c7\u5716\u7247\u4ee5\u555f\u7528 OCR \u80fd\u529b\u6e2c\u8a66\u3002';
+}
+
+function syncProviderModelIdentity(card, model) {
+    const identity = String(model || '').trim();
+    if (String(card.dataset.currentModelIdentity || '') !== identity) {
+        clearProviderOcrFile(card);
+        card.dataset.currentModelIdentity = identity;
+    }
+}
+
+function readProviderOcrImageDataUrl(card) {
+    const input = card.querySelector('[data-provider-ocr-file]');
+    const file = input?.files?.[0];
+    const validation = providerOcrFileValidation(file);
+    if (!validation.valid) return Promise.reject(new Error(validation.message));
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onerror = () => reject(new Error('\u7121\u6cd5\u8b80\u53d6 OCR \u6e2c\u8a66\u5716\u7247\u3002'));
+        reader.onload = () => {
+            const dataUrl = String(reader.result || '');
+            const mimeType = String(file.type || '').toLowerCase();
+            if (!dataUrl.startsWith(`data:${mimeType};base64,`)) {
+                reject(new Error('\u7121\u6cd5\u5efa\u7acb\u5b89\u5168\u7684 OCR \u5716\u7247\u8cc7\u6599\u3002'));
+                return;
+            }
+            resolve(dataUrl);
+        };
+        reader.readAsDataURL(file);
+    });
+}
+
 function providerModelKindOptions(selected) {
     const labels = {
         chat: '\u5c0d\u8a71\uff0fAgent \u6a21\u578b',
         translation: '\u7ffb\u8b6f\u5de5\u5177',
         embedding: '\u5411\u91cf\u5d4c\u5165\u5de5\u5177',
         rerank: '\u6587\u4ef6\u91cd\u6392\u5de5\u5177',
-        vision: '\u8996\u89ba\u5de5\u5177',
+        vision: '\u8996\u89ba\uff0fOCR \u5de5\u5177',
         unknown: '\u5c1a\u672a\u5206\u985e\uff08\u4e0d\u53ef\u4f5c\u70ba Agent\uff09'
     };
     return Object.entries(labels).map(([value, label]) =>
@@ -317,8 +505,28 @@ function modelIdFromSourceUrl(value) {
     return '';
 }
 
+function providerTypeFromSourceUrl(value) {
+    try {
+        const url = new URL(String(value || '').trim());
+        const hostname = url.hostname.toLowerCase();
+        const match = Object.values(modelProviderCatalog).find(item =>
+            (item.source_hosts || []).some(sourceHost => {
+                const normalizedHost = String(sourceHost || '').trim().toLowerCase();
+                return normalizedHost
+                    && (hostname === normalizedHost || hostname.endsWith(`.${normalizedHost}`));
+            })
+        );
+        return match?.id || '';
+    } catch (_error) {
+        return '';
+    }
+}
+
 function nextModelProviderId(prefix = 'connection') {
-    const existing = new Set(collectModelProviders().map(item => item.id));
+    const existing = new Set([
+        ...collectModelProviders().map(item => item.id),
+        ...Object.keys(modelProviderSecretStatus)
+    ]);
     let index = 1;
     let candidate = prefix;
     while (existing.has(candidate)) {
@@ -345,9 +553,15 @@ function modelProviderCard(provider = {}) {
     const endpointLock = catalogItem.endpoint_editable ? '' : 'readonly';
     const selectedModel = String(provider.selected_model || '').trim();
     const modelKind = inferredProviderModelKind(selectedModel, provider.model_kind);
+    const requiresDedicatedAdapter = providerModelRequiresDedicatedAdapter(modelKind);
+    const usesNemotronOcrAdapter = providerModelUsesNemotronOcrAdapter(modelKind, selectedModel);
+    const blocksModelTest = providerModelBlocksTest(modelKind, selectedModel);
+    const adapterStatus = providerModelAdapterStatus(modelKind, selectedModel);
     const languagePair = String(provider.language_pair || (modelKind === 'translation' ? 'en-zh-cn' : '')).trim();
     return `
         <div class="model-provider-card" data-provider-card
+             data-current-provider-type="${escapeHtml(providerType)}"
+             data-current-model-identity="${escapeHtml(selectedModel)}"
              data-original-provider-id="${escapeHtml(id)}">
             <div class="model-provider-card-head">
                 <input type="hidden" data-provider-field="id" value="${escapeHtml(id)}">
@@ -427,17 +641,29 @@ function modelProviderCard(provider = {}) {
                                placeholder="例如 en-zh-tw">
                     </label>
                 </div>
-                <label class="model-provider-test-prompt">
+                <label class="model-provider-test-prompt" data-provider-chat-test-control
+                       ${requiresDedicatedAdapter ? 'hidden' : ''}>
                     <span>Sandbox 測試內容</span>
                     <textarea class="settings-input" data-provider-test-prompt
                               rows="2">Hello, this is a model connection test.</textarea>
                 </label>
+                <label class="model-provider-test-prompt" data-provider-ocr-test-control
+                       ${usesNemotronOcrAdapter ? '' : 'hidden'}>
+                    <span>OCR 測試圖片 <small>PNG 或 JPEG，最大 128 KiB</small></span>
+                    <input class="settings-input" type="file" data-provider-ocr-file
+                           accept="image/png,image/jpeg" aria-label="OCR 測試圖片">
+                    <small data-provider-ocr-file-status>請選擇圖片以啟用 OCR 能力測試。</small>
+                </label>
                 <div class="model-provider-model-actions">
                     <button type="button" class="btn btn-primary compact"
-                            data-test-provider-model>取得模型回覆</button>
+                            data-test-provider-model
+                            ${blocksModelTest ? 'hidden disabled' : usesNemotronOcrAdapter ? 'disabled' : ''}>${usesNemotronOcrAdapter ? 'OCR 辨識' : '取得模型回覆'}</button>
                     <span data-provider-selected-status>尚未驗證模型回覆</span>
                 </div>
+                <div class="model-provider-response" data-provider-adapter-status
+                     ${requiresDedicatedAdapter ? '' : 'hidden'}>${escapeHtml(adapterStatus)}</div>
                 <output class="model-provider-response" data-provider-response
+                        ${blocksModelTest ? 'hidden' : ''}
                         aria-live="polite"></output>
             </section>
             <details class="model-provider-advanced">
@@ -577,14 +803,41 @@ async function loadModelProviderSettings(providers = []) {
     renderModelProviders(providers);
 }
 
+function resetProviderCredentialIdentity(card, providerType) {
+    const id = card.querySelector('[data-provider-field="id"]');
+    const retiredProviderId = id.value.trim().toLowerCase();
+    const apiKey = card.querySelector('[data-provider-field="api_key"]');
+    const enabled = card.querySelector('[data-provider-field="enabled"]');
+    const secretState = card.querySelector('.model-provider-secret-state');
+    if (!card.dataset.retiredProviderId && modelProviderSecretStatus[retiredProviderId]?.configured) {
+        card.dataset.retiredProviderId = retiredProviderId;
+    }
+    id.value = nextModelProviderId(`${providerType}-connection`);
+    apiKey.value = '';
+    apiKey.placeholder = `\u8acb\u8f38\u5165\u65b0\u7684 ${modelProviderCatalog[providerType]?.label || providerType} API Key`;
+    if (enabled) enabled.checked = false;
+    if (secretState) {
+        secretState.classList.remove('configured');
+        secretState.textContent = '\u4f9b\u61c9\u5546\u5df2\u8b8a\u66f4\uff1b\u70ba\u907f\u514d\u6cbf\u7528\u820a\u91d1\u9470\uff0c\u8acb\u8f38\u5165\u65b0 API Key';
+    }
+    card.providerCredentialResetRequired = true;
+}
+
 function applyProviderType(card, providerType) {
     const item = modelProviderCatalog[providerType] || modelProviderCatalog.openai_compatible;
+    const previousProviderType = String(card.dataset.currentProviderType || '').trim();
+    if (previousProviderType && previousProviderType !== providerType) {
+        resetProviderCredentialIdentity(card, providerType);
+    }
+    card.dataset.currentProviderType = providerType;
     const label = card.querySelector('[data-provider-field="label"]');
     const endpoint = card.querySelector('[data-provider-field="base_url"]');
     const link = card.querySelector('.model-provider-official');
     const description = card.querySelector('.model-provider-description');
     const sourceUrl = card.querySelector('[data-provider-field="source_url"]');
     const modelPanel = card.querySelector('[data-provider-model-panel]');
+    clearProviderOcrFile(card);
+    card.dataset.currentModelIdentity = '';
     label.value = item.label || label.value;
     endpoint.value = item.base_url || '';
     endpoint.readOnly = !item.endpoint_editable;
@@ -607,18 +860,38 @@ function applyProviderType(card, providerType) {
 function bindProviderSourceModelSync() {
     if (!modelProviderList || modelProviderList.providerSourceModelSyncBound) return;
     modelProviderList.providerSourceModelSyncBound = true;
-    modelProviderList.addEventListener('change', event => {
+    const syncSourceUrl = event => {
+        const ocrFile = event.target.closest('[data-provider-ocr-file]');
+        if (ocrFile) {
+            const ocrCard = ocrFile.closest('[data-provider-card]');
+            if (ocrCard) syncProviderOcrFileState(ocrCard);
+            return;
+        }
         const sourceUrl = event.target.closest('[data-provider-field="source_url"]');
         const card = sourceUrl?.closest('[data-provider-card]');
         if (!card) return;
         syncProviderSourceModel(card);
-    });
+    };
+    // Paste fires an input event, so the provider and fixed endpoint update
+    // immediately instead of waiting for the field to lose focus.
+    modelProviderList.addEventListener('input', syncSourceUrl);
+    modelProviderList.addEventListener('change', syncSourceUrl);
 }
 
 function syncProviderSourceModel(card) {
-    const sourceCandidate = modelIdFromSourceUrl(
-        card.querySelector('[data-provider-field="source_url"]').value
-    );
+    const sourceInput = card.querySelector('[data-provider-field="source_url"]');
+    const sourceUrl = sourceInput.value.trim();
+    const providerType = providerTypeFromSourceUrl(sourceUrl);
+    const providerTypeSelect = card.querySelector('[data-provider-field="provider_type"]');
+    if (providerType && providerTypeSelect.value !== providerType) {
+        providerTypeSelect.value = providerType;
+        applyProviderType(card, providerType);
+        // applyProviderType clears provider-specific model state. Restore the
+        // pasted source URL before deriving its model identity.
+        sourceInput.value = sourceUrl;
+        invalidateProviderToolAttestation(card);
+    }
+    const sourceCandidate = modelIdFromSourceUrl(sourceUrl);
     if (!sourceCandidate) return '';
     const select = card.querySelector('[data-provider-field="selected_model"]');
     if (select.value !== sourceCandidate) {
@@ -665,6 +938,7 @@ function populateProviderModels(card, models = []) {
 
 function syncProviderModelDefaults(card) {
     const model = card.querySelector('[data-provider-field="selected_model"]').value;
+    syncProviderModelIdentity(card, model);
     const kindSelect = card.querySelector('[data-provider-field="model_kind"]');
     const system = card.querySelector('[data-provider-test-system]');
     kindSelect.value = inferredProviderModelKind(model, '');
@@ -701,9 +975,40 @@ function syncProviderCapabilityDefaults(card) {
         kindSelect.value = inferredKind;
     }
     const kind = kindSelect.value;
+    const requiresDedicatedAdapter = providerModelRequiresDedicatedAdapter(kind);
+    const usesNemotronOcrAdapter = providerModelUsesNemotronOcrAdapter(kind, model);
+    const blocksModelTest = providerModelBlocksTest(kind, model);
     if (kind === 'translation' && !system.value.trim()) system.value = 'en-zh-cn';
     const languageLabel = system.closest('label');
     if (languageLabel) languageLabel.hidden = kind !== 'translation';
+    card.querySelectorAll('[data-provider-chat-test-control]').forEach(control => {
+        control.hidden = requiresDedicatedAdapter;
+    });
+    card.querySelectorAll('[data-provider-ocr-test-control]').forEach(control => {
+        control.hidden = !usesNemotronOcrAdapter;
+    });
+    const modelTestButton = card.querySelector('[data-test-provider-model]');
+    if (modelTestButton) {
+        modelTestButton.hidden = blocksModelTest;
+        modelTestButton.textContent = usesNemotronOcrAdapter ? 'OCR \u8fa8\u8b58' : '\u53d6\u5f97\u6a21\u578b\u56de\u8986';
+        modelTestButton.disabled = blocksModelTest
+            || (usesNemotronOcrAdapter && !syncProviderOcrFileState(card));
+    }
+    const adapterStatus = card.querySelector('[data-provider-adapter-status]');
+    if (adapterStatus) {
+        adapterStatus.hidden = !requiresDedicatedAdapter;
+        adapterStatus.textContent = requiresDedicatedAdapter
+            ? providerModelAdapterStatus(kind, model)
+            : '';
+    }
+    const modelResponse = card.querySelector('[data-provider-response]');
+    if (modelResponse) {
+        modelResponse.hidden = blocksModelTest;
+        if (requiresDedicatedAdapter) {
+            modelResponse.className = 'model-provider-response';
+            modelResponse.textContent = '';
+        }
+    }
     const toolCapability = card.querySelector('[data-provider-tool-capability]');
     if (toolCapability) toolCapability.hidden = kind !== 'chat';
     const toolDeclaration = card.querySelector('[data-provider-field="supports_tools"]');
@@ -719,7 +1024,9 @@ function syncProviderCapabilityDefaults(card) {
     card.querySelector('[data-provider-selected-status]').textContent = model
         ? kind === 'chat'
             ? `\u5df2\u9078\u64c7\u5c0d\u8a71\u6a21\u578b\uff1a${model}`
-            : `\u5df2\u9078\u64c7\u5c08\u7528${kind === 'translation' ? '\u7ffb\u8b6f' : ''}\u5de5\u5177\uff1a${model}\uff08\u4e0d\u6703\u51fa\u73fe\u5728 Agent \u6a21\u578b\u6e05\u55ae\uff09`
+            : requiresDedicatedAdapter
+                ? providerModelAdapterStatus(kind, model)
+                : `\u5df2\u9078\u64c7\u5c08\u7528\u7ffb\u8b6f\u5de5\u5177\uff1a${model}\uff08\u4e0d\u6703\u51fa\u73fe\u5728 Agent \u6a21\u578b\u6e05\u55ae\uff09`
         : '\u8acb\u9078\u64c7\u8981\u9a57\u8b49\u7684\u6a21\u578b';
 }
 
@@ -756,22 +1063,28 @@ async function testModelProviderCard(card) {
         selected_model: card.querySelector('[data-provider-field="selected_model"]').value.trim()
     };
     const key = card.querySelector('[data-provider-field="api_key"]').value.trim();
+    if (card.providerCredentialResetRequired && !key) {
+        result.className = 'model-provider-test-result failed';
+        result.textContent = '\u4f9b\u61c9\u5546\u5df2\u8b8a\u66f4\uff1b\u8acb\u8f38\u5165\u65b0 API Key\uff0c\u4e0d\u6703\u6cbf\u7528\u820a\u4f9b\u61c9\u5546\u91d1\u9470\u3002';
+        return;
+    }
     if (key) payload.api_key = key;
     button.disabled = true;
     result.className = 'model-provider-test-result testing';
     result.textContent = '正在測試連線…';
     try {
-        const response = await apiFetch(`${API_BASE}/api/settings/providers/test`, {
+        const data = await providerJsonRequest(`${API_BASE}/api/settings/providers/test`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(payload)
         });
-        const data = await response.json();
-        if (!response.ok || !data.success) {
-            throw new Error(data.detail?.message || data.message || `HTTP ${response.status}`);
-        }
-        result.className = 'model-provider-test-result connected';
-        result.textContent = `連線成功${Number.isFinite(data.model_count) ? `，找到 ${data.model_count} 個模型` : ''}`;
+        const capabilityTestRequired = data.status === 'capability_test_required';
+        result.className = capabilityTestRequired
+            ? 'model-provider-test-result testing'
+            : 'model-provider-test-result connected';
+        result.textContent = capabilityTestRequired
+            ? 'NVIDIA API Key 已完成目錄驗證；OCR 權限尚待確認。請上傳圖片並執行 OCR 能力測試。'
+            : `連線成功${Number.isFinite(data.model_count) ? `，找到 ${data.model_count} 個模型` : ''}`;
         const selected = populateProviderModels(card, data.models || []);
         if (data.model_profile?.kind) {
             card.querySelector('[data-provider-field="model_kind"]').value =
@@ -817,6 +1130,11 @@ async function testProviderToolCapability(card) {
         ...providerCapabilityPayload(card)
     };
     const key = card.querySelector('[data-provider-field="api_key"]').value.trim();
+    if (card.providerCredentialResetRequired && !key) {
+        state.dataset.verified = 'false';
+        state.textContent = '\u4f9b\u61c9\u5546\u5df2\u8b8a\u66f4\uff1b\u8acb\u8f38\u5165\u65b0 API Key\uff0c\u4e0d\u6703\u6cbf\u7528\u820a\u4f9b\u61c9\u5546\u91d1\u9470\u3002';
+        return;
+    }
     if (key) payload.api_key = key;
     button.disabled = true;
     state.dataset.verified = 'false';
@@ -844,56 +1162,104 @@ async function testProviderModelCard(card) {
     const button = card.querySelector('[data-test-provider-model]');
     const output = card.querySelector('[data-provider-response]');
     const status = card.querySelector('[data-provider-selected-status]');
+    if (card.providerModelTestPending) return;
     syncProviderSourceModel(card);
     const model = card.querySelector('[data-provider-field="selected_model"]').value.trim();
     if (!model) {
         output.textContent = '請先測試連線並選擇模型。';
         return;
     }
-    const payload = {
-        provider_id: card.querySelector('[data-provider-field="id"]').value.trim().toLowerCase(),
-        provider_type: card.querySelector('[data-provider-field="provider_type"]').value,
-        base_url: card.querySelector('[data-provider-field="base_url"]').value.trim(),
-        ...providerCapabilityPayload(card),
-        model,
-        system_prompt: card.querySelector('[data-provider-test-system]').value.trim(),
-        prompt: card.querySelector('[data-provider-test-prompt]').value.trim()
-    };
+    syncProviderCapabilityDefaults(card);
+    const modelKind = card.querySelector('[data-provider-field="model_kind"]').value;
+    const usesNemotronOcrAdapter = providerModelUsesNemotronOcrAdapter(modelKind, model);
+    if (providerModelBlocksTest(modelKind, model)) {
+        const adapterMessage = providerModelAdapterStatus(modelKind, model);
+        const adapterStatus = card.querySelector('[data-provider-adapter-status]');
+        if (adapterStatus) {
+            adapterStatus.hidden = false;
+            adapterStatus.textContent = adapterMessage;
+        }
+        button.disabled = true;
+        output.hidden = true;
+        status.textContent = adapterMessage;
+        return;
+    }
     const key = card.querySelector('[data-provider-field="api_key"]').value.trim();
-    if (key) payload.api_key = key;
+    if (card.providerCredentialResetRequired && !key) {
+        output.hidden = false;
+        output.className = 'model-provider-response failed';
+        output.textContent = '\u4f9b\u61c9\u5546\u5df2\u8b8a\u66f4\uff1b\u8acb\u8f38\u5165\u65b0 API Key\uff0c\u4e0d\u6703\u6cbf\u7528\u820a\u4f9b\u61c9\u5546\u91d1\u9470\u3002';
+        status.textContent = '\u5c1a\u672a\u63d0\u4f9b\u65b0\u4f9b\u61c9\u5546 API Key';
+        return;
+    }
+    if (usesNemotronOcrAdapter) {
+        const validation = providerOcrFileValidation(
+            card.querySelector('[data-provider-ocr-file]')?.files?.[0]
+        );
+        if (!validation.valid) {
+            output.hidden = false;
+            output.className = 'model-provider-response failed';
+            output.textContent = validation.message;
+            status.textContent = 'OCR \u5716\u7247\u9a57\u8b49\u5931\u6557';
+            syncProviderOcrFileState(card);
+            return;
+        }
+    }
+    card.providerModelTestPending = true;
     button.disabled = true;
+    output.hidden = false;
     output.className = 'model-provider-response testing';
-    output.textContent = '正在等待指定模型回覆…';
+    output.textContent = usesNemotronOcrAdapter
+        ? '正在上傳圖片並等待 OCR 辨識…'
+        : '正在等待指定模型回覆…';
     try {
-        const response = await apiFetch(`${API_BASE}/api/settings/providers/model-test`, {
+        const payload = {
+            provider_id: card.querySelector('[data-provider-field="id"]').value.trim().toLowerCase(),
+            provider_type: card.querySelector('[data-provider-field="provider_type"]').value,
+            base_url: card.querySelector('[data-provider-field="base_url"]').value.trim(),
+            ...providerCapabilityPayload(card),
+            model
+        };
+        if (usesNemotronOcrAdapter) {
+            payload.image_data_url = await readProviderOcrImageDataUrl(card);
+        } else {
+            payload.system_prompt = card.querySelector('[data-provider-test-system]').value.trim();
+            payload.prompt = card.querySelector('[data-provider-test-prompt]').value.trim();
+        }
+        if (key) payload.api_key = key;
+        const data = await providerJsonRequest(`${API_BASE}/api/settings/providers/model-test`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(payload)
         });
-        const data = await response.json();
-        if (!response.ok || !data.success) {
-            throw new Error(data.detail?.message || data.message || `HTTP ${response.status}`);
-        }
         output.className = 'model-provider-response connected';
         output.textContent = data.response;
         // A normal text response never grants tool capability. Only the
         // dedicated tool-test route may return an accepted attestation.
-        status.textContent = `已由 ${data.selected_model} 實際回覆；儲存後可在 Model Manager 切換`;
         const kind = data.model_profile?.kind || payload.model_kind;
-        status.textContent = kind === 'chat'
-            ? `\u5df2\u7531 ${data.selected_model} \u5be6\u969b\u56de\u8986\uff1b\u5132\u5b58\u5f8c\u53ef\u5728 Model Manager \u5207\u63db`
-            : `\u5df2\u7531 ${data.selected_model} \u5b8c\u6210\u5c08\u7528${kind === 'translation' ? '\u7ffb\u8b6f' : ''}\u6e2c\u8a66\uff1b\u4e0d\u6703\u5217\u5165 Agent \u6a21\u578b`;
+        status.textContent = usesNemotronOcrAdapter
+            ? `\u5df2\u7531 ${data.selected_model} \u5b8c\u6210 OCR \u5716\u7247\u80fd\u529b\u6e2c\u8a66\uff1b\u4e0d\u6703\u5217\u5165 Agent \u6a21\u578b`
+            : kind === 'chat'
+                ? `\u5df2\u7531 ${data.selected_model} \u5be6\u969b\u56de\u8986\uff1b\u5132\u5b58\u5f8c\u53ef\u5728 Model Manager \u5207\u63db`
+                : `\u5df2\u7531 ${data.selected_model} \u5b8c\u6210\u5c08\u7528${kind === 'translation' ? '\u7ffb\u8b6f' : ''}\u6e2c\u8a66\uff1b\u4e0d\u6703\u5217\u5165 Agent \u6a21\u578b`;
     } catch (error) {
         output.className = 'model-provider-response failed';
-        output.textContent = error.message;
-        status.textContent = '模型回覆驗證失敗';
+        output.textContent = error?.message || '無法完成模型能力測試。';
+        status.textContent = usesNemotronOcrAdapter ? 'OCR 能力測試失敗' : '模型回覆驗證失敗';
     } finally {
-        button.disabled = false;
+        card.providerModelTestPending = false;
+        button.disabled = usesNemotronOcrAdapter ? !syncProviderOcrFileState(card) : false;
     }
 }
 
 async function saveModelProviderSecrets() {
     const cards = [...(modelProviderList?.querySelectorAll('[data-provider-card]') || [])];
+    for (const card of cards) {
+        const apiKey = card.querySelector('[data-provider-field="api_key"]').value.trim();
+        if (card.providerCredentialResetRequired && !apiKey) {
+            throw new Error('\u4f9b\u61c9\u5546\u5df2\u8b8a\u66f4\uff1b\u5fc5\u9808\u8f38\u5165\u65b0 API Key \u624d\u80fd\u5132\u5b58\u3002');
+        }
+    }
     for (const card of cards) {
         const providerId = card.querySelector('[data-provider-field="id"]').value.trim().toLowerCase();
         const apiKeyInput = card.querySelector('[data-provider-field="api_key"]');
@@ -909,6 +1275,19 @@ async function saveModelProviderSecrets() {
             throw new Error(data.detail?.message || data.message || `無法保存 ${providerId} 金鑰`);
         }
         apiKeyInput.value = '';
+        card.providerCredentialResetRequired = false;
+    }
+    for (const card of cards) {
+        const retiredProviderId = String(card.dataset.retiredProviderId || '').trim().toLowerCase();
+        if (!retiredProviderId) continue;
+        const response = await apiFetch(`${API_BASE}/api/settings/secrets/${encodeURIComponent(retiredProviderId)}`, {
+            method: 'DELETE'
+        });
+        if (!response.ok) {
+            const data = await response.json().catch(() => ({}));
+            throw new Error(data.detail?.message || data.message || `\u7121\u6cd5\u522a\u9664 ${retiredProviderId} \u820a\u91d1\u9470`);
+        }
+        delete card.dataset.retiredProviderId;
     }
     for (const providerId of removedProviderSecrets) {
         const response = await apiFetch(`${API_BASE}/api/settings/secrets/${encodeURIComponent(providerId)}`, {

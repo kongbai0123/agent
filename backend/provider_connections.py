@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
+import math
 import re
 import secrets
 from dataclasses import dataclass
@@ -62,6 +65,26 @@ PROVIDER_CATALOG: dict[str, dict[str, Any]] = {
         "source_hosts": [],
         "credential_kind": "optional_api_key",
     },
+}
+
+
+NVIDIA_NEMOTRON_OCR_V2_MODEL = "nvidia/nemotron-ocr-v2"
+NVIDIA_NEMOTRON_OCR_V2_ENDPOINT = (
+    "https://ai.api.nvidia.com/v1/cv/nvidia/nemotron-ocr-v2"
+)
+MAX_OCR_IMAGE_BYTES = 128 * 1024
+MAX_OCR_IMAGE_BASE64_CHARS = 180_000
+MAX_OCR_IMAGE_DATA_URL_CHARS = 180_032
+MAX_OCR_RESPONSE_CHARS = 12_000
+MAX_OCR_DETECTIONS = 500
+MAX_OCR_DETECTION_TEXT_CHARS = 1_000
+_OCR_DATA_URL = re.compile(
+    r"\Adata:(image/(?:png|jpeg));base64,([A-Za-z0-9+/]*={0,2})\Z",
+    re.IGNORECASE,
+)
+_OCR_IMAGE_SIGNATURES = {
+    "image/png": lambda value: value.startswith(b"\x89PNG\r\n\x1a\n"),
+    "image/jpeg": lambda value: value.startswith(b"\xff\xd8\xff"),
 }
 
 
@@ -293,6 +316,79 @@ def _chat_url(base_url: str) -> str:
     return f"{base_url.rstrip('/')}/chat/completions"
 
 
+def _is_nvidia_nemotron_ocr_v2(provider_type: str, model_id: str) -> bool:
+    return (
+        str(provider_type or "").strip().casefold() == "nvidia"
+        and str(model_id or "").strip().casefold()
+        == NVIDIA_NEMOTRON_OCR_V2_MODEL
+    )
+
+
+def _validated_ocr_image_data_url(value: str) -> str:
+    data_url = str(value or "").strip()
+    if not data_url:
+        raise ProviderConnectionFailure(
+            "PROVIDER_OCR_IMAGE_REQUIRED",
+            "OCR 能力測試需要一張 PNG 或 JPEG 圖片。",
+            400,
+            True,
+        )
+    if len(data_url) > MAX_OCR_IMAGE_DATA_URL_CHARS:
+        raise ProviderConnectionFailure(
+            "PROVIDER_OCR_IMAGE_TOO_LARGE",
+            (
+                "NVIDIA OCR 直接上傳的 base64 內容必須小於 180,000 "
+                "字元（約 130 KiB）；目前尚未實作 Assets API。"
+            ),
+            413,
+            True,
+        )
+    matched = _OCR_DATA_URL.fullmatch(data_url)
+    if matched is None:
+        raise ProviderConnectionFailure(
+            "PROVIDER_OCR_IMAGE_INVALID",
+            "OCR 測試只接受 base64 PNG 或 JPEG data URL。",
+            400,
+            True,
+        )
+    mime_type = matched.group(1).casefold()
+    encoded = matched.group(2)
+    if len(encoded) >= MAX_OCR_IMAGE_BASE64_CHARS:
+        raise ProviderConnectionFailure(
+            "PROVIDER_OCR_IMAGE_TOO_LARGE",
+            (
+                "NVIDIA OCR 直接上傳的 base64 內容必須小於 180,000 "
+                "字元（約 130 KiB）；目前尚未實作 Assets API。"
+            ),
+            413,
+            True,
+        )
+    try:
+        decoded = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ProviderConnectionFailure(
+            "PROVIDER_OCR_IMAGE_INVALID",
+            "OCR 圖片的 base64 內容無效。",
+            400,
+            True,
+        ) from exc
+    if len(decoded) > MAX_OCR_IMAGE_BYTES:
+        raise ProviderConnectionFailure(
+            "PROVIDER_OCR_IMAGE_TOO_LARGE",
+            "OCR 測試圖片解碼後不得超過 128 KiB。",
+            413,
+            True,
+        )
+    if not decoded or not _OCR_IMAGE_SIGNATURES[mime_type](decoded):
+        raise ProviderConnectionFailure(
+            "PROVIDER_OCR_IMAGE_INVALID",
+            "OCR 圖片內容與宣告的 PNG 或 JPEG 格式不符。",
+            400,
+            True,
+        )
+    return f"data:{mime_type};base64,{encoded}"
+
+
 def _failure_for_status(
     status_code: int,
     response_text: str = "",
@@ -348,6 +444,52 @@ def _failure_for_status(
         "PROVIDER_TEST_FAILED",
         f"API 端點拒絕模型清單測試（HTTP {status_code}）。",
         502,
+        True,
+    )
+
+
+def _specialized_endpoint_failure(model_kind: str) -> ProviderConnectionFailure:
+    capability = "OCR / vision" if model_kind == "vision" else "rerank"
+    return ProviderConnectionFailure(
+        "PROVIDER_SPECIALIZED_ENDPOINT_REQUIRED",
+        (
+            f"此 {capability} 模型不能使用 OpenAI-compatible "
+            "`/models` + `/chat/completions` 測試。它需要供應商專用 "
+            "Hosted Endpoint 或自行部署的 NIM，並搭配對應 Adapter；"
+            "這是模型能力／端點不相容，不代表 API Key 無效。"
+        ),
+        409,
+        True,
+    )
+
+
+def _inventory_miss_failure(
+    *,
+    provider_type: str,
+    model_id: str,
+    from_source_url: bool,
+) -> ProviderConnectionFailure:
+    """Describe a successful inventory lookup without blaming credentials."""
+
+    if provider_type == "nvidia" and from_source_url:
+        inferred_kind = model_capability_profile(model_id).kind
+        if inferred_kind in {"vision", "rerank"}:
+            return _specialized_endpoint_failure(inferred_kind)
+        return ProviderConnectionFailure(
+            "PROVIDER_MODEL_NOT_IN_CATALOG",
+            (
+                "NVIDIA 已接受此 API Key 的 OpenAI-compatible 模型清單請求，"
+                "但來源網址的模型未出現在 `/models` 清單中。它可能使用"
+                "專用 Hosted Endpoint，或是 download-only／需自行部署的 NIM；"
+                "請依模型頁的 API Reference 選擇正確端點。"
+            ),
+            409,
+            True,
+        )
+    return ProviderConnectionFailure(
+        "PROVIDER_MODEL_NOT_FOUND",
+        "The selected model is not available from this provider inventory.",
+        400,
         True,
     )
 
@@ -417,17 +559,30 @@ def test_provider_connection(
         model_id = item.get("id") if isinstance(item, dict) else item
         if model_id:
             models.append(str(model_id)[:200])
-    scoped_model = (
-        model_id_from_source_url(normalized_type, source_url)
-        or _clean_model_id(selected_model)
-    )
+    source_model = model_id_from_source_url(normalized_type, source_url)
+    scoped_model = source_model or _clean_model_id(selected_model)
     if scoped_model:
+        if _is_nvidia_nemotron_ocr_v2(normalized_type, scoped_model):
+            # A successful OpenAI-compatible catalog lookup verifies the key,
+            # but this allowlisted OCR model uses a separate hosted API.  Do
+            # not claim OCR entitlement until an image capability test passes.
+            profile = model_capability_profile(scoped_model)
+            return {
+                "status": "capability_test_required",
+                "provider_type": normalized_type,
+                "endpoint": endpoint,
+                "credential_verified": True,
+                "capability_test_required": True,
+                "capability_endpoint": NVIDIA_NEMOTRON_OCR_V2_ENDPOINT,
+                "model_count": 1,
+                "models": [scoped_model],
+                "model_profile": profile.as_dict(),
+            }
         if scoped_model not in models:
-            raise ProviderConnectionFailure(
-                "PROVIDER_MODEL_NOT_FOUND",
-                "The model identified by the URL is not available from this API key.",
-                400,
-                True,
+            raise _inventory_miss_failure(
+                provider_type=normalized_type,
+                model_id=scoped_model,
+                from_source_url=bool(source_model),
             )
         models = [scoped_model]
     profile_payload: dict[str, Any] = {}
@@ -526,6 +681,173 @@ def _provider_model_reply(response: requests.Response) -> str:
             True,
         )
     return reply
+
+
+def _post_nvidia_nemotron_ocr_v2_request(
+    *,
+    api_key: str,
+    image_data_url: str,
+    timeout_seconds: float,
+) -> requests.Response:
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {str(api_key or '').strip()}",
+    }
+    request_payload = {
+        "input": [{"type": "image_url", "url": image_data_url}],
+        "merge_levels": ["paragraph"],
+    }
+    try:
+        response = requests.post(
+            NVIDIA_NEMOTRON_OCR_V2_ENDPOINT,
+            headers=headers,
+            json=request_payload,
+            timeout=max(2.0, min(float(timeout_seconds), 30.0)),
+            allow_redirects=False,
+        )
+    except requests.Timeout as exc:
+        raise ProviderConnectionFailure(
+            "PROVIDER_OCR_TIMEOUT",
+            "NVIDIA OCR 能力測試逾時。",
+            504,
+            True,
+        ) from exc
+    except requests.RequestException as exc:
+        raise ProviderConnectionFailure(
+            "PROVIDER_OCR_UNREACHABLE",
+            "無法連線到 NVIDIA OCR 專用端點。",
+            502,
+            True,
+        ) from exc
+    if response.status_code < 200 or response.status_code >= 300:
+        # Never surface OCR upstream bodies: some providers echo the submitted
+        # data URL (or a prefix of it) in validation errors.
+        if response.status_code in {401, 403, 429} or response.status_code >= 500:
+            raise _failure_for_status(
+                response.status_code,
+                "",
+                secret=str(api_key or "").strip(),
+            )
+        raise ProviderConnectionFailure(
+            "PROVIDER_OCR_REQUEST_REJECTED",
+            (
+                "NVIDIA OCR 端點拒絕了圖片能力測試"
+                f"（HTTP {response.status_code}）；請確認圖片格式與大小。"
+            ),
+            400,
+            True,
+        )
+    return response
+
+
+def _bounded_number(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    if not math.isfinite(number):
+        return None
+    return max(-1_000_000_000.0, min(1_000_000_000.0, number))
+
+
+def _nvidia_ocr_result(response: requests.Response) -> dict[str, Any]:
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise ProviderConnectionFailure(
+            "PROVIDER_OCR_INVALID_RESPONSE",
+            "NVIDIA OCR 端點未回傳有效 JSON。",
+            502,
+            True,
+        ) from exc
+    pages = payload.get("data") if isinstance(payload, Mapping) else None
+    if not isinstance(pages, list) or not pages:
+        raise ProviderConnectionFailure(
+            "PROVIDER_OCR_INVALID_RESPONSE",
+            "NVIDIA OCR 端點回傳了不支援的結果格式。",
+            502,
+            True,
+        )
+
+    detections: list[dict[str, Any]] = []
+    response_parts: list[str] = []
+    response_chars = 0
+    total_detections = 0
+    truncated = False
+    for page in pages:
+        raw_detections = page.get("text_detections") if isinstance(page, Mapping) else None
+        if not isinstance(raw_detections, list):
+            raise ProviderConnectionFailure(
+                "PROVIDER_OCR_INVALID_RESPONSE",
+                "NVIDIA OCR 端點回傳了不支援的結果格式。",
+                502,
+                True,
+            )
+        total_detections += len(raw_detections)
+        for raw_detection in raw_detections:
+            if len(detections) >= MAX_OCR_DETECTIONS:
+                truncated = True
+                break
+            if not isinstance(raw_detection, Mapping):
+                continue
+            prediction = raw_detection.get("text_prediction")
+            if not isinstance(prediction, Mapping):
+                continue
+            raw_text = str(prediction.get("text") or "").strip()
+            if not raw_text:
+                continue
+            detection_text = raw_text[:MAX_OCR_DETECTION_TEXT_CHARS]
+            if len(raw_text) > len(detection_text):
+                truncated = True
+            detection: dict[str, Any] = {"text": detection_text}
+            confidence = _bounded_number(prediction.get("confidence"))
+            if confidence is not None:
+                detection["confidence"] = max(0.0, min(1.0, confidence))
+
+            bounding_box = raw_detection.get("bounding_box")
+            raw_points = (
+                bounding_box.get("points")
+                if isinstance(bounding_box, Mapping)
+                else None
+            )
+            points: list[dict[str, float]] = []
+            for raw_point in raw_points[:8] if isinstance(raw_points, list) else []:
+                if not isinstance(raw_point, Mapping):
+                    continue
+                x = _bounded_number(raw_point.get("x"))
+                y = _bounded_number(raw_point.get("y"))
+                if x is not None and y is not None:
+                    points.append({
+                        "x": max(0.0, min(1.0, x)),
+                        "y": max(0.0, min(1.0, y)),
+                    })
+            if points:
+                detection["bounding_box"] = {"points": points}
+            detections.append(detection)
+
+            if response_chars < MAX_OCR_RESPONSE_CHARS:
+                separator = "\n" if response_parts else ""
+                remaining = MAX_OCR_RESPONSE_CHARS - response_chars - len(separator)
+                if remaining > 0:
+                    part = raw_text[:remaining]
+                    response_parts.append(f"{separator}{part}")
+                    response_chars += len(separator) + len(part)
+                    if len(part) < len(raw_text):
+                        truncated = True
+                else:
+                    truncated = True
+            else:
+                truncated = True
+
+    text_content = "".join(response_parts).strip()
+    return {
+        "response": text_content,
+        "detections": detections,
+        "detection_count": len(detections),
+        "detections_truncated": (
+            truncated or total_detections > len(detections)
+        ),
+    }
 
 
 _TOOL_PROBE_NAME = "workbench_capability_probe"
@@ -801,6 +1123,8 @@ def test_provider_tool_call(
             "passed": True,
         },
     }
+
+
 def test_provider_model_response(
     *,
     provider_type: str,
@@ -813,8 +1137,39 @@ def test_provider_model_response(
     model_kind: str = "",
     supports_tools: bool = False,
     language_pair: str = "",
+    source_url: str = "",
+    image_data_url: str = "",
 ) -> dict[str, Any]:
     selected_model = str(model or "").strip()
+    normalized_type = str(provider_type or "").strip().casefold()
+    if _is_nvidia_nemotron_ocr_v2(normalized_type, selected_model):
+        validated_image = _validated_ocr_image_data_url(image_data_url)
+        profile = model_capability_profile(selected_model)
+        connection = test_provider_connection(
+            provider_type=normalized_type,
+            base_url=base_url,
+            api_key=api_key,
+            timeout_seconds=min(timeout_seconds, 10.0),
+            selected_model=selected_model,
+            model_kind=profile.kind,
+            supports_tools=False,
+        )
+        response = _post_nvidia_nemotron_ocr_v2_request(
+            api_key=api_key,
+            image_data_url=validated_image,
+            timeout_seconds=timeout_seconds,
+        )
+        result = _nvidia_ocr_result(response)
+        return {
+            "status": "responded",
+            "selected_model": selected_model,
+            **result,
+            "model_profile": profile.as_dict(),
+            "credential_verified": bool(
+                connection.get("credential_verified", True)
+            ),
+            "capability_endpoint": NVIDIA_NEMOTRON_OCR_V2_ENDPOINT,
+        }
     profile = model_capability_profile(
         selected_model,
         model_kind=model_kind,
@@ -828,18 +1183,29 @@ def test_provider_model_response(
             supports_tools=False,
             language_pair=system_prompt,
         )
+    if profile.kind in {"vision", "rerank"}:
+        raise _specialized_endpoint_failure(profile.kind)
     if profile.kind not in {"chat", "translation"}:
         raise ProviderConnectionFailure(
             "PROVIDER_MODEL_KIND_REQUIRED",
-            "Classify this model as chat or use its specialized capability adapter.",
+            "This model cannot use chat/completions; use its specialized capability adapter.",
             400,
             False,
+        )
+    user_prompt = str(prompt or "").strip()
+    if not user_prompt:
+        raise ProviderConnectionFailure(
+            "PROVIDER_MODEL_PROMPT_REQUIRED",
+            "Chat and translation model tests require a text prompt.",
+            400,
+            True,
         )
     connection = test_provider_connection(
         provider_type=provider_type,
         base_url=base_url,
         api_key=api_key,
         timeout_seconds=min(timeout_seconds, 10.0),
+        source_url=source_url,
         selected_model=selected_model,
         model_kind=profile.kind,
         supports_tools=profile.supports_tools,
@@ -856,7 +1222,7 @@ def test_provider_model_response(
     messages = []
     if str(system_prompt or "").strip():
         messages.append({"role": "system", "content": str(system_prompt).strip()})
-    messages.append({"role": "user", "content": str(prompt).strip()})
+    messages.append({"role": "user", "content": user_prompt})
     request_payload = build_openai_chat_payload(
         {
             "model": selected_model,

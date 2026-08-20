@@ -15,6 +15,8 @@ from api.schemas.settings import (
 from provider_connections import (
     ProviderConnectionFailure,
     catalog_payload,
+    infer_provider_type,
+    normalize_provider_endpoint,
     test_provider_connection,
     test_provider_model_response,
     test_provider_tool_call,
@@ -27,8 +29,65 @@ from secret_store import (
 )
 
 
+def _resolve_provider_api_key(
+    request_data: ProviderConnectionTestRequest,
+    load_settings: Callable[[], Dict[str, Any]],
+) -> str:
+    supplied = (
+        request_data.api_key.get_secret_value()
+        if request_data.api_key is not None
+        else ""
+    )
+    if supplied:
+        return supplied
+
+    provider_id = str(request_data.provider_id).strip().casefold()
+    configured = next(
+        (
+            item
+            for item in load_settings().get("model_providers", [])
+            if isinstance(item, dict)
+            and str(item.get("id") or "").strip().casefold() == provider_id
+        ),
+        None,
+    )
+    if configured is None:
+        raise ProviderConnectionFailure(
+            "PROVIDER_KEY_REQUIRED",
+            "目前的供應商設定沒有可安全重用的 API Key；請重新輸入。",
+            400,
+            True,
+        )
+
+    requested_type = str(request_data.provider_type or "").strip().casefold()
+    configured_type = infer_provider_type(configured)
+    requested_endpoint = normalize_provider_endpoint(
+        requested_type,
+        request_data.base_url,
+    )
+    configured_endpoint = normalize_provider_endpoint(
+        configured_type,
+        str(configured.get("base_url") or ""),
+    )
+    if (
+        configured_type != requested_type
+        or configured_endpoint != requested_endpoint
+    ):
+        raise ProviderConnectionFailure(
+            "PROVIDER_SECRET_CONTEXT_MISMATCH",
+            (
+                "已儲存的 API Key 屬於不同的供應商或端點；"
+                "請為目前設定重新輸入 API Key。"
+            ),
+            409,
+            True,
+        )
+    return get_provider_secret(provider_id)
+
+
 def _build_provider_model_test_router(
     *,
+    load_settings: Callable[[], Dict[str, Any]],
     error_payload: Callable[..., Dict[str, Any]],
     require_local: Optional[Callable[[Request], None]],
 ) -> APIRouter:
@@ -42,22 +101,19 @@ def _build_provider_model_test_router(
         if require_local is not None:
             require_local(request)
         provider_id = str(request_data.provider_id).strip().casefold()
-        supplied = (
-            request_data.api_key.get_secret_value()
-            if request_data.api_key is not None
-            else ""
-        )
         try:
             result = test_provider_model_response(
                 provider_type=request_data.provider_type,
                 base_url=request_data.base_url,
-                api_key=supplied or get_provider_secret(provider_id),
+                api_key=_resolve_provider_api_key(request_data, load_settings),
                 model=request_data.model,
                 system_prompt=request_data.system_prompt,
                 prompt=request_data.prompt,
                 model_kind=request_data.model_kind,
                 supports_tools=request_data.supports_tools,
                 language_pair=request_data.language_pair,
+                source_url=request_data.source_url,
+                image_data_url=request_data.image_data_url,
             )
         except (ValueError, ProviderConnectionFailure) as exc:
             raise HTTPException(
@@ -78,16 +134,11 @@ def _build_provider_model_test_router(
         if require_local is not None:
             require_local(request)
         provider_id = str(request_data.provider_id).strip().casefold()
-        supplied = (
-            request_data.api_key.get_secret_value()
-            if request_data.api_key is not None
-            else ""
-        )
         try:
             result = test_provider_tool_call(
                 provider_type=request_data.provider_type,
                 base_url=request_data.base_url,
-                api_key=supplied or get_provider_secret(provider_id),
+                api_key=_resolve_provider_api_key(request_data, load_settings),
                 model=request_data.model,
                 model_kind=request_data.model_kind,
                 supports_tools=request_data.supports_tools,
@@ -114,7 +165,11 @@ def build_provider_settings_router(
     require_local: Optional[Callable[[Request], None]] = None,
 ) -> APIRouter:
     router = APIRouter()
-    router.include_router(_build_provider_model_test_router(error_payload=error_payload, require_local=require_local))
+    router.include_router(_build_provider_model_test_router(
+        load_settings=load_settings,
+        error_payload=error_payload,
+        require_local=require_local,
+    ))
 
     def local(request: Request) -> None:
         if require_local is not None:
@@ -140,16 +195,11 @@ def build_provider_settings_router(
     def post_provider_test(request_data: ProviderConnectionTestRequest, request: Request):
         local(request)
         provider_id = str(request_data.provider_id).strip().casefold()
-        supplied = (
-            request_data.api_key.get_secret_value()
-            if request_data.api_key is not None
-            else ""
-        )
         try:
             result = test_provider_connection(
                 provider_type=request_data.provider_type,
                 base_url=request_data.base_url,
-                api_key=supplied or get_provider_secret(provider_id),
+                api_key=_resolve_provider_api_key(request_data, load_settings),
                 source_url=request_data.source_url,
                 selected_model=request_data.selected_model,
                 model_kind=request_data.model_kind,
