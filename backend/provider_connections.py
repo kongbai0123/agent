@@ -648,6 +648,47 @@ def _post_provider_model_request(
     return response
 
 
+def _specialized_model_endpoint(
+    *, provider_type: str, base_url: str, model: str, kind: str
+) -> str:
+    if provider_type == "nvidia":
+        short = model.split("/", 1)[-1]
+        operation = "reranking" if kind == "rerank" else "embeddings"
+        return f"https://ai.api.nvidia.com/v1/retrieval/nvidia/{short}/{operation}"
+    base = normalize_provider_endpoint(provider_type, base_url).rstrip("/")
+    operation = "ranking" if kind == "rerank" else "embeddings"
+    return f"{base}/{operation}" if base.endswith("/v1") else f"{base}/v1/{operation}"
+
+
+def _post_specialized_model_test(
+    *, endpoint: str, api_key: str, payload: Mapping[str, Any], timeout_seconds: float
+) -> requests.Response:
+    secret = str(api_key or "").strip()
+    try:
+        response = requests.post(
+            endpoint,
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {secret}",
+            },
+            json=dict(payload),
+            timeout=max(2.0, min(float(timeout_seconds), 30.0)),
+            allow_redirects=False,
+        )
+    except requests.Timeout as exc:
+        raise ProviderConnectionFailure(
+            "PROVIDER_MODEL_TIMEOUT", "The specialized model test timed out.", 504, True
+        ) from exc
+    except requests.RequestException as exc:
+        raise ProviderConnectionFailure(
+            "PROVIDER_MODEL_UNREACHABLE", "Unable to reach the specialized model.", 502, True
+        ) from exc
+    if not 200 <= response.status_code < 300:
+        raise _failure_for_status(response.status_code, response.text, secret=secret)
+    return response
+
+
 def _provider_model_reply(response: requests.Response) -> str:
     try:
         payload = response.json()
@@ -1183,7 +1224,92 @@ def test_provider_model_response(
             supports_tools=False,
             language_pair=system_prompt,
         )
-    if profile.kind in {"vision", "rerank"}:
+    if profile.kind == "rerank":
+        query = str(prompt or "").strip()
+        if not query:
+            raise ProviderConnectionFailure(
+                "PROVIDER_MODEL_PROMPT_REQUIRED",
+                "Rerank capability tests require a text query.",
+                400,
+                True,
+            )
+        endpoint = _specialized_model_endpoint(
+            provider_type=normalized_type,
+            base_url=base_url,
+            model=selected_model,
+            kind="rerank",
+        )
+        response = _post_specialized_model_test(
+            endpoint=endpoint,
+            api_key=api_key,
+            payload={
+                "model": selected_model,
+                "query": {"text": query[:8192]},
+                "passages": [
+                    {"text": f"{query[:4000]} — relevant capability probe"},
+                    {"text": "Unrelated capability probe passage."},
+                ],
+                "truncate": "END",
+            },
+            timeout_seconds=timeout_seconds,
+        )
+        try:
+            rankings = response.json().get("rankings")
+        except ValueError as exc:
+            raise ProviderConnectionFailure(
+                "PROVIDER_MODEL_INVALID_RESPONSE", "Rerank returned invalid JSON.", 502, True
+            ) from exc
+        if not isinstance(rankings, list) or not rankings:
+            raise ProviderConnectionFailure(
+                "PROVIDER_MODEL_INVALID_RESPONSE", "Rerank returned no rankings.", 502, True
+            )
+        return {
+            "status": "responded",
+            "selected_model": selected_model,
+            "response": "Rerank 能力測試通過。",
+            "model_profile": profile.as_dict(),
+            "credential_verified": True,
+            "capability_endpoint": endpoint,
+        }
+    if profile.kind == "embedding":
+        endpoint = _specialized_model_endpoint(
+            provider_type=normalized_type,
+            base_url=base_url,
+            model=selected_model,
+            kind="embedding",
+        )
+        embedding_payload: dict[str, Any] = {
+            "model": selected_model,
+            "input": [str(prompt or "capability verification")[:8192]],
+        }
+        if normalized_type == "nvidia":
+            embedding_payload["input_type"] = "query"
+        response = _post_specialized_model_test(
+            endpoint=endpoint,
+            api_key=api_key,
+            payload=embedding_payload,
+            timeout_seconds=timeout_seconds,
+        )
+        try:
+            rows = response.json().get("data")
+        except ValueError as exc:
+            raise ProviderConnectionFailure(
+                "PROVIDER_MODEL_INVALID_RESPONSE", "Embedding returned invalid JSON.", 502, True
+            ) from exc
+        vector = rows[0].get("embedding") if isinstance(rows, list) and rows and isinstance(rows[0], Mapping) else None
+        if not isinstance(vector, list) or not vector:
+            raise ProviderConnectionFailure(
+                "PROVIDER_MODEL_INVALID_RESPONSE", "Embedding returned no vector.", 502, True
+            )
+        return {
+            "status": "responded",
+            "selected_model": selected_model,
+            "response": "Embedding 能力測試通過。",
+            "model_profile": profile.as_dict(),
+            "credential_verified": True,
+            "capability_endpoint": endpoint,
+        }
+    if profile.kind == "vision":
         raise _specialized_endpoint_failure(profile.kind)
     if profile.kind not in {"chat", "translation"}:
         raise ProviderConnectionFailure(

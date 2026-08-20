@@ -6,7 +6,9 @@
         deps: null,
         initialized: false,
         editingId: null,
-        lifecycleRevision: 0
+        lifecycleRevision: 0,
+        governance: null,
+        governanceTab: 'connections'
     };
 
     const byId = id => document.getElementById(id);
@@ -147,6 +149,175 @@
         state.deps?.createIcons?.();
     }
 
+    async function governanceJson(path, options = {}) {
+        const response = await state.deps.apiFetch(`${state.deps.apiBase}${path}`, options);
+        let data = {};
+        try { data = await response.json(); } catch (_) { /* handled below */ }
+        if (!response.ok || data.success === false) {
+            throw new Error(data.detail?.message || data.message || `HTTP ${response.status}`);
+        }
+        return data;
+    }
+
+    function selectedProjectId() {
+        return String(state.deps?.getProjectId?.() || '').trim();
+    }
+
+    function expiryLabel(credential) {
+        if (credential?.never_expires) return '永不到期（使用者聲明）';
+        if (!credential?.expires_at) return '到期日未知';
+        const days = credential.remaining_days;
+        return `${new Date(credential.expires_at).toLocaleString()}${Number.isFinite(days) ? ` · 剩餘 ${days} 天` : ''}`;
+    }
+
+    function renderGovernanceHealth() {
+        const data = state.governance || {};
+        const totals = data.usage?.totals || {};
+        const historical = data.usage?.historical_runs?.totals || {};
+        const costs = Object.entries(data.usage?.cost_by_currency || {});
+        const metrics = byId('cloud-governance-usage-summary');
+        if (metrics) metrics.innerHTML = [
+            ['本機觀測請求', Number(totals.requests || 0).toLocaleString()],
+            ['本機觀測 Token', Number(totals.total_tokens || 0).toLocaleString()],
+            ['OCR 圖片量', `${Number(totals.image_megabytes || 0).toFixed(3)} MiB`],
+            ['估算成本', costs.length ? costs.map(([currency, amount]) => `${currency} ${Number(amount).toFixed(4)}`).join(' · ') : '尚無可估算費率'],
+            ['歷史 Run（唯讀）', `${Number(historical.runs || 0).toLocaleString()} · ${Number(historical.total_tokens || 0).toLocaleString()} Token（不計入預算）`]
+        ].map(([label, value]) => `<div class="governance-metric"><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></div>`).join('');
+        const list = byId('cloud-governance-provider-health');
+        if (!list) return;
+        list.innerHTML = (data.providers || []).map(item => {
+            const operational = item.operational || {};
+            const credential = item.credential || {};
+            const stateName = operational.state || 'unknown';
+            const retry = operational.retry_at ? ` · 可重試 ${new Date(operational.retry_at).toLocaleString()}` : '';
+            const expiryDate = credential.expires_at ? String(credential.expires_at).slice(0, 10) : '';
+            return `<article class="governance-provider" data-governance-provider="${escapeHtml(item.provider_id)}">
+                <div><strong>${escapeHtml(item.provider_id)}</strong><span>${escapeHtml(item.model_id || '尚未選擇模型')}</span></div>
+                <div class="governance-provider-state ${escapeHtml(stateName)}">${escapeHtml(stateName)}${escapeHtml(retry)}</div>
+                <div class="governance-expiry-row">
+                    <span>${escapeHtml(expiryLabel(credential))}</span>
+                    <input type="date" class="settings-input" data-governance-expiry value="${escapeHtml(expiryDate)}" aria-label="API Key 到期日">
+                    <label><input type="checkbox" data-governance-never ${credential.never_expires ? 'checked' : ''}>永不到期</label>
+                    <button type="button" class="btn btn-secondary compact" data-save-credential-metadata>儲存到期資訊</button>
+                </div>
+                <small>最後驗證：${escapeHtml(credential.last_verified_at ? new Date(credential.last_verified_at).toLocaleString() : '尚未完成')}</small>
+            </article>`;
+        }).join('') || '<div class="cloud-llm-empty compact">尚未導入供應商。</div>';
+    }
+
+    function budgetInput(scope, period, metric, value) {
+        const labels = { requests: '請求數', tokens: 'Token', cost: '成本' };
+        return `<label>${scope === 'global' ? '全域' : '專案'} ${period === 'daily' ? '每日' : '每月'} ${labels[metric]}
+            <input class="settings-input" type="number" min="0" step="${metric === 'cost' ? '0.0001' : '1'}"
+                   data-budget-scope="${scope}" data-budget-period="${period}" data-budget-metric="${metric}"
+                   value="${escapeHtml(value || '')}" placeholder="未設定"></label>`;
+    }
+
+    function renderGovernanceBudgets() {
+        const data = state.governance || {};
+        const fields = byId('cloud-governance-budget-fields');
+        if (fields) {
+            const rows = [];
+            for (const [scope, record] of [['global', data.global_budget], ['project', data.project_budget]]) {
+                if (!record) continue;
+                for (const period of ['daily', 'monthly']) {
+                    for (const metric of ['requests', 'tokens', 'cost']) rows.push(budgetInput(scope, period, metric, record.policy?.[period]?.[metric]));
+                }
+            }
+            fields.innerHTML = rows.join('') || '<p>請先選擇專案以設定專案預算。</p>';
+        }
+        const policy = data.routing_policy;
+        const card = byId('cloud-governance-routing-card');
+        if (card) card.hidden = !policy;
+        if (!policy) return;
+        byId('cloud-routing-mode').value = policy.mode || 'ask';
+        byId('cloud-consent-text').checked = policy.data_consent?.text === true;
+        byId('cloud-consent-images').checked = policy.data_consent?.images === true;
+        byId('cloud-consent-documents').checked = policy.data_consent?.documents === true;
+        const providerBox = byId('cloud-routing-providers');
+        if (providerBox) providerBox.innerHTML = providers().map(provider => `<label><input type="checkbox" data-routing-provider="${escapeHtml(provider.id)}" ${(policy.allowed_providers || []).includes(provider.id) ? 'checked' : ''}>允許 ${escapeHtml(provider.label || provider.id)}</label>`).join('');
+    }
+
+    async function loadGovernance() {
+        const projectId = selectedProjectId();
+        const path = projectId
+            ? `/api/model-governance/overview?project_id=${encodeURIComponent(projectId)}`
+            : '/api/model-governance/overview';
+        state.governance = await governanceJson(path);
+        renderGovernanceHealth();
+        renderGovernanceBudgets();
+    }
+
+    async function showGovernanceTab(tab) {
+        state.governanceTab = tab;
+        document.querySelectorAll('[data-cloud-governance-tab]').forEach(button => {
+            const active = button.dataset.cloudGovernanceTab === tab;
+            button.classList.toggle('active', active);
+            button.setAttribute('aria-selected', String(active));
+        });
+        for (const name of ['connections', 'health', 'budgets']) {
+            const panel = byId(`cloud-governance-${name}-panel`);
+            if (panel) panel.hidden = name !== tab;
+        }
+        if (tab !== 'connections') {
+            try { await loadGovernance(); }
+            catch (error) { state.deps?.showToast?.(`治理資料載入失敗：${error.message}`, 'error'); }
+        }
+    }
+
+    async function saveCredentialMetadata(button) {
+        const card = button.closest('[data-governance-provider]');
+        const providerId = card?.dataset.governanceProvider;
+        if (!providerId) return;
+        const never = card.querySelector('[data-governance-never]').checked;
+        const date = card.querySelector('[data-governance-expiry]').value;
+        const expiresAt = !never && date ? new Date(`${date}T23:59:59`).toISOString() : null;
+        await governanceJson(`/api/model-governance/providers/${encodeURIComponent(providerId)}/credential-metadata`, {
+            method: 'PUT', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ expires_at: expiresAt, expiry_source: date && !never ? 'user_declared' : 'unknown', never_expires: never })
+        });
+        await loadGovernance();
+        state.deps?.showToast?.('API Key 到期資訊已更新', 'success');
+    }
+
+    function collectBudget(scope, existing) {
+        const policy = { daily: {}, monthly: {} };
+        document.querySelectorAll(`[data-budget-scope="${scope}"]`).forEach(input => {
+            const value = Number(input.value || 0);
+            if (value > 0) policy[input.dataset.budgetPeriod][input.dataset.budgetMetric] = value;
+        });
+        policy.daily.currency = existing?.policy?.daily?.currency || 'USD';
+        policy.monthly.currency = existing?.policy?.monthly?.currency || 'USD';
+        return policy;
+    }
+
+    async function saveBudgets() {
+        const data = state.governance || {};
+        const operations = [['global', 'global', data.global_budget]];
+        if (data.project_budget && selectedProjectId()) operations.push(['project', selectedProjectId(), data.project_budget]);
+        for (const [scope, id, record] of operations) {
+            await governanceJson(`/api/model-governance/budgets/${scope}/${encodeURIComponent(id)}`, {
+                method: 'PUT', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ revision: record.revision || 0, timezone: record.timezone || 'Asia/Taipei', policy: collectBudget(scope, record) })
+            });
+        }
+        await loadGovernance();
+        state.deps?.showToast?.('模型預算已儲存', 'success');
+    }
+
+    async function saveRouting() {
+        const projectId = selectedProjectId();
+        const policy = state.governance?.routing_policy;
+        if (!projectId || !policy) return;
+        const allowed = [...document.querySelectorAll('[data-routing-provider]:checked')].map(input => input.dataset.routingProvider);
+        await governanceJson(`/api/projects/${encodeURIComponent(projectId)}/model-routing-policy`, {
+            method: 'PUT', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ revision: policy.revision || 0, mode: byId('cloud-routing-mode').value, allowed_providers: allowed, data_consent: { text: byId('cloud-consent-text').checked, images: byId('cloud-consent-images').checked, documents: byId('cloud-consent-documents').checked }, preferred_models: policy.preferred_models || [] })
+        });
+        await loadGovernance();
+        state.deps?.showToast?.('專案選模與資料同意政策已儲存', 'success');
+    }
+
     function setView(view) {
         const library = byId('cloud-llm-library-view');
         const editor = byId('cloud-llm-editor-view');
@@ -161,6 +332,7 @@
             .forEach(card => { card.hidden = false; });
         setView('library');
         renderLibrary();
+        showGovernanceTab(state.governanceTab);
     }
 
     async function discardEditor() {
@@ -303,6 +475,14 @@
         byId('cloud-llm-editor-cancel')?.addEventListener('click', discardEditor);
         byId('cloud-llm-save')?.addEventListener('click', persistAndReturn);
         byId('btn-add-model-provider')?.addEventListener('click', addProvider);
+        document.querySelectorAll('[data-cloud-governance-tab]').forEach(button => button.addEventListener('click', () => showGovernanceTab(button.dataset.cloudGovernanceTab)));
+        byId('cloud-governance-refresh')?.addEventListener('click', loadGovernance);
+        byId('cloud-governance-provider-health')?.addEventListener('click', event => {
+            const button = event.target.closest('[data-save-credential-metadata]');
+            if (button) saveCredentialMetadata(button).catch(error => state.deps?.showToast?.(`到期資訊儲存失敗：${error.message}`, 'error'));
+        });
+        byId('cloud-governance-save-budgets')?.addEventListener('click', () => saveBudgets().catch(error => state.deps?.showToast?.(`預算儲存失敗：${error.message}`, 'error')));
+        byId('cloud-governance-save-routing')?.addEventListener('click', () => saveRouting().catch(error => state.deps?.showToast?.(`選模政策儲存失敗：${error.message}`, 'error')));
         byId('btn-open-cloud-llm-settings')?.addEventListener('click', () => {
             byId('settings-modal')?.classList.remove('active');
             open();
@@ -330,5 +510,10 @@
         renderLibrary();
     }
 
-    window.workbenchCloudLlm = { init, open, close, deactivate, render: renderLibrary };
+    function openTab(tab = 'connections') {
+        state.governanceTab = ['connections', 'health', 'budgets'].includes(tab) ? tab : 'connections';
+        open();
+    }
+
+    window.workbenchCloudLlm = { init, open, openTab, close, deactivate, render: renderLibrary };
 })();

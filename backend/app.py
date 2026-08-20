@@ -41,6 +41,7 @@ from api.routes.connectors import (
 from api.routes.extensions import build_extensions_router
 from api.routes.hermes import build_hermes_router
 from api.routes.models import build_models_router
+from api.routes.model_governance import build_model_governance_router
 from api.routes.n8n_agent import build_n8n_agent_router
 from api.routes.n8n_agent_tasks import build_n8n_agent_tasks_router
 from api.routes.n8n_gmail import build_n8n_gmail_router
@@ -111,6 +112,11 @@ from model_client import (
     provider_for_model,
     uses_local_model_slot,
 )
+from model_governance import (
+    GovernanceError,
+    ModelGovernanceService,
+    configure_model_governance,
+)
 from n8n_gmail_crypto import AesGcmContentCipher
 from n8n_gmail_delivery import N8nDeliveryDispatcher
 from n8n_gmail_secrets import N8nGmailSecretStore
@@ -152,6 +158,7 @@ from project_storage import (
 )
 from project_skill_runtime import ProjectSkillRuntime
 from project_skills import ProjectSkillError, ProjectSkillStore
+from provider_tools import runtime_tool_definitions as provider_runtime_tool_definitions
 from runtime_manager import export_session_zip
 from startup_progress import complete_startup, read_startup_status, update_startup
 from structured_log import redact
@@ -195,6 +202,7 @@ extension_registry: Any = None
 connector_service: Optional[ConnectorService] = None
 host_tool_runtime: Optional[HostToolRuntime] = None
 mcp_coordinator: Optional[MCPSettingsCoordinator] = None
+model_governance: Optional[ModelGovernanceService] = None
 application_event_loop: Optional[asyncio.AbstractEventLoop] = None
 hook_dispatcher = configure_hook_dispatcher(
     HookDispatcher.from_builtin_plugins([DiagnosticBuiltinHookPlugin()])
@@ -1359,6 +1367,9 @@ update_startup(
     progress_percent=28,
 )
 database.init_db()
+model_governance = ModelGovernanceService(database_module=database)
+model_governance.initialize()
+configure_model_governance(model_governance)
 hook_audit_store = HookAuditStore(database_module=database)
 hook_dispatcher = configure_hook_dispatcher(
     HookDispatcher.from_builtin_plugins(
@@ -1530,11 +1541,21 @@ async def _prepare_project_tools(project_id: str) -> None:
         )
         if extension_is_enabled(definition.extension_id, project_id)
     )
+    provider_definitions = tuple(
+        definition
+        for definition in provider_runtime_tool_definitions(
+            load_settings(),
+            project_id=project_id,
+            manifest_digest=_manifest_digest,
+            governance=model_governance,
+        )
+        if extension_is_enabled(definition.extension_id, project_id)
+    )
     # One atomic project replacement avoids a window where a healthy MCP tool
     # disappears while connector definitions are refreshed.
     tool_registry.replace_project(
         project_id,
-        (*connector_definitions, *mcp_definitions),
+        (*connector_definitions, *provider_definitions, *mcp_definitions),
     )
 
 
@@ -1563,6 +1584,53 @@ def _resolve_tool_scope(definition: Any, call: Any) -> ToolScopeState:
             resource_revision=0,
             connection_enabled=not bool(definition.requires_connection),
             reason=str(health.get("error_code") or health.get("status") or ""),
+        )
+    if str(definition.extension_id).startswith("provider."):
+        provider_id = str(definition.extension_id).split(".", 1)[1]
+        configured = next(
+            (
+                item for item in load_settings().get("model_providers") or []
+                if isinstance(item, dict)
+                and str(item.get("id") or "").casefold() == provider_id
+            ),
+            None,
+        )
+        try:
+            item = extension_registry.get(
+                definition.extension_id,
+                call.project_id,
+                synchronize=False,
+            )
+        except ExtensionError as exc:
+            raise ToolUnavailableError(str(exc), details={"tool_name": definition.name}) from exc
+        model_id = str((configured or {}).get("selected_model") or "")
+        endpoint = str((configured or {}).get("base_url") or "")
+        decision = model_governance.operational_decision(
+            provider_id,
+            model_id=model_id,
+            endpoint=endpoint,
+        )
+        policy = model_governance.get_routing_policy(call.project_id)
+        consent = policy.get("data_consent") or {}
+        allowed_provider = provider_id in set(policy.get("allowed_providers") or [])
+        consent_allowed = allowed_provider and bool(consent.get("text"))
+        if definition.name == "provider.ocr_image":
+            consent_allowed = consent_allowed and bool(consent.get("images"))
+        return ToolScopeState(
+            installed=bool(item.get("installed")),
+            trusted=bool(item.get("trusted")),
+            enabled=bool(item.get("effective_enabled")),
+            healthy=(
+                bool(configured)
+                and configured.get("enabled") is True
+                and decision.allowed
+                and consent_allowed
+            ),
+            resource_allowed=consent_allowed,
+            manifest_sha256=str(item.get("manifest_sha256") or ""),
+            resource_revision=int(policy.get("revision") or 0),
+            connection_enabled=True,
+            reason=(decision.message if not decision.allowed else "Project data consent is required" if not consent_allowed else ""),
         )
     try:
         invocation = connector_service.resolve_tool_invocation(
@@ -1720,6 +1788,16 @@ settings_router = build_settings_router(
     error_payload=error_payload,
     require_local=require_local_workbench,
     hermes_rollout_guard=guard_hermes_rollout,
+    model_governance=model_governance,
+)
+
+model_governance_router = build_model_governance_router(
+    service=model_governance,
+    load_settings=load_settings,
+    model_inventory=model_inventory,
+    require_local=require_local_workbench,
+    require_project=database.get_project,
+    error_payload=error_payload,
 )
 
 project_skill_store = ProjectSkillStore(
@@ -2425,6 +2503,7 @@ for domain_router in (
     run_results_router,
     settings_router,
     models_router,
+    model_governance_router,
 ):
     app.include_router(domain_router)
 
@@ -2451,8 +2530,7 @@ async def chat(request: ChatRequest):
         )
 
     existing_session = database.get_session(session_id)
-    database.create_session(session_id, model=model)
-    session = database.get_session(session_id)
+    session = existing_session
     if session and str(session.get("mode") or "").casefold() == "email":
         raise HTTPException(
             status_code=404,
@@ -2469,6 +2547,101 @@ async def chat(request: ChatRequest):
     )
     project_id = project.get("id") if project else None
     settings = {**settings, "_extension_project_id": project_id}
+
+    requested_model = model
+    routing_decision: Dict[str, Any] = {}
+    if request.routing_proposal_id:
+        selected = model_governance.consume_proposal(
+            request.routing_proposal_id,
+            project_id=project_id,
+            requested_model=requested_model,
+        )
+        if not selected:
+            raise HTTPException(
+                status_code=409,
+                detail=error_payload(
+                    "ROUTING_PROPOSAL_INVALID",
+                    "選模建議已過期、已使用或不屬於目前專案。",
+                    recoverable=True,
+                ),
+            )
+        model = selected
+        routing_decision = {
+            "routed": model != requested_model,
+            "requested_model": requested_model,
+            "model": model,
+            "reason": "user_approved",
+            "provider": provider_for_model(settings, model, project_id=project_id).provider,
+        }
+    else:
+        try:
+            requested_profile = model_profile_for_model(
+                settings,
+                requested_model,
+                project_id=project_id,
+            )
+        except (ValueError, PermissionError):
+            requested_profile = None
+        requested_route_blocked = False
+        if requested_profile is not None and requested_profile.eligible_for_primary:
+            try:
+                requested_provider = provider_for_model(
+                    settings,
+                    requested_model,
+                    project_id=project_id,
+                )
+                requested_route_blocked = not model_governance.operational_decision(
+                    requested_provider.provider,
+                    model_id=(requested_model.split("::", 1)[1] if "::" in requested_model else requested_model),
+                    endpoint=requested_provider.base_url,
+                    claim_half_open=False,
+                ).allowed
+            except (ValueError, PermissionError):
+                requested_route_blocked = True
+        if requested_profile is None or not requested_profile.eligible_for_primary or requested_route_blocked:
+            try:
+                resolution = model_governance.resolve_route(
+                    project_id=project_id,
+                    run_id=run_id,
+                    requested_model=requested_model,
+                    requirements={
+                        "kind": "chat",
+                        "tools": False,
+                        "text": True,
+                        "images": bool(request.images),
+                        "documents": bool(request.attachment_ids or request.temporary_context_id),
+                    },
+                    candidates=model_inventory(),
+                )
+            except GovernanceError as exc:
+                raise HTTPException(
+                    status_code=exc.status_code,
+                    detail=error_payload(exc.code, str(exc), exc.details, recoverable=True),
+                ) from exc
+            if resolution.get("status") == "approval_required":
+                raise HTTPException(
+                    status_code=409,
+                    detail=error_payload(
+                        "MODEL_ROUTE_APPROVAL_REQUIRED",
+                        "目前模型不適合此工作或暫時不可用；請確認建議模型後再執行。",
+                        resolution,
+                        recoverable=True,
+                    ),
+                )
+            model = str(resolution["model"])
+            routing_decision = {
+                "routed": model != requested_model,
+                "requested_model": requested_model,
+                **resolution,
+            }
+    settings["_governance_run_id"] = run_id
+    settings["_governance_budget_override_id"] = request.budget_override_id or ""
+
+    if existing_session is None:
+        database.create_session(session_id, model=model)
+        session = database.get_session(session_id)
+    elif model != requested_model:
+        database.update_session_metadata(session_id, model=model)
 
     if existing_session is None:
         await hook_dispatcher.observe(
@@ -2804,6 +2977,7 @@ async def chat(request: ChatRequest):
             history_snapshot=history_snapshot,
             archive_sync=sync_session_archive,
             host_tool_runtime=host_tool_runtime,
+            routing_decision=routing_decision,
         ):
             yield item
 

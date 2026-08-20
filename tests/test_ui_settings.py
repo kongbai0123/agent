@@ -16,8 +16,8 @@ import local_session
 class UiSettingsTests(unittest.TestCase):
     def test_modal_size_defaults_and_validation_bounds(self):
         defaults = workbench_app.load_settings()
-        self.assertEqual(defaults["settings_modal_width"], 900)
-        self.assertEqual(defaults["settings_modal_height"], 650)
+        self.assertEqual(defaults["settings_modal_width"], 1040)
+        self.assertEqual(defaults["settings_modal_height"], 760)
 
         minimum = workbench_app.validate_settings({
             "settings_modal_width": 100,
@@ -27,7 +27,7 @@ class UiSettingsTests(unittest.TestCase):
             "settings_modal_width": 9999,
             "settings_modal_height": 9999,
         })
-        self.assertEqual((minimum["settings_modal_width"], minimum["settings_modal_height"]), (620, 420))
+        self.assertEqual((minimum["settings_modal_width"], minimum["settings_modal_height"]), (760, 540))
         self.assertEqual((maximum["settings_modal_width"], maximum["settings_modal_height"]), (3840, 2160))
 
     def test_ui_state_endpoint_persists_without_browser_storage(self):

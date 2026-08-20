@@ -80,6 +80,14 @@ def test_each_hermes_field_uses_an_accessible_bulleted_hover_help():
     ):
         assert contract in HERMES_SETTINGS_JS
     assert "toggle.addEventListener('click'" not in HERMES_SETTINGS_JS
+    for portal_contract in (
+        "function bindFieldHelp(toggle, help, disclosure)",
+        "document.body.appendChild(help)",
+        "surfaceRect.right - width - 8",
+        "scrollSurface?.addEventListener('scroll', close, { once: true })",
+        "closeActiveFieldHelp()",
+    ):
+        assert portal_contract in HERMES_SETTINGS_JS
     assert "help.hidden" not in HERMES_SETTINGS_JS
     for selector in (
         ".hermes-field-title-row",
@@ -92,10 +100,11 @@ def test_each_hermes_field_uses_an_accessible_bulleted_hover_help():
     assert ".hermes-field-help-disclosure:hover .hermes-field-help" in STYLE_CSS
     assert ".hermes-field-help-disclosure:focus-within .hermes-field-help" in STYLE_CSS
     assert ".hermes-settings-field:has(.hermes-field-help-trigger:hover)" in STYLE_CSS
-    assert "right: 0" in STYLE_CSS
-    assert "z-index: 541" in STYLE_CSS
+    assert "position: fixed" in STYLE_CSS
+    assert "z-index: calc(var(--z-modal) + 1)" in STYLE_CSS
+    assert '.hermes-field-help[data-open="true"]' in STYLE_CSS
     assert "visibility: hidden" in STYLE_CSS
-    assert 'hermes-settings.js?v=1.1.2-hover-help-dom' in INDEX_HTML
+    assert 'hermes-settings.js?v=1.1.3-tooltip-layer' in INDEX_HTML
 
 
 def test_secret_is_never_collected_or_persisted_by_the_panel():
@@ -165,6 +174,10 @@ class FakeElement {
         this.checked = false;
         this.disabled = false;
         this.hidden = false;
+        this.style = {
+            setProperty(name, value) { this[name] = value; },
+            removeProperty(name) { delete this[name]; },
+        };
     }
     set id(value) {
         this._id = String(value);
@@ -186,15 +199,29 @@ class FakeElement {
     }
     setAttribute(name, value) { this.attributes[name] = String(value); }
     addEventListener(name, listener) { this.listeners[name] = listener; }
+    getBoundingClientRect() {
+        if (this.className === 'hermes-field-help') {
+            return { left: 0, right: 320, top: 0, bottom: 110, width: 320, height: 110 };
+        }
+        return { left: 344, right: 372, top: 190, bottom: 218, width: 28, height: 28 };
+    }
 }
 
+const fakeBody = new FakeElement('body');
 global.document = {
+    body: fakeBody,
     createElement: tag => new FakeElement(tag),
     querySelector: selector => selector.startsWith('#')
         ? elements.get(selector.slice(1)) || null
         : null,
 };
-global.window = { API_BASE: '' };
+global.window = {
+    API_BASE: '',
+    innerWidth: 750,
+    innerHeight: 516,
+    addEventListener() {},
+    removeEventListener() {},
+};
 vm.runInThisContext(fs.readFileSync(process.argv[1], 'utf8'), {
     filename: process.argv[1],
 });
@@ -291,6 +318,20 @@ const invalidStatuses = [
     if (rolloutHelp.parentElement !== rolloutHelpTrigger.parentElement
         || rolloutHelp.parentElement?.className !== 'hermes-field-help-disclosure') {
         throw new Error('rollout help must remain inside its hovered disclosure');
+    }
+    const rolloutDisclosure = rolloutHelp.parentElement;
+    rolloutHelpTrigger.listeners.mouseenter();
+    if (rolloutHelp.parentElement !== fakeBody || rolloutHelp.dataset.open !== 'true') {
+        throw new Error('opened help must enter the body portal above modal clipping');
+    }
+    const portalLeft = Number.parseInt(rolloutHelp.style.left, 10);
+    const portalWidth = Number.parseInt(rolloutHelp.style.width, 10);
+    if (portalLeft < 12 || portalLeft + portalWidth > 738) {
+        throw new Error('portal help must stay inside viewport bounds');
+    }
+    rolloutHelpTrigger.listeners.mouseleave();
+    if (rolloutHelp.parentElement !== rolloutDisclosure || rolloutHelp.dataset.open) {
+        throw new Error('closed help must return to its disclosure without stale layer state');
     }
     if (!toggle || toggle.disabled) throw new Error('verified toggle must be enabled');
     if (JSON.stringify(rolloutPercentage.children.map(option => option.value))

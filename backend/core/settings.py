@@ -31,8 +31,8 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "tts_auto_play": False,
     "tts_rate": 1.0,
     "ui_language": "zh-TW",
-    "settings_modal_width": 900,
-    "settings_modal_height": 650,
+      "settings_modal_width": 1040,
+      "settings_modal_height": 760,
     "chat_run_budget_seconds": 600,
     "cancel_release_grace_seconds": 4.0,
     "cancel_release_poll_seconds": 0.5,
@@ -526,13 +526,13 @@ def load_settings() -> Dict[str, Any]:
 
 def normalize_modal_size(data: Mapping[str, Any]) -> Dict[str, int]:
     try:
-        width = int(data.get("settings_modal_width", 900))
-        height = int(data.get("settings_modal_height", 650))
+        width = int(data.get("settings_modal_width", 1040))
+        height = int(data.get("settings_modal_height", 760))
     except (TypeError, ValueError) as exc:
         raise ValueError("Settings modal dimensions must be integers.") from exc
     return {
-        "settings_modal_width": max(620, min(3840, width)),
-        "settings_modal_height": max(420, min(2160, height)),
+        "settings_modal_width": max(760, min(3840, width)),
+        "settings_modal_height": max(540, min(2160, height)),
     }
 
 

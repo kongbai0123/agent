@@ -345,10 +345,11 @@ def test_connection_test_lists_models_without_sending_project_content():
 
 
 def test_rerank_model_test_never_calls_chat_completions():
+    completed = _response(200, {"rankings": [{"index": 0, "logit": 1.0}]})
     with patch("provider_connections.requests.get") as get, patch(
-        "provider_connections.requests.post"
-    ) as post, pytest.raises(ProviderConnectionFailure) as failure:
-        run_model_test(
+        "provider_connections.requests.post", return_value=completed
+    ) as post:
+        result = run_model_test(
             provider_type="nvidia",
             base_url="https://integrate.api.nvidia.com/v1",
             api_key="nvapi-test-secret",
@@ -357,10 +358,38 @@ def test_rerank_model_test_never_calls_chat_completions():
             prompt="Hello.",
         )
 
-    assert failure.value.code == "PROVIDER_SPECIALIZED_ENDPOINT_REQUIRED"
-    assert failure.value.status_code == 409
+    assert result["status"] == "responded"
+    assert result["model_profile"]["kind"] == "rerank"
     get.assert_not_called()
-    post.assert_not_called()
+    assert post.call_args.args[0].endswith(
+        "/llama-nemotron-rerank-1b-v2/reranking"
+    )
+    assert "/chat/completions" not in post.call_args.args[0]
+    assert post.call_args.kwargs["json"]["query"] == {"text": "Hello."}
+
+
+def test_embedding_model_test_uses_bounded_embedding_endpoint():
+    completed = _response(200, {"data": [{"embedding": [0.1, 0.2]}]})
+    with patch("provider_connections.requests.get") as get, patch(
+        "provider_connections.requests.post", return_value=completed
+    ) as post:
+        result = run_model_test(
+            provider_type="nvidia",
+            base_url="https://integrate.api.nvidia.com/v1",
+            api_key="nvapi-test-secret",
+            model="nvidia/llama-nemotron-embed-1b-v2",
+            model_kind="embedding",
+            system_prompt="",
+            prompt="semantic probe",
+        )
+
+    assert result["status"] == "responded"
+    assert result["model_profile"]["kind"] == "embedding"
+    get.assert_not_called()
+    assert post.call_args.args[0].endswith(
+        "/llama-nemotron-embed-1b-v2/embeddings"
+    )
+    assert post.call_args.kwargs["json"]["input"] == ["semantic probe"]
 
 
 def test_nemotron_ocr_v2_uses_exact_endpoint_payload_and_bounded_result():

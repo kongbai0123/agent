@@ -41,6 +41,7 @@
         statusError: null,
         settingsRequestId: 0,
         statusRequestId: 0,
+        closeActiveHelp: null,
     };
 
     function element(tag, className = '', text = null) {
@@ -68,6 +69,68 @@
     function helpItems(value) {
         const items = Array.isArray(value) ? value : value ? [value] : [];
         return items.map(item => String(item || '').trim()).filter(Boolean);
+    }
+
+    function closeActiveFieldHelp() {
+        state.closeActiveHelp?.();
+        state.closeActiveHelp = null;
+    }
+
+    function bindFieldHelp(toggle, help, disclosure) {
+        const scrollSurface = toggle.closest?.('.settings-panes') || null;
+        let opened = false;
+
+        const close = () => {
+            if (!opened) return;
+            opened = false;
+            delete help.dataset.open;
+            help.style.removeProperty('left');
+            help.style.removeProperty('top');
+            help.style.removeProperty('width');
+            disclosure.appendChild(help);
+            window.removeEventListener('resize', close);
+            scrollSurface?.removeEventListener('scroll', close);
+            if (state.closeActiveHelp === close) state.closeActiveHelp = null;
+        };
+        const open = () => {
+            if (opened) return;
+            closeActiveFieldHelp();
+            opened = true;
+            const triggerRect = toggle.getBoundingClientRect();
+            const surfaceRect = scrollSurface?.getBoundingClientRect?.() || {
+                left: 0,
+                right: window.innerWidth,
+                top: 0,
+                bottom: window.innerHeight,
+                width: window.innerWidth,
+            };
+            const width = Math.max(180, Math.min(320, surfaceRect.width - 16, window.innerWidth - 24));
+            document.body.appendChild(help);
+            help.style.width = `${width}px`;
+            help.dataset.open = 'true';
+            const helpRect = help.getBoundingClientRect();
+            const minLeft = Math.max(12, surfaceRect.left + 8);
+            const maxLeft = Math.max(minLeft, Math.min(window.innerWidth - width - 12, surfaceRect.right - width - 8));
+            const left = Math.min(maxLeft, Math.max(minLeft, triggerRect.left));
+            const below = triggerRect.bottom + 6;
+            const top = below + helpRect.height <= surfaceRect.bottom - 8
+                ? below
+                : Math.max(surfaceRect.top + 8, triggerRect.top - helpRect.height - 6);
+            help.style.left = `${Math.round(left)}px`;
+            help.style.top = `${Math.round(top)}px`;
+            state.closeActiveHelp = close;
+            window.addEventListener('resize', close, { once: true });
+            scrollSurface?.addEventListener('scroll', close, { once: true });
+        };
+        toggle.addEventListener('mouseenter', open);
+        toggle.addEventListener('mouseleave', close);
+        toggle.addEventListener('focus', open);
+        toggle.addEventListener('blur', close);
+        toggle.addEventListener('keydown', event => {
+            if (event.key !== 'Escape') return;
+            event.preventDefault();
+            close();
+        });
     }
 
     function fieldTitle(id, labelText, helpContent = []) {
@@ -98,6 +161,7 @@
         help.appendChild(list);
         const disclosure = element('span', 'hermes-field-help-disclosure');
         disclosure.append(toggle, help);
+        bindFieldHelp(toggle, help, disclosure);
         row.appendChild(disclosure);
         return { row, help };
     }
@@ -934,6 +998,7 @@
     }
 
     function buildPanel() {
+        closeActiveFieldHelp();
         const root = element('section', 'hermes-settings-panel');
         root.dataset.hermesSettings = 'panel';
         root.setAttribute('aria-labelledby', 'hermes-settings-title');
@@ -1217,6 +1282,7 @@
     }
 
     function destroy() {
+        closeActiveFieldHelp();
         state.settingsRequestId += 1;
         state.statusRequestId += 1;
         state.container?.replaceChildren();

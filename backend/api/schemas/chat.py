@@ -27,3 +27,11 @@ class ChatRequest(BaseModel):
         default=None,
         pattern=r"^run_[A-Za-z0-9_-]{8,80}$",
     )
+    routing_proposal_id: Optional[str] = Field(
+        default=None,
+        pattern=r"^mrp_[a-f0-9]{32}$",
+    )
+    budget_override_id: Optional[str] = Field(
+        default=None,
+        pattern=r"^mbo_[a-f0-9]{32}$",
+    )

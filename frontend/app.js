@@ -1424,6 +1424,7 @@ async function initApp() {
 
     // 2. 確保側欄資料完成，再啟用完整 Workbench 控制器。
     await sessionsPromise;
+    void refreshProviderGovernanceAlert();
     loadRagStatus(); // P1-2
 
     // 3. 載入第十階段高階功能控制器
@@ -1435,6 +1436,27 @@ async function initApp() {
 
     // 4. Workbench Shell（Rail / Chips / Dashboard / Wizard / Palette / Inspector）
     initWorkbench(status);
+}
+
+async function refreshProviderGovernanceAlert() {
+    const banner = document.getElementById('provider-governance-banner');
+    const text = document.getElementById('provider-governance-banner-text');
+    if (!banner || !text) return;
+    try {
+        const path = activeProjectId
+            ? `${API_BASE}/api/model-governance/overview?project_id=${encodeURIComponent(activeProjectId)}`
+            : `${API_BASE}/api/model-governance/overview`;
+        const response = await apiFetch(path);
+        const data = await response.json();
+        if (!response.ok) throw new Error();
+        const critical = (data.providers || []).find(item => ['auth_required', 'quota_exhausted', 'permission_denied'].includes(item.operational?.state));
+        const expiring = (data.providers || []).find(item => Number.isFinite(item.credential?.remaining_days) && item.credential.remaining_days <= 30);
+        if (critical) text.textContent = `${critical.provider_id} 目前無法使用（${critical.operational.state}），系統已停止將新工作送往此連線。`;
+        else if (expiring) text.textContent = `${expiring.provider_id} API Key 將在 ${expiring.credential.remaining_days} 天內到期。`;
+        banner.hidden = !(critical || expiring);
+    } catch (_) {
+        banner.hidden = true;
+    }
 }
 
 function getOllamaConnectionStatus(status) {
@@ -3303,12 +3325,38 @@ async function handleChatSubmit(e) {
             question: sendQuestion,
             temporaryContextEnabled: !!temporaryContextText,
         });
-        const response = await apiFetch(`${API_BASE}/api/chat`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload),
-            signal: chatAbort.signal
-        });
+        let response;
+        while (true) {
+            response = await apiFetch(`${API_BASE}/api/chat`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload),
+                signal: chatAbort.signal
+            });
+            if (response.status !== 409) break;
+            let conflict = {};
+            try { conflict = await response.json(); } catch (_) { break; }
+            const detail = conflict.detail || {};
+            if (detail.code !== 'MODEL_ROUTE_APPROVAL_REQUIRED' || !detail.detail?.proposal_id) {
+                const failure = new Error(detail.message || `HTTP error! status: ${response.status}`);
+                failure.code = detail.code;
+                failure.detail = detail.detail;
+                throw failure;
+            }
+            const proposal = detail.detail;
+            const approved = window.confirm(
+                `目前模型不適合這項工作。\n\n建議改用：${proposal.selected_model}\n原因：${proposal.reason || '能力需求'}\n\n按「確定」只批准本次切換。`
+            );
+            if (!approved) throw new Error('使用者取消模型切換。');
+            const approvalResponse = await apiFetch(`${API_BASE}/api/model-routing/proposals/${encodeURIComponent(proposal.proposal_id)}/approve`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ remember_project: false }),
+                signal: chatAbort.signal
+            });
+            if (!approvalResponse.ok) throw new Error('模型切換批准已逾時或無法送達。');
+            payload.routing_proposal_id = proposal.proposal_id;
+        }
         
         if (!response.ok) {
             throw new Error(`HTTP error! status: ${response.status}`);
@@ -3930,7 +3978,16 @@ async function handleChatSubmit(e) {
                             chatProgressStatus = 'failed';
                             setAssistantResponsePhase(assistantMsgEl, 'clear');
                             const errorMessage = eventData.content || eventData.message || '未知錯誤';
-                            bubbleEl.innerHTML = `<span style="color: var(--danger-color)">錯誤: ${escapeHtml(errorMessage)}</span>`;
+                            const actions = Array.isArray(eventData.actions) ? eventData.actions : [];
+                            bubbleEl.innerHTML = `<div class="provider-error-card"><strong>${escapeHtml(errorMessage)}</strong>
+                                <p>${eventData.input_preserved ? '你的輸入與附件已保留；系統不會在背景持續重試此連線。' : ''}</p>
+                                <div class="provider-error-actions">${actions.map(action => `<button type="button" class="btn btn-secondary compact" data-provider-error-action="${escapeHtml(action.id)}">${escapeHtml(action.label)}</button>`).join('')}</div></div>`;
+                            bubbleEl.querySelectorAll('[data-provider-error-action]').forEach(button => button.addEventListener('click', () => {
+                                const action = button.dataset.providerErrorAction;
+                                if (action === 'update_key' || action === 'provider_settings') window.workbenchCloudLlm?.openTab?.('connections');
+                                else if (action === 'view_usage') window.workbenchCloudLlm?.openTab?.('health');
+                                else if (action === 'choose_model') openModelManager('routing');
+                            }));
                         }
                     } catch (e) {
                         console.error('Failed to parse SSE JSON:', e);
@@ -5141,13 +5198,14 @@ async function runRuntimeRebuild(apply) {
 
 function initSettingsControls() {
     const sizeStorageKey = 'settings-modal-size';
-    const defaultSize = { width: 900, height: 650 };
+    const defaultSize = { width: 1040, height: 760 };
+    const legacyDefaultSize = { width: 900, height: 650 };
     const getSizeBounds = () => {
         const maxWidth = Math.max(320, window.innerWidth - 32);
         const maxHeight = Math.max(320, window.innerHeight - 32);
         return {
-            minWidth: Math.min(620, maxWidth),
-            minHeight: Math.min(420, maxHeight),
+            minWidth: Math.min(760, maxWidth),
+            minHeight: Math.min(540, maxHeight),
             maxWidth,
             maxHeight
         };
@@ -5172,7 +5230,7 @@ function initSettingsControls() {
         try { return localStorage.getItem(sizeStorageKey) !== null; } catch (error) { return false; }
     };
     const applySize = size => {
-        if (!settingsModalBox || window.matchMedia('(max-width: 640px)').matches) {
+        if (!settingsModalBox || window.matchMedia('(max-width: 760px)').matches) {
             settingsModalBox?.style.removeProperty('width');
             settingsModalBox?.style.removeProperty('height');
             return clampSize(size || defaultSize);
@@ -5200,7 +5258,7 @@ function initSettingsControls() {
 
     if (settingsResizeHandle && settingsModalBox) {
         settingsResizeHandle.addEventListener('pointerdown', event => {
-            if (event.button !== 0 || window.matchMedia('(max-width: 640px)').matches) return;
+            if (event.button !== 0 || window.matchMedia('(max-width: 760px)').matches) return;
             event.preventDefault();
             event.stopPropagation();
             const startRect = settingsModalBox.getBoundingClientRect();
@@ -5264,7 +5322,13 @@ function initSettingsControls() {
         const hadLocalSize = hasSavedLocalSize();
         const localSize = readSavedSize();
         const serverUsesDefault = serverSize.width === defaultSize.width && serverSize.height === defaultSize.height;
-        const preferredSize = hadLocalSize && serverUsesDefault ? localSize : (hasServerSize ? serverSize : localSize);
+        const serverUsesLegacyDefault = serverSize.width === legacyDefaultSize.width
+            && serverSize.height === legacyDefaultSize.height;
+        const localUsesLegacyDefault = localSize.width === legacyDefaultSize.width
+            && localSize.height === legacyDefaultSize.height;
+        const preferredSize = serverUsesLegacyDefault && (!hadLocalSize || localUsesLegacyDefault)
+            ? defaultSize
+            : (hadLocalSize && serverUsesDefault ? localSize : (hasServerSize ? serverSize : localSize));
         currentSettingsSize = applySize(preferredSize);
         try { localStorage.setItem(sizeStorageKey, JSON.stringify(currentSettingsSize)); } catch (error) {}
         if (hadLocalSize && serverUsesDefault
@@ -5272,6 +5336,8 @@ function initSettingsControls() {
             currentSettingsSize = saveSize(currentSettingsSize);
         }
         updateRuntimeSessionLabel();
+        const settingsPanes = settingsModal.querySelector('.settings-panes');
+        if (settingsPanes) settingsPanes.scrollTop = 0;
         settingsModal.classList.add('active');
     });
 
@@ -5303,6 +5369,8 @@ function initSettingsControls() {
             
             btn.classList.add('active');
             document.getElementById(targetId).classList.add('active');
+            const settingsPanes = settingsModal.querySelector('.settings-panes');
+            if (settingsPanes) settingsPanes.scrollTop = 0;
             if (targetId === 'tab-settings-runtime') {
                 updateRuntimeSessionLabel();
                 checkRuntimeHealth();
@@ -6197,6 +6265,29 @@ function switchMmTab(tab) {
         pane.classList.toggle('active', active);
         pane.hidden = !active;
     });
+    if (tab === 'routing') loadModelRoutingSummary();
+}
+
+async function loadModelRoutingSummary() {
+    const target = document.getElementById('mm-routing-summary');
+    if (!target) return;
+    if (!activeProjectId) {
+        target.textContent = '請先選擇專案；選模政策不會使用全域寬鬆授權。';
+        return;
+    }
+    target.textContent = '載入中...';
+    try {
+        const response = await apiFetch(`${API_BASE}/api/model-governance/overview?project_id=${encodeURIComponent(activeProjectId)}`);
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.detail?.message || `HTTP ${response.status}`);
+        const policy = data.routing_policy || {};
+        const labels = { off: '關閉', ask: '先詢問', auto_within_policy: '政策內自動' };
+        const providers = (policy.allowed_providers || []).join('、') || '尚未允許雲端供應商';
+        target.innerHTML = `<div class="mm-note">模式：${escapeHtml(labels[policy.mode] || '先詢問')} · 供應商：${escapeHtml(providers)}</div>
+            <div class="mm-note">文字 ${policy.data_consent?.text ? '可傳送' : '未同意'} · 圖片 ${policy.data_consent?.images ? '可傳送' : '未同意'} · 文件 ${policy.data_consent?.documents ? '可傳送' : '未同意'}</div>`;
+    } catch (error) {
+        target.textContent = `選模政策載入失敗：${error.message}`;
+    }
 }
 function mmCard({ title, meta, badge, actions, progress }) {
     const card = document.createElement('div');
@@ -7049,12 +7140,16 @@ function initWorkbench(status) {
         reloadProviders: () => loadModelProviderSettings(currentSettings.model_providers || []),
         getSecretStatus: () => modelProviderSecretStatus,
         inferModelKind: inferredProviderModelKind,
+        getProjectId: () => activeProjectId,
         createIcons: safeCreateIcons,
         onWorkspaceOpen: () => setPrimaryWorkspace('cloud'),
         onWorkspaceClose: () => {
             setPrimaryWorkspace('chat');
             document.getElementById('rail-chat')?.focus();
         }
+    });
+    document.getElementById('provider-governance-banner-action')?.addEventListener('click', () => {
+        window.workbenchCloudLlm?.openTab?.('health');
     });
     window.workbenchN8nWorkflows?.init({
         apiFetch,
@@ -7117,6 +7212,9 @@ function initWorkbench(status) {
         }
     });
     document.getElementById('rail-models').addEventListener('click', () => openModelManager('installed'));
+    document.getElementById('mm-open-routing-settings')?.addEventListener('click', () => {
+        window.workbenchCloudLlm?.openTab?.('budgets');
+    });
     document.getElementById('rail-cloud-llm').addEventListener('click', () => window.workbenchCloudLlm?.open());
     document.getElementById('rail-extensions').addEventListener('click', () => window.workbenchExtensions?.open('installed'));
     document.getElementById('rail-settings').addEventListener('click', () => document.getElementById('btn-settings-trigger').click());

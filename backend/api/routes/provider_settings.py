@@ -25,8 +25,10 @@ from secret_store import (
     delete_provider_secret,
     get_provider_secret,
     provider_secret_statuses,
+    provider_credential_version,
     set_provider_secret,
 )
+from model_governance import ModelGovernanceService
 
 
 def _resolve_provider_api_key(
@@ -90,6 +92,7 @@ def _build_provider_model_test_router(
     load_settings: Callable[[], Dict[str, Any]],
     error_payload: Callable[..., Dict[str, Any]],
     require_local: Optional[Callable[[Request], None]],
+    model_governance: Optional[ModelGovernanceService],
 ) -> APIRouter:
     router = APIRouter()
 
@@ -116,6 +119,14 @@ def _build_provider_model_test_router(
                 image_data_url=request_data.image_data_url,
             )
         except (ValueError, ProviderConnectionFailure) as exc:
+            if model_governance is not None and isinstance(exc, ProviderConnectionFailure):
+                model_governance.observe_failure(
+                    request_data.provider_id,
+                    model_id=request_data.model,
+                    endpoint=request_data.base_url,
+                    status_code=exc.status_code,
+                    capability="ocr" if request_data.model_kind == "vision" else request_data.model_kind or "chat",
+                )
             raise HTTPException(
                 status_code=getattr(exc, "status_code", 400),
                 detail=error_payload(
@@ -124,6 +135,12 @@ def _build_provider_model_test_router(
                     recoverable=getattr(exc, "recoverable", False),
                 ),
             ) from exc
+        if model_governance is not None:
+            model_governance.mark_verified(
+                provider_id,
+                model_id=request_data.model,
+                endpoint=request_data.base_url,
+            )
         return {"success": True, "provider_id": provider_id, **result}
 
     @router.post("/api/settings/providers/tool-test")
@@ -145,6 +162,14 @@ def _build_provider_model_test_router(
                 language_pair=request_data.language_pair,
             )
         except (ValueError, ProviderConnectionFailure) as exc:
+            if model_governance is not None and isinstance(exc, ProviderConnectionFailure):
+                model_governance.observe_failure(
+                    request_data.provider_id,
+                    model_id=request_data.model,
+                    endpoint=request_data.base_url,
+                    status_code=exc.status_code,
+                    capability="tools",
+                )
             raise HTTPException(
                 status_code=getattr(exc, "status_code", 400),
                 detail=error_payload(
@@ -153,6 +178,8 @@ def _build_provider_model_test_router(
                     recoverable=getattr(exc, "recoverable", False),
                 ),
             ) from exc
+        if model_governance is not None:
+            model_governance.mark_verified(provider_id, model_id=request_data.model, endpoint=request_data.base_url)
         return {"success": True, "provider_id": provider_id, **result}
 
     return router
@@ -163,12 +190,14 @@ def build_provider_settings_router(
     load_settings: Callable[[], Dict[str, Any]],
     error_payload: Callable[..., Dict[str, Any]],
     require_local: Optional[Callable[[Request], None]] = None,
+    model_governance: Optional[ModelGovernanceService] = None,
 ) -> APIRouter:
     router = APIRouter()
     router.include_router(_build_provider_model_test_router(
         load_settings=load_settings,
         error_payload=error_payload,
         require_local=require_local,
+        model_governance=model_governance,
     ))
 
     def local(request: Request) -> None:
@@ -216,6 +245,14 @@ def build_provider_settings_router(
                 ),
             ) from exc
         except ProviderConnectionFailure as exc:
+            if model_governance is not None:
+                model_governance.observe_failure(
+                    request_data.provider_id,
+                    model_id=request_data.selected_model,
+                    endpoint=request_data.base_url,
+                    status_code=exc.status_code,
+                    capability=request_data.model_kind or "connection",
+                )
             raise HTTPException(
                 status_code=exc.status_code,
                 detail=error_payload(
@@ -224,6 +261,12 @@ def build_provider_settings_router(
                     recoverable=exc.recoverable,
                 ),
             ) from exc
+        if model_governance is not None:
+            model_governance.observe_success(
+                provider_id,
+                model_id=request_data.selected_model,
+                endpoint=request_data.base_url,
+            )
         return {"success": True, "provider_id": provider_id, **result}
 
     @router.post("/api/settings/secrets")
@@ -246,6 +289,11 @@ def build_provider_settings_router(
             )
         try:
             status = set_provider_secret(provider_id, request_data.api_key)
+            if model_governance is not None:
+                model_governance.rotate_credential(
+                    provider_id,
+                    provider_credential_version(provider_id),
+                )
         except (ValueError, RuntimeError, OSError) as exc:
             raise HTTPException(
                 status_code=400,
@@ -258,6 +306,8 @@ def build_provider_settings_router(
         local(request)
         try:
             deleted = delete_provider_secret(provider_id)
+            if deleted and model_governance is not None:
+                model_governance.clear_credential(provider_id)
         except ValueError as exc:
             raise HTTPException(
                 status_code=400,

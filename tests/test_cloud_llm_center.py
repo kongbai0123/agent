@@ -39,7 +39,7 @@ def test_deactivate_discards_an_unsaved_editor_before_hiding_workspace():
     assert "if (discardEditor) await state.deps?.reloadProviders?.()" in CENTER_JS
     assert "if (workspace) workspace.hidden = true" in CENTER_JS
     assert "if (await deactivate()) state.deps?.onWorkspaceClose?.()" in CENTER_JS
-    assert "{ init, open, close, deactivate, render: renderLibrary }" in CENTER_JS
+    assert "{ init, open, openTab, close, deactivate, render: renderLibrary }" in CENTER_JS
 
 
 def test_workspace_does_not_restore_modal_backdrop_close_behavior():

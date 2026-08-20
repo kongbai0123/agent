@@ -23,6 +23,7 @@ from chat.events import encode_sse
 from chat.generated_artifacts import persist_generated_artifacts
 from hook_runtime import HookContext, HookRuntimeError, get_hook_dispatcher
 from model_gateway import ModelGatewayDenied, get_model_gateway
+from model_governance import GovernanceError
 from model_client import (
     model_call_error,
     model_supports_tools,
@@ -427,6 +428,7 @@ class _GenerationState:
     failure: Optional[Dict[str, Any]] = None
     first_token_at: Optional[float] = None
     tool_calls: List[Dict[str, Any]] = field(default_factory=list)
+    governance_events: List[tuple[str, Dict[str, Any]]] = field(default_factory=list)
 
 
 def _model_hook_context(
@@ -517,6 +519,25 @@ async def _collect_model_round(
             )
             response = gateway_call.response
             run_control.attach(response)
+            governance_context = getattr(response, "governance_context", {})
+            if governance_context.get("recovered_from"):
+                recovered_payload = {
+                    "run_id": run_id,
+                    "project_id": project_id,
+                    "provider": str(governance_context.get("provider_id") or ""),
+                    "model": str(governance_context.get("model_id") or model),
+                    "prior_state": str(governance_context["recovered_from"]),
+                }
+                _record_public_event(run_id, "provider_recovered", recovered_payload)
+                state.governance_events.append(("provider_recovered", recovered_payload))
+            for warning in governance_context.get("warnings") or []:
+                warning_payload = {
+                    "run_id": run_id,
+                    "project_id": project_id,
+                    **dict(warning),
+                }
+                _record_public_event(run_id, "budget_warning", warning_payload)
+                state.governance_events.append(("budget_warning", warning_payload))
             if int(response.status_code) != 200:
                 state.failure = model_call_error(
                     settings,
@@ -618,6 +639,22 @@ async def _stream_model_tokens(
         )
         for content in state.answer_parts:
             yield encode_sse("token", {"content": content})
+        for event, payload in state.governance_events:
+            yield encode_sse(event, payload)
+    except GovernanceError as exc:
+        state.failure = {
+            "code": exc.code,
+            "message": str(exc),
+            "recoverable": True,
+            "detail": dict(exc.details),
+            "input_preserved": True,
+            "external_write_state": "none",
+            "actions": (
+                [{"id": "view_usage", "label": "查看用量／額度"}, {"id": "choose_model", "label": "改用其他模型"}]
+                if exc.code == "MODEL_BUDGET_EXCEEDED"
+                else [{"id": "update_key", "label": "更新 Key 並驗證"}, {"id": "choose_model", "label": "改用其他模型"}]
+            ),
+        }
     except (HookRuntimeError, ModelGatewayDenied, ValueError) as exc:
         state.failure = {
             "code": getattr(exc, "code", "MODEL_HOOK_INVALID"),
@@ -845,6 +882,21 @@ async def _stream_model_tool_loop(
                 post_chat=post_chat,
                 state=round_state,
             )
+        except GovernanceError as exc:
+            state.failure = {
+                "code": exc.code,
+                "message": str(exc),
+                "recoverable": True,
+                "detail": dict(exc.details),
+                "input_preserved": True,
+                "external_write_state": "none",
+                "actions": (
+                    [{"id": "view_usage", "label": "查看用量／額度"}, {"id": "choose_model", "label": "改用其他模型"}]
+                    if exc.code == "MODEL_BUDGET_EXCEEDED"
+                    else [{"id": "update_key", "label": "更新 Key 並驗證"}, {"id": "choose_model", "label": "改用其他模型"}]
+                ),
+            }
+            return
         except (HookRuntimeError, ModelGatewayDenied, ValueError) as exc:
             state.failure = {
                 "code": getattr(exc, "code", "MODEL_HOOK_INVALID"),
@@ -1127,6 +1179,7 @@ async def stream_basic_chat(
     archive_sync: Optional[Callable[[str], bool]] = None,
     post_chat: Optional[Callable[..., Any]] = None,
     host_tool_runtime: Any = None,
+    routing_decision: Optional[Dict[str, Any]] = None,
 ) -> AsyncIterator[str]:
     """Stream one direct model response and persist the completed turn."""
     started_at = time.time()
@@ -1161,6 +1214,16 @@ async def stream_basic_chat(
         metadata={"model": model, "runtime": "basic_chat"},
     )
     await get_hook_dispatcher().observe("run.started", runtime_context)
+    if routing_decision and routing_decision.get("routed"):
+        routed_payload = {
+            **binding,
+            "requested_model": str(routing_decision.get("requested_model") or ""),
+            "model": model,
+            "reason": str(routing_decision.get("reason") or "required_capability"),
+            "provider": str(routing_decision.get("provider") or ""),
+        }
+        _record_public_event(run_id, "model_routed", routed_payload)
+        yield encode_sse("model_routed", routed_payload)
     meta_payload = {
         **binding,
         "model": model,
@@ -1216,6 +1279,21 @@ async def stream_basic_chat(
                 "recoverable": bool(state.failure.get("recoverable", True)),
                 "content": state.failure.get("message"),
             }
+            failure_code = str(state.failure.get("code") or "")
+            governance_event = None
+            if failure_code == "MODEL_BUDGET_EXCEEDED":
+                governance_event = "budget_blocked"
+            elif failure_code.startswith("PROVIDER_"):
+                governance_event = "provider_suspended"
+            if governance_event:
+                governance_payload = {
+                    **binding,
+                    "code": failure_code,
+                    "model": model,
+                    "detail": dict(state.failure.get("detail") or {}),
+                }
+                _record_public_event(run_id, governance_event, governance_payload)
+                yield encode_sse(governance_event, governance_payload)
             _record_public_event(
                 run_id, "error", public_failure
             )

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import os
+import time
+import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterator, Mapping, Optional
 
@@ -18,6 +20,7 @@ from model_capabilities import (
     normalize_tool_attestation,
     safe_upstream_error_reason,
 )
+from model_governance import GovernanceError, get_model_governance
 from model_catalog import MODEL_CATALOG
 from secret_store import get_provider_secret
 
@@ -402,20 +405,37 @@ def model_call_error(
         response_text,
         secrets=(config.api_key,),
     )
-    if status in {401, 403}:
+    governance_state = ""
+    actions: list[dict[str, str]] = []
+    if status == 401:
         code = "PROVIDER_AUTH_FAILED"
-        message = f"{provider_label} API 金鑰無效，或帳戶沒有使用此模型的權限。"
+        governance_state = "auth_required"
+        message = f"{provider_label} API 認證失效；金鑰可能錯誤、過期或已撤銷。"
+        actions = [{"id": "update_key", "label": "更新 Key 並驗證"}, {"id": "choose_model", "label": "改用其他模型"}]
+    elif status == 402:
+        code = "PROVIDER_QUOTA_EXHAUSTED"
+        governance_state = "quota_exhausted"
+        message = f"{provider_label} 額度或計費目前不可用。"
+        actions = [{"id": "view_usage", "label": "查看用量／額度"}, {"id": "choose_model", "label": "改用其他模型"}]
+    elif status == 403:
+        code = "PROVIDER_PERMISSION_DENIED"
+        governance_state = "permission_denied"
+        message = f"{provider_label} 帳戶沒有使用此模型或能力的權限。"
+        actions = [{"id": "provider_settings", "label": "檢查供應商權限"}, {"id": "choose_model", "label": "改用其他模型"}]
     elif status == 404:
         code = "PROVIDER_MODEL_UNAVAILABLE"
+        governance_state = "model_unavailable"
         message = (
             f"{provider_label} 已列出此模型，但目前帳戶無法呼叫它。"
             "請在 API 連線中先取得模型回覆，再切換使用。"
         )
     elif status == 429:
         code = "PROVIDER_RATE_LIMITED"
+        governance_state = "rate_limited"
         message = f"{provider_label} 已達速率或試用額度限制，請稍後再試。"
     elif status >= 500:
         code = "PROVIDER_UPSTREAM_ERROR"
+        governance_state = "degraded"
         message = f"{provider_label} 目前無法完成模型請求。"
     else:
         code = "PROVIDER_MODEL_ERROR"
@@ -428,6 +448,10 @@ def model_call_error(
         "detail": f"{config.provider} HTTP {status or 'unknown'}"
         + (f": {reason}" if reason else ""),
         "provider": config.provider,
+        "governance_state": governance_state,
+        "actions": actions,
+        "input_preserved": True,
+        "external_write_state": "none",
     }
 
 
@@ -522,17 +546,51 @@ def _openai_payload(
 class CompatibleChatResponse:
     """Expose OpenAI SSE as the Ollama-shaped stream expected by existing loops."""
 
-    def __init__(self, response: requests.Response, provider: str, protocol: Optional[str] = None):
+    def __init__(self, response: requests.Response, provider: str, protocol: Optional[str] = None, governance_context: Optional[Mapping[str, Any]] = None):
         self._response = response
         self.provider = provider
         self.protocol = protocol or provider
         self.status_code = response.status_code
+        self.governance_context = dict(governance_context or {})
+        self._governance_recorded = False
+
+    def _record_governance(self, usage: Optional[Mapping[str, Any]] = None) -> None:
+        if self._governance_recorded:
+            return
+        service = get_model_governance()
+        if service is None or not self.governance_context:
+            return
+        self._governance_recorded = True
+        usage = dict(usage or {})
+        context = self.governance_context
+        prompt = max(0, int(usage.get("prompt_tokens") or usage.get("prompt_eval_count") or 0))
+        completion = max(0, int(usage.get("completion_tokens") or usage.get("eval_count") or 0))
+        input_rate = float(context.get("input_rate") or 0)
+        output_rate = float(context.get("output_rate") or 0)
+        service.record_usage(
+            call_id=str(context["call_id"]),
+            provider_id=str(context["provider_id"]),
+            model_id=str(context["model_id"]),
+            capability=str(context.get("capability") or "chat"),
+            project_id=context.get("project_id"),
+            run_id=context.get("run_id"),
+            status="completed" if 200 <= self.status_code < 300 else "failed",
+            prompt_tokens=prompt,
+            completion_tokens=completion,
+            latency_ms=max(0, int((time.monotonic() - float(context.get("started") or time.monotonic())) * 1000)),
+            estimated_cost=prompt * input_rate / 1_000_000 + completion * output_rate / 1_000_000,
+            currency=str(context.get("currency") or "USD"),
+            provider_signal=str(context.get("provider_signal") or ""),
+            retry_at=context.get("retry_at"),
+        )
 
     @property
     def text(self) -> str:
         return self._response.text
 
     def close(self) -> None:
+        if not self._governance_recorded:
+            self._record_governance()
         self._response.close()
 
     def json(self) -> Dict[str, Any]:
@@ -543,6 +601,7 @@ class CompatibleChatResponse:
         message = dict((choices[0].get("message") if choices else None) or {})
         message["tool_calls"] = _normalize_openai_tool_calls(message.get("tool_calls") or [])
         usage = payload.get("usage") or {}
+        self._record_governance(usage)
         return {
             "message": message,
             "prompt_eval_count": int(usage.get("prompt_tokens") or 0),
@@ -602,6 +661,7 @@ class CompatibleChatResponse:
             final["message"]["tool_calls"] = _normalize_openai_tool_calls(
                 [tool_calls[index] for index in sorted(tool_calls)]
             )
+        self._record_governance(usage)
         yield json.dumps(final).encode("utf-8")
 
 
@@ -663,28 +723,98 @@ def _post_completion(
     _provider_id, request_model = split_model_reference(model)
     if request_model:
         original_payload["model"] = request_model
-    if config.protocol == "ollama":
-        options = dict(original_payload.get("options") or {})
-        options.setdefault(
-            "num_ctx",
-            max(4096, min(32768, int(settings.get("ollama_num_ctx") or 8192))),
+    governance = get_model_governance()
+    governance_context: dict[str, Any] = {}
+    if governance is not None and config.protocol != "ollama":
+        decision = governance.operational_decision(
+            config.provider,
+            model_id=request_model,
+            endpoint=config.base_url,
         )
-        original_payload["options"] = options
-        response = requests.post(
-            f"{config.base_url}/api/chat",
-            json={**original_payload, "stream": stream},
-            stream=stream,
-            timeout=timeout,
+        if not decision.allowed:
+            raise GovernanceError(
+                decision.code or "PROVIDER_OPERATION_BLOCKED",
+                decision.message or "Provider route is unavailable.",
+                details={"retry_at": decision.retry_at, "provider": config.provider, "model": request_model},
+            )
+        call_id = f"modelcall_{uuid.uuid4().hex}"
+        run_id = str(settings.get("_governance_run_id") or "") or None
+        message_chars = sum(
+            len(str(item.get("content") or ""))
+            for item in original_payload.get("messages") or []
+            if isinstance(item, Mapping)
         )
-    else:
-        response = requests.post(
-            _openai_url(config, "chat/completions"),
-            json=_openai_payload(original_payload, stream, profile),
-            headers=_headers(config),
-            stream=stream,
-            timeout=timeout,
+        reserve_tokens = max(1, message_chars // 4) + 4096
+        reserve_cost = (
+            max(1, message_chars // 4) * config.input_cost_per_million / 1_000_000
+            + 4096 * config.output_cost_per_million / 1_000_000
         )
-    return CompatibleChatResponse(response, config.provider, config.protocol)
+        budget = governance.budget_decision(
+            project_id=project_id,
+            run_id=run_id or call_id,
+            call_id=call_id,
+            reserve_tokens=reserve_tokens,
+            reserve_cost=reserve_cost,
+            currency=config.currency,
+            override_id=str(settings.get("_governance_budget_override_id") or "") or None,
+        )
+        if not budget.allowed:
+            raise GovernanceError(
+                budget.code or "MODEL_BUDGET_EXCEEDED",
+                budget.message or "Model budget is exhausted.",
+                details={"warnings": list(budget.warnings), "provider": config.provider, "model": request_model},
+            )
+        governance_context = {
+            "call_id": call_id,
+            "run_id": run_id,
+            "project_id": project_id,
+            "provider_id": config.provider,
+            "model_id": request_model,
+            "capability": required_model_kind,
+            "started": time.monotonic(),
+            "input_rate": config.input_cost_per_million,
+            "output_rate": config.output_cost_per_million,
+            "currency": config.currency,
+            "warnings": list(budget.warnings),
+        }
+    try:
+        if config.protocol == "ollama":
+            options = dict(original_payload.get("options") or {})
+            options.setdefault(
+                "num_ctx",
+                max(4096, min(32768, int(settings.get("ollama_num_ctx") or 8192))),
+            )
+            original_payload["options"] = options
+            response = requests.post(
+                f"{config.base_url}/api/chat",
+                json={**original_payload, "stream": stream},
+                stream=stream,
+                timeout=timeout,
+            )
+        else:
+            response = requests.post(
+                _openai_url(config, "chat/completions"),
+                json=_openai_payload(original_payload, stream, profile),
+                headers=_headers(config),
+                stream=stream,
+                timeout=timeout,
+            )
+    except requests.RequestException:
+        if governance is not None and config.protocol != "ollama":
+            governance.observe_failure(config.provider, model_id=request_model, endpoint=config.base_url, transport_error=True, capability=required_model_kind)
+            governance.record_usage(call_id=governance_context["call_id"], provider_id=config.provider, model_id=request_model, capability=required_model_kind, project_id=project_id, run_id=governance_context.get("run_id"), status="failed", provider_signal="transport_error")
+        raise
+    if governance is not None and config.protocol != "ollama":
+        if 200 <= int(response.status_code) < 300:
+            state = governance.observe_success(config.provider, model_id=request_model, endpoint=config.base_url)
+            if state.get("recovered_from"):
+                governance_context["recovered_from"] = str(state["recovered_from"])
+        else:
+            retry_header = response.headers.get("Retry-After") if hasattr(response, "headers") else None
+            state = governance.observe_failure(config.provider, model_id=request_model, endpoint=config.base_url, status_code=int(response.status_code), retry_after=retry_header, capability=required_model_kind)
+            governance_context["provider_signal"] = str(state.get("state") or "")
+            governance_context["retry_at"] = state.get("retry_at")
+    return CompatibleChatResponse(response, config.provider, config.protocol, governance_context)
 
 
 def post_chat(
@@ -757,6 +887,7 @@ def list_models(
                 **item,
                 "provider": "ollama",
                 "provider_label": "Ollama",
+                "endpoint": config.base_url,
                 "kind": profile.kind,
                 "profile": profile.as_dict(),
             })
@@ -789,6 +920,7 @@ def list_models(
             "name": reference,
             "model": reference,
             "provider": config.provider,
+            "endpoint": config.base_url,
             "scoped": True,
             "kind": profile.kind,
             "profile": profile.as_dict(),
@@ -809,6 +941,7 @@ def list_models(
                 else str(item.get("id") or "")
             ),
             "provider": config.provider,
+            "endpoint": config.base_url,
         }
         for item in response.json().get("data") or []
         for profile in [model_capability_profile(

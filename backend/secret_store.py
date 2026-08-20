@@ -13,6 +13,7 @@ import json
 import os
 import re
 import threading
+import uuid
 from ctypes import wintypes
 from pathlib import Path
 from typing import Any, Iterable, Optional
@@ -136,9 +137,21 @@ def set_provider_secret(provider_id: str, secret: str) -> dict[str, Any]:
         payload[normalized] = {
             "ciphertext": _protect(plain),
             "last4": plain[-4:] if len(plain) >= 4 else plain,
+            "credential_version_id": f"cred_{uuid.uuid4().hex}",
         }
         _write(payload)
-    return {"provider_id": normalized, "configured": True, "last4": payload[normalized]["last4"]}
+    return {
+        "provider_id": normalized,
+        "configured": True,
+        "last4": payload[normalized]["last4"],
+    }
+
+
+def provider_credential_version(provider_id: str) -> str:
+    """Return the non-secret random version bound to the current ciphertext."""
+    normalized = normalize_provider_id(provider_id)
+    with _LOCK:
+        return str(_read().get(normalized, {}).get("credential_version_id") or "")
 
 
 def get_provider_secret(provider_id: str) -> str:

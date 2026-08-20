@@ -295,9 +295,16 @@ function providerModelUsesNemotronOcrAdapter(kind, model) {
         && String(model || '').trim().toLowerCase() === 'nvidia/nemotron-ocr-v2';
 }
 
+function providerModelHasCapabilityTestAdapter(kind, model) {
+    const normalized = String(kind || '').trim().toLowerCase();
+    return providerModelUsesNemotronOcrAdapter(normalized, model)
+        || normalized === 'rerank'
+        || normalized === 'embedding';
+}
+
 function providerModelBlocksTest(kind, model) {
     return providerModelRequiresDedicatedAdapter(kind)
-        && !providerModelUsesNemotronOcrAdapter(kind, model);
+        && !providerModelHasCapabilityTestAdapter(kind, model);
 }
 
 function providerModelAdapterStatus(kind, model = '') {
@@ -982,7 +989,8 @@ function syncProviderCapabilityDefaults(card) {
     const languageLabel = system.closest('label');
     if (languageLabel) languageLabel.hidden = kind !== 'translation';
     card.querySelectorAll('[data-provider-chat-test-control]').forEach(control => {
-        control.hidden = requiresDedicatedAdapter;
+        control.hidden = requiresDedicatedAdapter
+            && !['rerank', 'embedding'].includes(kind);
     });
     card.querySelectorAll('[data-provider-ocr-test-control]').forEach(control => {
         control.hidden = !usesNemotronOcrAdapter;
@@ -990,7 +998,13 @@ function syncProviderCapabilityDefaults(card) {
     const modelTestButton = card.querySelector('[data-test-provider-model]');
     if (modelTestButton) {
         modelTestButton.hidden = blocksModelTest;
-        modelTestButton.textContent = usesNemotronOcrAdapter ? 'OCR \u8fa8\u8b58' : '\u53d6\u5f97\u6a21\u578b\u56de\u8986';
+        modelTestButton.textContent = usesNemotronOcrAdapter
+            ? 'OCR \u8fa8\u8b58'
+            : kind === 'rerank'
+                ? 'Rerank \u9a57\u8b49'
+                : kind === 'embedding'
+                    ? 'Embedding \u9a57\u8b49'
+                    : '\u53d6\u5f97\u6a21\u578b\u56de\u8986';
         modelTestButton.disabled = blocksModelTest
             || (usesNemotronOcrAdapter && !syncProviderOcrFileState(card));
     }

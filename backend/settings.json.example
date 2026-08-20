@@ -34,6 +34,6 @@
   "hermes_allowed_capabilities": [],
   "hermes_readonly_project_id": "",
   "hermes_fallback_enabled": true,
-  "settings_modal_width": 900,
-  "settings_modal_height": 650
+  "settings_modal_width": 1040,
+  "settings_modal_height": 760
 }

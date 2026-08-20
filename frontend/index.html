@@ -65,6 +65,11 @@
             </div>
         </header>
 
+        <div class="provider-governance-banner" id="provider-governance-banner" role="status" hidden>
+            <span id="provider-governance-banner-text"></span>
+            <button type="button" id="provider-governance-banner-action">查看並修復</button>
+        </div>
+
         <div class="workbench-body">
 
             <!-- ================= 左側 Icon Rail ================= -->
@@ -975,6 +980,8 @@
                     aria-controls="mm-pane-available" aria-selected="false" tabindex="-1">可安裝</button>
                 <button class="mm-tab" id="mm-tab-benchmark" data-mmtab="benchmark" role="tab"
                     aria-controls="mm-pane-benchmark" aria-selected="false" tabindex="-1">效能測試</button>
+                <button class="mm-tab" id="mm-tab-routing" data-mmtab="routing" role="tab"
+                    aria-controls="mm-pane-routing" aria-selected="false" tabindex="-1">選模政策</button>
             </div>
             <div class="mm-body">
                 <section class="mm-pane active" id="mm-pane-installed" role="tabpanel"
@@ -1019,6 +1026,14 @@
                     <div class="mm-note">對目前選用模型執行一次短提示測速（實際呼叫本機模型）。</div>
                     <button class="btn btn-primary" id="mm-run-benchmark" style="width:auto; margin: 10px 0;">執行測速</button>
                     <div class="mm-list" id="mm-benchmark-result">尚無測速結果。</div>
+                </section>
+                <section class="mm-pane" id="mm-pane-routing" role="tabpanel"
+                    aria-labelledby="mm-tab-routing" hidden>
+                    <div class="governance-card">
+                        <h2>目前專案的安全選模</h2>
+                        <div id="mm-routing-summary" class="mm-list" aria-live="polite">請先選擇專案。</div>
+                        <button type="button" class="btn btn-primary" id="mm-open-routing-settings">管理候選、資料同意與預算</button>
+                    </div>
                 </section>
             </div>
             <div class="workspace-footer">
@@ -1949,6 +1964,12 @@
                 </button>
             </div>
             <section id="cloud-llm-library-view" class="cloud-llm-library-view">
+                <nav class="cloud-governance-tabs" aria-label="雲端模型治理">
+                    <button type="button" class="active" data-cloud-governance-tab="connections" aria-selected="true">連線</button>
+                    <button type="button" data-cloud-governance-tab="health" aria-selected="false">用量與健康</button>
+                    <button type="button" data-cloud-governance-tab="budgets" aria-selected="false">預算與選模</button>
+                </nav>
+                <div id="cloud-governance-connections-panel" class="cloud-governance-panel">
                 <div class="cloud-llm-toolbar">
                     <label class="cloud-llm-search">
                         <i data-lucide="search"></i>
@@ -1991,6 +2012,38 @@
                     <span class="cloud-llm-security-note"><i data-lucide="shield-check"></i>金鑰由 Windows DPAPI 加密，不會顯示完整內容。</span>
                     <button type="button" class="btn btn-secondary" id="cloud-llm-close-btn">關閉</button>
                 </div>
+                </div>
+                <div id="cloud-governance-health-panel" class="cloud-governance-panel governance-scroll" hidden>
+                    <div class="governance-panel-head">
+                        <div><strong>供應商即時狀態</strong><span>狀態來自實際回應；用量標示為本機觀測，不代表供應商官方餘額。</span></div>
+                        <button type="button" class="btn btn-secondary compact" id="cloud-governance-refresh">重新整理</button>
+                    </div>
+                    <div id="cloud-governance-usage-summary" class="governance-metric-grid" aria-live="polite"></div>
+                    <div id="cloud-governance-provider-health" class="governance-provider-list" aria-live="polite"></div>
+                </div>
+                <div id="cloud-governance-budgets-panel" class="cloud-governance-panel governance-scroll" hidden>
+                    <section class="governance-card">
+                        <h2>全域與專案預算</h2>
+                        <p>70%／90% 提醒，100% 停止新的模型請求。成本依幣別分開計算。</p>
+                        <div class="governance-budget-grid" id="cloud-governance-budget-fields"></div>
+                        <button type="button" class="btn btn-primary compact" id="cloud-governance-save-budgets">儲存預算</button>
+                    </section>
+                    <section class="governance-card" id="cloud-governance-routing-card">
+                        <h2>目前專案選模政策</h2>
+                        <label>模式
+                            <select class="settings-input" id="cloud-routing-mode">
+                                <option value="off">關閉</option><option value="ask">先詢問</option><option value="auto_within_policy">政策內自動</option>
+                            </select>
+                        </label>
+                        <div class="governance-consent-row">
+                            <label><input type="checkbox" id="cloud-consent-text">文字可傳送至已允許的雲端供應商</label>
+                            <label><input type="checkbox" id="cloud-consent-images">圖片可傳送至已允許的雲端供應商</label>
+                            <label><input type="checkbox" id="cloud-consent-documents">文件可傳送至已允許的雲端供應商</label>
+                        </div>
+                        <div id="cloud-routing-providers" class="governance-consent-row"></div>
+                        <button type="button" class="btn btn-primary compact" id="cloud-governance-save-routing">儲存專案政策</button>
+                    </section>
+                </div>
             </section>
             <section id="cloud-llm-editor-view" class="cloud-llm-editor-view" hidden>
                 <div class="cloud-llm-editor-toolbar">
@@ -2032,14 +2085,14 @@
     <script src="extension-center.js?v=1.6.1-nvidia-ocr"></script>
     <script src="connector-center.js?v=1.0.1-extension-gate"></script>
     <script src="skill-center.js?v=1.0.2-chat-reset"></script>
-    <script src="cloud-llm-center.js?v=1.1.0-workspace"></script>
+    <script src="cloud-llm-center.js?v=1.2.0-governance"></script>
     <script src="agent-collaboration.js?v=1.1.0-model-trace"></script>
     <script src="basic-chat-mode.js?v=1.0.2-sidebar-contract"></script>
     <script src="project-skills-sidebar.js?v=1.2.1-add-menu-a11y"></script>
     <script src="run-inspector.js?v=1.0.2"></script>
     <script src="n8n-workflows.js?v=0.9.1-hmi-controls"></script>
     <script src="n8n-agent-governance.js?v=0.9.1-personal-scope"></script>
-    <script src="hermes-settings.js?v=1.1.2-hover-help-dom"></script>
+    <script src="hermes-settings.js?v=1.1.3-tooltip-layer"></script>
     <script src="app.js?v=0.9.0-model-catalog-beta.1"></script>
 </body>
 </html>

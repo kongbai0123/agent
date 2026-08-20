@@ -193,7 +193,7 @@ def test_escape_and_cloud_deactivation_route_through_workspace_controllers():
     deactivate = _slice(CLOUD_JS, "async function deactivate", "function bindEvents")
     assert "lifecycleRevision" in deactivate
     assert "if (await deactivate()) state.deps?.onWorkspaceClose?.()" in deactivate
-    assert "window.workbenchCloudLlm = { init, open, close, deactivate" in CLOUD_JS
+    assert "window.workbenchCloudLlm = { init, open, openTab, close, deactivate" in CLOUD_JS
 
 
 def test_auxiliary_panels_cannot_reclaim_a_management_workspace():

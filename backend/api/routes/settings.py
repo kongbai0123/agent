@@ -7,6 +7,7 @@ from typing import Any, Callable, Dict, Optional
 from fastapi import APIRouter, Request
 
 from api.routes.provider_settings import build_provider_settings_router
+from model_governance import ModelGovernanceService
 
 
 _HERMES_SECRET_SETTING_KEYS = frozenset({
@@ -43,12 +44,14 @@ def build_settings_router(
     hermes_rollout_guard: Optional[
         Callable[[Dict[str, Any], Dict[str, Any]], None]
     ] = None,
+    model_governance: Optional[ModelGovernanceService] = None,
 ) -> APIRouter:
     router = APIRouter(tags=["settings"])
     router.include_router(build_provider_settings_router(
         load_settings=load_settings,
         error_payload=error_payload,
         require_local=require_local,
+        model_governance=model_governance,
     ))
 
     @router.get("/api/settings")
