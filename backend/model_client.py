@@ -13,13 +13,65 @@ from model_capabilities import (
     ModelCapabilityProfile,
     build_openai_chat_payload,
     capability_fingerprint,
+    infer_model_kind,
     model_capability_profile,
     normalize_tool_attestation,
     safe_upstream_error_reason,
 )
+from model_catalog import MODEL_CATALOG
 from secret_store import get_provider_secret
 
 _PROVIDER_EXTENSION_GATE: Optional[Callable[[str, Optional[str]], bool]] = None
+
+
+def _catalog_ollama_model_kinds() -> dict[str, str]:
+    kinds: dict[str, str] = {}
+    for entry in MODEL_CATALOG:
+        categories = {str(value).strip().casefold() for value in entry.get("category") or []}
+        kind = "chat" if "chat" in categories else "vision" if "vision" in categories else "unknown"
+        for name in (entry.get("name"), *(entry.get("aliases") or [])):
+            normalized = str(name or "").strip().casefold()
+            if normalized:
+                kinds[normalized] = kind
+    return kinds
+
+
+_OLLAMA_CATALOG_MODEL_KINDS = _catalog_ollama_model_kinds()
+
+
+def ollama_model_kind(model_id: str) -> str:
+    """Classify local models without promoting unknown tools to chat."""
+
+    normalized = str(model_id or "").strip().casefold()
+    return _OLLAMA_CATALOG_MODEL_KINDS.get(normalized) or infer_model_kind(normalized)
+
+
+def _ollama_model_requires_specialized_manager(model_id: str, kind: str) -> bool:
+    normalized = str(model_id or "").strip().casefold()
+    if kind in {"translation", "embedding", "rerank", "vision"}:
+        return True
+    if any(token in normalized for token in (
+        "llama-guard", "nemoguard", "safety-guard", "moderation", "classifier",
+        "whisper", "text-to-speech", "-tts", "/tts", "clip",
+    )):
+        return True
+    return "starcoder" in normalized and "instruct" not in normalized
+
+
+def _ollama_model_profile(model_id: str) -> ModelCapabilityProfile:
+    kind = ollama_model_kind(model_id)
+    legacy_chat = (
+        kind == "unknown"
+        and not _ollama_model_requires_specialized_manager(model_id, kind)
+    )
+    return model_capability_profile(
+        model_id,
+        model_kind=kind,
+        supports_tools=kind == "chat" or legacy_chat,
+        # Preserve pre-catalog local chat models. New installs through Model
+        # Manager are separately rejected unless their kind is recognizable.
+        local_chat_default=legacy_chat,
+    )
 
 
 def configure_provider_extension_gate(
@@ -217,12 +269,7 @@ def model_profile_for_model(
     config = provider_for_model(settings, model, project_id=project_id)
     _provider_id, model_name = split_model_reference(model)
     if config.protocol == "ollama":
-        return model_capability_profile(
-            model_name or model,
-            model_kind="chat",
-            supports_tools=True,
-            local_chat_default=True,
-        )
+        return _ollama_model_profile(model_name or model)
     providers = settings.get("model_providers")
     if isinstance(providers, list) and providers:
         for item in providers:
@@ -701,23 +748,19 @@ def list_models(
     if config.protocol == "ollama":
         response = requests.get(f"{config.base_url}/api/tags", timeout=timeout)
         response.raise_for_status()
-        profile = model_capability_profile(
-            "ollama",
-            model_kind="chat",
-            supports_tools=True,
-            local_chat_default=True,
-        )
-        return [
-            {
+        models = []
+        for item in response.json().get("models") or []:
+            if not isinstance(item, Mapping) or not item.get("name"):
+                continue
+            profile = _ollama_model_profile(str(item["name"]))
+            models.append({
                 **item,
                 "provider": "ollama",
                 "provider_label": "Ollama",
                 "kind": profile.kind,
                 "profile": profile.as_dict(),
-            }
-            for item in response.json().get("models") or []
-            if isinstance(item, Mapping) and item.get("name")
-        ]
+            })
+        return models
     configured_provider = next(
         (
             item

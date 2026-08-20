@@ -1669,7 +1669,9 @@ function specializedModelKindFromName(modelName = '') {
     const name = String(modelName || '').trim().toLowerCase();
     if (/(?:riva-|\/|-)?translat(?:e|ion)/.test(name)) return 'translation';
     if (/rerank|re-rank|ranker/.test(name)) return 'rerank';
-    if (/(?:\/|-)(?:embed|embedding)|text-embedding|\/bge-|(?:^|\/)e5-/.test(name)) return 'embedding';
+    if (/(?:^|[\/-])(?:embed|embedding)|text-embedding|(?:^|\/)bge-|(?:^|\/)e5-/.test(name)) return 'embedding';
+    if (/llama-guard|nemoguard|safety-guard|moderation|classifier/.test(name)) return 'unknown';
+    if (/ocr/.test(name)) return 'vision';
     return '';
 }
 function modelEligibleForChat(entry, modelName = '') {
@@ -6302,6 +6304,11 @@ async function installCustomOllamaModel() {
         input?.focus();
         return;
     }
+    if (specializedModelKindFromName(model)) {
+        showToast('這是專用模型；目前此區只安裝可用於對話的生成模型。', 'error');
+        input?.focus();
+        return;
+    }
     try {
         const catalog = await loadModelCatalog();
         if (catalog.items.some(item => item.name === model || item.installed_as === model)) {
@@ -6386,15 +6393,30 @@ async function renderMmInstalled() {
     if (!list) return;
     list.textContent = '載入中...';
     try {
-        const res = await apiFetch(`${API_BASE}/api/models`);
+        const [res, catalog] = await Promise.all([
+            apiFetch(`${API_BASE}/api/models`),
+            loadModelCatalog().catch(() => null)
+        ]);
         const data = await res.json();
+        const catalogByInstalledName = new Map();
+        (catalog?.items || []).forEach(item => {
+            catalogByInstalledName.set(item.name, item);
+            if (item.installed_as) catalogByInstalledName.set(item.installed_as, item);
+        });
         const ready = new Set(Array.isArray(data.models) ? data.models : []);
         const configured = Array.isArray(data.configured_models) ? data.configured_models : [];
         const configuredByName = new Map(configured.map(item => [item.name, item]));
         const entries = [...ready].map(name => {
             const provider = name.includes('::') ? name.split('::', 1)[0] : 'ollama';
             const metadata = configuredByName.get(name) || {};
-            return { ...metadata, name, provider, provider_label: metadata.provider_label || (provider === 'ollama' ? 'Ollama' : provider), ready: true };
+            return {
+                ...metadata,
+                name,
+                provider,
+                provider_label: metadata.provider_label || (provider === 'ollama' ? 'Ollama' : provider),
+                catalog: provider === 'ollama' ? catalogByInstalledName.get(name) || null : null,
+                ready: true
+            };
         });
         configured.filter(item => !ready.has(item.name)).forEach(item => entries.push({ ...item, ready: false }));
         list.innerHTML = '';
@@ -6410,10 +6432,13 @@ async function renderMmInstalled() {
             const stateText = !chatEligible ? `${entry.model_kind || '專用'}模型` : entry.ready ? '可用' : '已連接，待權限啟用';
             const actions = !chatEligible ? [{ label: '專用工具', disabled: true }] : entry.ready ? [
                 { label: isActive ? '使用中' : '切換使用', primary: !isActive, onClick: () => { if (!isActive) openModelSwitch(name); } }, { label: '測速', onClick: () => { switchMmTab('benchmark'); runBenchmark(name); } }] : [{ label: '啟用並切換', primary: true, onClick: () => activateConfiguredModel(entry) }];
+            const catalogMeta = entry.catalog
+                ? ` · 模型標籤：${escapeHtml(name)} · Context：${escapeHtml(entry.catalog.contextLabel)} · ${escapeHtml(entry.catalog.license)}`
+                : '';
             list.appendChild(mmCard({
-                title: name,
+                title: entry.catalog?.display_name || name,
                 badge: isActive ? '<span class="mm-badge good">使用中</span>' : (isDefault ? '<span class="mm-badge slow">預設</span>' : ''),
-                meta: `來源：${escapeHtml(entry.provider_label)} · 狀態：${stateText}${isDefault ? ' · 預設模型' : ''}`,
+                meta: `來源：${escapeHtml(entry.provider_label)} · 狀態：${escapeHtml(stateText)}${isDefault ? ' · 預設模型' : ''}${catalogMeta}`,
                 actions
             }));
         });
@@ -6464,7 +6489,7 @@ async function renderMmRecommended() {
         list.innerHTML = '';
         catalog.recommended.slice(0, 4).forEach(m => {
             list.appendChild(mmCatalogCard(m,
-                `模型標籤：${escapeHtml(m.name)} · 用途：${escapeHtml(m.use)} · ${escapeHtml(m.size)} · ${escapeHtml(m.need)}`
+                `模型標籤：${escapeHtml(m.name)} · 用途：${escapeHtml(m.use)} · ${escapeHtml(m.size)} · Context：${escapeHtml(m.contextLabel)} · ${escapeHtml(m.need)}`
             ));
         });
         if (!list.children.length) list.innerHTML = '<div class="mm-note">目前沒有適合這台機器且尚未安裝的模型。</div>';

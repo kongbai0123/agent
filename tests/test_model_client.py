@@ -372,6 +372,42 @@ class ModelClientTests(unittest.TestCase):
         )
         self.assertEqual(get.call_count, 1)
 
+    def test_local_specialized_and_base_models_never_enter_primary_chat_inventory(self):
+        settings = {"ollama_url": "http://127.0.0.1:11434"}
+        local_response = Mock()
+        local_response.json.return_value = {"models": [
+            {"name": "qwen3.5:4b"},
+            {"name": "local-model"},
+            {"name": "bge-m3:latest"},
+            {"name": "embeddinggemma:latest"},
+            {"name": "glm-ocr:latest"},
+            {"name": "llama-guard3:8b"},
+            {"name": "starcoder2:3b"},
+        ]}
+        local_response.raise_for_status.return_value = None
+        with patch.object(model_client.requests, "get", return_value=local_response):
+            inventory = model_client.list_models(settings, provider_id="ollama")
+            chat = model_client.list_all_models(settings)
+
+        kinds = {item["name"]: item["kind"] for item in inventory}
+        self.assertEqual(kinds["qwen3.5:4b"], "chat")
+        self.assertEqual(kinds["local-model"], "chat")
+        self.assertEqual(kinds["bge-m3:latest"], "embedding")
+        self.assertEqual(kinds["embeddinggemma:latest"], "embedding")
+        self.assertEqual(kinds["glm-ocr:latest"], "vision")
+        self.assertEqual(kinds["llama-guard3:8b"], "unknown")
+        self.assertEqual(kinds["starcoder2:3b"], "unknown")
+        profiles = {item["name"]: item["profile"] for item in inventory}
+        self.assertTrue(profiles["qwen3.5:4b"]["supports_tools"])
+        self.assertTrue(profiles["local-model"]["supports_tools"])
+        self.assertFalse(profiles["bge-m3:latest"]["supports_tools"])
+        self.assertFalse(profiles["llama-guard3:8b"]["supports_tools"])
+        self.assertFalse(profiles["starcoder2:3b"]["supports_tools"])
+        self.assertEqual(
+            [item["name"] for item in chat],
+            ["qwen3.5:4b", "local-model"],
+        )
+
     def test_unscoped_configured_provider_does_not_publish_its_full_catalog(self):
         settings = {
             "ollama_url": "http://127.0.0.1:11434",

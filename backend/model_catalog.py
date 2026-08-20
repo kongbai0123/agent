@@ -120,7 +120,7 @@ MODEL_CATALOG: list[dict[str, Any]] = [
 
     # Coding and software-engineering models.
     _model("qwen2.5-coder:1.5b", "Qwen2.5 Coder 1.5B", ("code", "chat", "rag"), 0.986, 32_768, "Alibaba Qwen", "Apache-2.0", "qwen2.5-coder"),
-    _model("qwen2.5-coder:3b", "Qwen2.5 Coder 3B", ("code", "chat", "rag"), 1.9, 32_768, "Alibaba Qwen", "Apache-2.0", "qwen2.5-coder"),
+    _model("qwen2.5-coder:3b", "Qwen2.5 Coder 3B", ("code", "chat", "rag"), 1.9, 32_768, "Alibaba Qwen", "Qwen Research License (non-commercial)", "qwen2.5-coder"),
     _model("qwen2.5-coder:7b", "Qwen2.5 Coder 7B", ("code", "chat", "rag"), 4.7, 32_768, "Alibaba Qwen", "Apache-2.0", "qwen2.5-coder", aliases=("qwen2.5-coder:latest",), recommendation_priority=13),
     _model("qwen2.5-coder:14b", "Qwen2.5 Coder 14B", ("code", "chat", "rag"), 9.0, 32_768, "Alibaba Qwen", "Apache-2.0", "qwen2.5-coder"),
     _model("qwen2.5-coder:32b", "Qwen2.5 Coder 32B", ("code", "chat", "rag"), 20.0, 32_768, "Alibaba Qwen", "Apache-2.0", "qwen2.5-coder"),
@@ -128,8 +128,6 @@ MODEL_CATALOG: list[dict[str, Any]] = [
     _model("qwen3-coder-next:latest", "Qwen3 Coder Next", ("code", "chat", "tools", "reasoning"), 52.0, 262_144, "Alibaba Qwen", "Apache-2.0", "qwen3-coder-next"),
     _model("devstral-small-2:24b", "Devstral Small 2 24B", ("code", "chat", "tools", "vision"), 15.0, 393_216, "Mistral AI", "Apache-2.0", "devstral-small-2", aliases=("devstral-small-2:latest",)),
     _model("deepseek-coder-v2:16b", "DeepSeek Coder V2 Lite 16B", ("code", "chat", "reasoning"), 8.9, 163_840, "DeepSeek", "DeepSeek Model License", "deepseek-coder-v2", aliases=("deepseek-coder-v2:latest",)),
-    _model("starcoder2:3b", "StarCoder2 3B", ("code",), 1.7, 16_384, "BigCode", "BigCode OpenRAIL-M", "starcoder2", aliases=("starcoder2:latest",)),
-    _model("starcoder2:7b", "StarCoder2 7B", ("code",), 4.0, 16_384, "BigCode", "BigCode OpenRAIL-M", "starcoder2"),
     _model("starcoder2:15b-instruct", "StarCoder2 15B Instruct", ("code", "chat"), 9.1, 16_384, "BigCode", "BigCode OpenRAIL-M", "starcoder2"),
 
     # Multimodal generative models. These are installable and image-capable;

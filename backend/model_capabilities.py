@@ -94,6 +94,7 @@ def infer_model_kind(model_id: str) -> str:
         "embedding",
         "text-embedding",
         "/bge-",
+        "bge-",
         "e5-",
     )):
         return "embedding"
@@ -112,6 +113,7 @@ def infer_model_kind(model_id: str) -> str:
         "llava",
         "vila",
         "image-to-text",
+        "ocr",
     )):
         return "vision"
     if any(token in name for token in (

@@ -78,6 +78,7 @@ def test_model_manager_supports_category_search_and_safe_custom_ollama_tags():
     assert 'rel="noopener noreferrer"' in INDEX_HTML
     assert ".mm-catalog-toolbar" in STYLE_CSS
     assert ".mm-custom-install" in STYLE_CSS
+    assert MODELS_PY.count("_require_chat_model_install(req.model)") == 2
 
 
 def test_catalog_cards_use_friendly_names_and_search_provenance():
@@ -85,6 +86,20 @@ def test_catalog_cards_use_friendly_names_and_search_provenance():
     assert "searchText:" in APP_JS
     for field in ("publisher", "license", "displayName"):
         assert field in APP_JS
+    assert APP_JS.count("Context：${escapeHtml(m.contextLabel)}") >= 2
+    assert "catalogByInstalledName" in APP_JS
+    assert "entry.catalog?.display_name || name" in APP_JS
+
+
+def test_frontend_guard_recognizes_specialized_local_model_names():
+    guard = re.search(
+        r"function specializedModelKindFromName\([^)]*\)\s*\{(.+?)\n\}",
+        APP_JS,
+        re.S,
+    )
+    assert guard
+    for marker in ("bge-", "llama-guard", "classifier", "ocr"):
+        assert marker in guard.group(1)
 
 
 def test_every_catalog_entry_carries_what_the_ui_needs():
@@ -119,6 +134,11 @@ def test_catalog_covers_current_open_model_families_without_cloud_or_specialized
         assert expected in names
     assert all("cloud" not in name.casefold() for name in names)
     assert all(not re.search(r"embed|rerank|classifier|guard", name, re.I) for name in names)
+    assert all("chat" in entry["category"] for entry in entries)
+    assert "starcoder2:3b" not in names
+    assert "starcoder2:7b" not in names
+    qwen_3b = next(entry for entry in entries if entry["name"] == "qwen2.5-coder:3b")
+    assert qwen_3b["license"] == "Qwen Research License (non-commercial)"
 
 
 def test_catalog_uses_safe_explicit_ollama_references():

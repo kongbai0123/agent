@@ -17,6 +17,7 @@ from fastapi.responses import StreamingResponse
 from api.schemas.models import BenchmarkRequest, ModelInstallRequest, SelectModelRequest
 from chat.events import encode_sse
 from model_catalog import MODEL_CATALOG
+from model_client import ollama_model_kind
 from system_resources import detect_gpus as _detect_gpus, detect_ram as _detect_ram
 
 
@@ -128,6 +129,27 @@ def build_models_router(
 
     def _require_ollama(project_id: Optional[str] = None) -> None:
         _ensure_ollama_enabled(project_id)
+
+    catalog_install_names = {
+        str(name).strip().casefold()
+        for entry in MODEL_CATALOG
+        for name in (entry.get("name"), *(entry.get("aliases") or []))
+        if str(name or "").strip()
+    }
+
+    def _require_chat_model_install(model: str) -> None:
+        normalized = str(model or "").strip().casefold()
+        if normalized in catalog_install_names or ollama_model_kind(normalized) == "chat":
+            return
+        raise HTTPException(
+            status_code=422,
+            detail=error_payload(
+                "MODEL_KIND_UNVERIFIED",
+                "此處只能安裝可確認為對話或生成用途的 Ollama 模型。",
+                "Embedding、Reranker、Guard、OCR、基礎補全或無法辨識用途的標籤，需要專用模型管理介面。",
+                recoverable=True,
+            ),
+        )
 
     def _ollama_info() -> Dict[str, Any]:
         url = load_settings()["ollama_url"]
@@ -347,6 +369,7 @@ def build_models_router(
     def install_model(req: ModelInstallRequest, background_tasks: BackgroundTasks, request: Request):
         require_local_workbench(request)
         _require_ollama()
+        _require_chat_model_install(req.model)
         for existing in database.list_model_install_jobs(100):
             if existing.get("model") == req.model and existing.get("status") in _MODEL_INSTALL_ACTIVE_STATES:
                 if _has_model_install_control(existing["job_id"]):
@@ -440,6 +463,7 @@ def build_models_router(
     ):
         require_local_workbench(request)
         _require_ollama()
+        _require_chat_model_install(req.model)
         job_id = create_id("job")
         database.upsert_model_install_job(job_id, req.model, "queued", 0, message="Queued model install.")
         _register_model_install(job_id)

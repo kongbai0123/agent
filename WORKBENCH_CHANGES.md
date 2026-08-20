@@ -4,11 +4,12 @@
 
 ### 模型管理
 
-- 將本機 Ollama 型錄由 4 個擴充為 62 個經官方 Library 核對的生成模型，涵蓋 Qwen 3.5／3.6、Gemma 4、Granite 4、Ministral 3、DeepSeek R1、gpt-oss、Phi-4、Llama、程式模型與多模態模型。
+- 將本機 Ollama 型錄由 4 個擴充為 60 個經官方 Library 核對的對話型生成模型，涵蓋 Qwen 3.5／3.6、Gemma 4、Granite 4、Ministral 3、DeepSeek R1、gpt-oss、Phi-4、Llama、程式模型與多模態模型。
 - 型錄只收錄可本機下載的明確 tag，不納入 cloud-only、重複量化、社群 namespace、Embedding、Reranker、Guard 或分類器，避免專用模型被誤當一般聊天模型。
-- 「可安裝」新增名稱／開發者搜尋、用途篩選、友善名稱、發布者、授權、Context、硬體需求與收錄數量；找不到的官方生成模型可用安全的 Ollama tag 手動安裝。
+- 「可安裝」新增名稱／開發者搜尋、用途篩選、友善名稱、發布者、授權、Context、硬體需求與收錄數量；找不到的對話型生成模型可用安全的 Ollama tag 手動安裝。
 - 修正硬體資料格式接錯而把所有模型判為不適合、已安裝模型仍出現在可安裝清單、安裝完成後快取未更新，以及下載進度 SSE 使用未定義 formatter 的問題。
 - 自訂模型名稱加入長度、字元與路徑片段驗證；安裝仍只透過本機、受擴充權限保護的 Ollama API。
+- 本機模型改為逐一辨識用途；Embedding、Reranker、Guard、OCR、基礎補全與不明標籤不會被當成主對話模型。
 
 ### 擴充功能與 n8n HMI
 
