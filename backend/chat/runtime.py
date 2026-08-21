@@ -897,6 +897,24 @@ async def _stream_model_tool_loop(
               "Tool execution follows the active extension permission policy; if an "
               "approval is required, wait for the local user to decide."
         )
+    capability_update = {
+        "role": "system",
+        "content": (
+            "Runtime capability update: the governed tools listed in this request "
+            "are available now. Any earlier assistant statement claiming that "
+            "browser, computer, connector, or tool operation is impossible is "
+            "obsolete and must not be repeated. When the latest request matches an "
+            "available tool, call it now and wait for its result instead of giving "
+            "manual instructions."
+        ),
+    }
+    # Keep the runtime update adjacent to the latest request. This prevents a
+    # conversation recorded while tools were unavailable from teaching a local
+    # model to repeat stale capability refusals after the extension is enabled.
+    insert_at = len(governed_payload["messages"])
+    if insert_at and governed_payload["messages"][-1].get("role") == "user":
+        insert_at -= 1
+    governed_payload["messages"].insert(insert_at, capability_update)
     governed_payload["tools"] = [definition.model_schema() for definition in definitions]
     governed_payload["tool_choice"] = "auto"
     by_name = {definition.name: definition for definition in definitions}

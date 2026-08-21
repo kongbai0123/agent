@@ -251,6 +251,17 @@ class ModelClientTests(unittest.TestCase):
             )
         self.assertEqual(post.call_args.kwargs["json"]["tools"], tools)
 
+    def test_content_safety_model_is_not_promoted_to_chat_by_nemotron_name(self):
+        profile = model_client.model_capability_profile(
+            "nvidia/nemotron-3.5-content-safety"
+        )
+
+        self.assertEqual(profile.kind, "unknown")
+        self.assertFalse(profile.supports_chat)
+        self.assertFalse(profile.supports_tools)
+        self.assertFalse(profile.eligible_for_primary)
+        self.assertFalse(profile.eligible_for_subagent)
+
     def test_imported_provider_requires_current_passed_attestation_for_tools(self):
         response = Mock(status_code=200)
         model_name = "vendor/model"

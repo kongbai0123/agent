@@ -524,6 +524,9 @@ def test_basic_stream_runs_global_mcp_tool_in_independent_chat(monkeypatch):
     assert payloads[0]["tools"][0]["function"]["name"] == (
         "mcp.browser.browser_navigate"
     )
+    assert payloads[0]["messages"][-2]["role"] == "system"
+    assert "earlier assistant statement" in payloads[0]["messages"][-2]["content"]
+    assert payloads[0]["messages"][-1]["content"] == "請開啟瀏覽器搜尋 n8n"
     assert any(message.get("role") == "tool" for message in payloads[1]["messages"])
     assert fake_db.messages[-1]["content"] == "已開啟瀏覽器並搜尋 n8n。"
 

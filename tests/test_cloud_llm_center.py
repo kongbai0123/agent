@@ -79,6 +79,12 @@ def test_new_imports_use_unique_records_and_fail_closed():
     assert "new Set(ids).size !== ids.length" in CENTER_JS
 
 
+def test_content_safety_models_remain_dedicated_tools_in_the_frontend():
+    assert "content[-_]safety" in PROVIDER_JS
+    assert "providerDedicatedAdapterKinds" in PROVIDER_JS
+    assert "'unknown'" in PROVIDER_JS
+
+
 def test_library_persists_the_complete_provider_array_and_secrets_separately():
     assert "model_providers: records" in CENTER_JS
     assert "await state.deps.saveSecrets()" in CENTER_JS

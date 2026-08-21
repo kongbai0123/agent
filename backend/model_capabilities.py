@@ -102,6 +102,8 @@ def infer_model_kind(model_id: str) -> str:
         "llama-guard",
         "nemoguard",
         "safety-guard",
+        "content-safety",
+        "content_safety",
         "moderation",
         "classifier",
     )):

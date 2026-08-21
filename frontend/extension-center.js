@@ -270,7 +270,7 @@ function inferredProviderModelKind(model, explicit = '') {
     if (/(?:riva-|\/|-)?translat(?:e|ion)/.test(value)) return 'translation';
     if (/rerank|re-rank|ranker/.test(value)) return 'rerank';
     if (/(?:\/|-)(?:embed|embedding)|text-embedding|\/bge-|(?:^|\/)e5-/.test(value)) return 'embedding';
-    if (/llama-guard|nemoguard|safety-guard|moderation|classifier/.test(value)) return 'unknown';
+    if (/llama-guard|nemoguard|safety-guard|content[-_]safety|moderation|classifier/.test(value)) return 'unknown';
     if (/ocr|optical[-_ ]character|vision|(?:\/|-)(?:vl)(?:-|$)|llava|vila|image-to-text/.test(value)) {
         return 'vision';
     }
