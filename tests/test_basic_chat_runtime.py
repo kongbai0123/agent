@@ -179,6 +179,26 @@ def test_basic_prompt_uses_only_complete_history_and_one_current_user():
     assert "failed orphan" not in [item["content"] for item in messages]
     assert "explicit context" in messages[0]["content"]
     assert messages[-1]["images"] == ["image-data"]
+    assert "only when they are explicitly supplied" in messages[0]["content"]
+    assert "Do not claim to use tools" not in messages[0]["content"]
+
+
+def test_independent_task_tool_note_explains_project_requirement():
+    payload = {
+        "messages": [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "open Chrome"},
+        ]
+    }
+    result = chat_runtime._payload_with_tool_availability_note(
+        payload,
+        "No tools were supplied because this conversation is not assigned to a Project.",
+    )
+
+    assert result is not payload
+    assert result["messages"] is not payload["messages"]
+    assert "not assigned to a Project" in result["messages"][0]["content"]
+    assert payload["messages"][0]["content"] == "system"
 
 
 def test_basic_stream_has_no_agent_events_or_tool_payload(monkeypatch):
