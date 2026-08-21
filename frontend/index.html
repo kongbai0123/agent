@@ -1727,14 +1727,14 @@
         <div class="extensions-workspace-shell">
             <div class="modal-header">
                 <div>
-                    <span class="workflow-eyebrow">AGENT EXTENSIONS</span>
-                    <h3 id="extensions-title"><i data-lucide="puzzle"></i>外掛程式</h3>
-                    <p class="extension-subtitle">先分清楚已安裝與未安裝；連線與本機來源則在需要時再使用。</p>
+                    <span class="workflow-eyebrow" data-extension-zh="AGENT 擴充功能" data-extension-en="AGENT EXTENSIONS">AGENT 擴充功能</span>
+                    <h3 id="extensions-title"><i data-lucide="puzzle"></i><span data-extension-zh="外掛程式" data-extension-en="Extensions">外掛程式</span></h3>
+                    <p class="extension-subtitle" data-extension-zh="選擇一項擴充即可查看用途、操作方式、資料去向與何時需要你的同意。" data-extension-en="Select an extension to see what it does, how to use it, where data goes, and when approval is required.">選擇一項擴充即可查看用途、操作方式、資料去向與何時需要你的同意。</p>
                 </div>
                 <div class="extension-header-actions">
                     <button type="button" class="btn btn-secondary compact" id="extension-developer-toggle"
                         aria-label="開啟開發者設定" title="開發者設定">
-                        <i data-lucide="settings-2"></i><span>開發者設定</span>
+                        <i data-lucide="settings-2"></i><span data-extension-zh="開發者設定" data-extension-en="Developer settings">開發者設定</span>
                     </button>
                     <button type="button" class="modal-close" id="extensions-close" aria-label="回到聊天">
                         <i data-lucide="x"></i>
@@ -1744,41 +1744,42 @@
             <div class="extension-toolbar" id="extension-toolbar">
                 <label class="extension-search">
                     <i data-lucide="search"></i>
-                    <span class="sr-only">搜尋擴充</span>
-                    <input type="search" id="extension-search" placeholder="搜尋名稱、類型或來源">
+                    <span class="sr-only" data-extension-zh="搜尋擴充" data-extension-en="Search extensions">搜尋擴充</span>
+                    <input type="search" id="extension-search" placeholder="搜尋名稱、類型或來源"
+                        data-extension-placeholder-zh="搜尋名稱、用途或來源" data-extension-placeholder-en="Search by name, purpose, or source">
                 </label>
                 <label class="extension-scope">
-                    <span>作用範圍</span>
+                    <span data-extension-zh="作用範圍" data-extension-en="Scope">作用範圍</span>
                     <select id="extension-scope-select" class="settings-input">
                         <option value="global">所有專案（全域）</option>
                     </select>
                 </label>
                 <button type="button" class="btn btn-secondary compact" id="extension-refresh">
-                    <i data-lucide="refresh-cw"></i>重新整理
+                    <i data-lucide="refresh-cw"></i><span data-extension-zh="重新整理" data-extension-en="Refresh">重新整理</span>
                 </button>
             </div>
             <div class="extension-tabs" id="extension-tabs" role="tablist" aria-label="擴充分類">
                 <div class="extension-primary-tabs" role="presentation">
                     <button type="button" class="extension-tab-btn is-primary active" role="tab" aria-selected="true"
                         aria-controls="extension-pane-installed" data-extension-tab="installed">
-                        <i data-lucide="check-circle-2" aria-hidden="true"></i><span>已安裝</span>
+                        <i data-lucide="check-circle-2" aria-hidden="true"></i><span data-extension-zh="已安裝" data-extension-en="Installed">已安裝</span>
                         <span class="extension-tab-count" id="extension-installed-count" aria-label="0 個已安裝">0</span>
                     </button>
                     <button type="button" class="extension-tab-btn is-primary" role="tab" aria-selected="false"
                         aria-controls="extension-pane-available" data-extension-tab="available">
-                        <i data-lucide="download" aria-hidden="true"></i><span>未安裝</span>
+                        <i data-lucide="download" aria-hidden="true"></i><span data-extension-zh="未安裝" data-extension-en="Not installed">未安裝</span>
                         <span class="extension-tab-count" id="extension-available-count" aria-label="0 個未安裝">0</span>
                     </button>
                 </div>
                 <div class="extension-secondary-tabs" role="presentation">
-                    <span class="extension-secondary-label" aria-hidden="true">其他</span>
+                    <span class="extension-secondary-label" aria-hidden="true" data-extension-zh="其他" data-extension-en="Other">其他</span>
                     <button type="button" class="extension-tab-btn is-secondary" role="tab" aria-selected="false"
                         aria-controls="extension-pane-connections" data-extension-tab="connections">
-                        <i data-lucide="link" aria-hidden="true"></i><span>連線</span>
+                        <i data-lucide="link" aria-hidden="true"></i><span data-extension-zh="連線" data-extension-en="Connections">連線</span>
                     </button>
                     <button type="button" class="extension-tab-btn is-secondary" role="tab" aria-selected="false"
                         aria-controls="extension-pane-local" data-extension-tab="local">
-                        <i data-lucide="folder-lock" aria-hidden="true"></i><span>私人／本機</span>
+                        <i data-lucide="folder-lock" aria-hidden="true"></i><span data-extension-zh="私人／本機" data-extension-en="Private / local">私人／本機</span>
                     </button>
                 </div>
             </div>
@@ -1787,7 +1788,7 @@
                     aria-labelledby="extension-detail-title" hidden>
                     <div class="extension-detail-nav">
                         <button type="button" class="extension-detail-back" id="extension-detail-back">
-                            <i data-lucide="arrow-left" aria-hidden="true"></i>返回擴充列表
+                            <i data-lucide="arrow-left" aria-hidden="true"></i><span data-extension-zh="返回擴充列表" data-extension-en="Back to extensions">返回擴充列表</span>
                         </button>
                     </div>
                     <div id="extension-detail-content"></div>
@@ -1795,46 +1796,46 @@
                 <section class="extension-tab-panel active" id="extension-pane-installed" role="tabpanel"
                     data-extension-panel="installed">
                     <header class="extension-section-intro">
-                        <div><span class="workflow-eyebrow">INSTALLED</span><h4>已安裝</h4></div>
-                        <p>這些擴充已加入 Workbench；點開後才會顯示啟用、權限與技術設定。</p>
+                        <div><span class="workflow-eyebrow" data-extension-zh="已加入" data-extension-en="INSTALLED">已加入</span><h4 data-extension-zh="已安裝" data-extension-en="Installed">已安裝</h4></div>
+                        <p data-extension-zh="這些功能已加入 Workbench。點選項目可查看實際用途、使用範例與權限。" data-extension-en="These extensions are available in Workbench. Open one to review its purpose, examples, and permissions.">這些功能已加入 Workbench。點選項目可查看實際用途、使用範例與權限。</p>
                     </header>
                     <div class="extension-list" id="extension-installed-list" aria-live="polite">
-                        <div class="extension-state is-loading">載入已安裝擴充中…</div>
+                        <div class="extension-state is-loading" data-extension-zh="載入已安裝擴充中…" data-extension-en="Loading installed extensions…">載入已安裝擴充中…</div>
                     </div>
                 </section>
                 <section class="extension-tab-panel" id="extension-pane-available" role="tabpanel"
                     data-extension-panel="available" hidden>
                     <header class="extension-section-intro">
-                        <div><span class="workflow-eyebrow">NOT INSTALLED</span><h4>未安裝</h4></div>
-                        <p>只顯示尚未加入的擴充；安裝前會先讓你確認用途與必要權限。</p>
+                        <div><span class="workflow-eyebrow" data-extension-zh="尚未加入" data-extension-en="NOT INSTALLED">尚未加入</span><h4 data-extension-zh="未安裝" data-extension-en="Not installed">未安裝</h4></div>
+                        <p data-extension-zh="安裝前會先用白話說明它能做什麼、會接觸哪些資料，以及需要哪些權限。" data-extension-en="Before installation, Workbench explains what it does, what data it can access, and which permissions it needs.">安裝前會先用白話說明它能做什麼、會接觸哪些資料，以及需要哪些權限。</p>
                     </header>
                     <div class="extension-list" id="extension-available-list" aria-live="polite">
-                        <div class="extension-state is-loading">載入未安裝擴充中…</div>
+                        <div class="extension-state is-loading" data-extension-zh="載入未安裝擴充中…" data-extension-en="Loading available extensions…">載入未安裝擴充中…</div>
                     </div>
                 </section>
                 <section class="extension-tab-panel" id="extension-pane-connections" role="tabpanel"
                     data-extension-panel="connections" hidden>
                     <div id="connector-center" class="connector-center" aria-live="polite">
-                        <div class="extension-state is-loading">載入連接器中…</div>
+                        <div class="extension-state is-loading" data-extension-zh="載入連接器中…" data-extension-en="Loading connectors…">載入連接器中…</div>
                     </div>
                 </section>
                 <section class="extension-tab-panel" id="extension-pane-local" role="tabpanel"
                     data-extension-panel="local" hidden>
                     <div class="extension-local-picker">
                         <div>
-                            <label class="settings-label" for="extension-local-path">本機 Extension Manifest</label>
-                            <span class="settings-tip">先將 JSON 放入 <code>runtime/extensions/local/</code>，再輸入檔名；不可使用路徑或網址。</span>
+                            <label class="settings-label" for="extension-local-path" data-extension-zh="本機擴充資訊清單（Manifest）" data-extension-en="Local extension manifest">本機擴充資訊清單（Manifest）</label>
+                            <span class="settings-tip" data-extension-zh="先把 JSON 檔放入 runtime/extensions/local/，再輸入檔名；不可輸入其他路徑或網址。" data-extension-en="Place the JSON file in runtime/extensions/local/, then enter its filename. Paths and URLs are not accepted.">先把 JSON 檔放入 <code>runtime/extensions/local/</code>，再輸入檔名；不可輸入其他路徑或網址。</span>
                         </div>
                         <div class="extension-local-controls">
                             <input id="extension-local-path" class="settings-input" autocomplete="off"
                                 placeholder="example-extension.json">
                             <button type="button" class="btn btn-primary compact" id="extension-local-inspect" disabled>
-                                <i data-lucide="shield-check"></i>檢查權限
+                                <i data-lucide="shield-check"></i><span data-extension-zh="檢查權限" data-extension-en="Review permissions">檢查權限</span>
                             </button>
                         </div>
                     </div>
                     <div class="extension-list" id="extension-local-list" aria-live="polite">
-                        <div class="extension-state">輸入 manifest 檔名後，系統會先驗證來源、格式與權限。</div>
+                        <div class="extension-state" data-extension-zh="輸入資訊清單檔名後，系統會先驗證來源、格式與權限。" data-extension-en="Enter a manifest filename. Workbench validates its source, format, and permissions before use.">輸入資訊清單檔名後，系統會先驗證來源、格式與權限。</div>
                     </div>
                 </section>
                 <section class="extension-tab-panel" id="extension-pane-developer" role="tabpanel"
@@ -1867,8 +1868,8 @@
                 <div id="extension-audit-list" class="extension-audit-list" aria-live="polite"></div>
             </aside>
             <div class="extension-workspace-footer">
-                <span class="extension-safety-note"><i data-lucide="shield-check"></i>安裝與權限變更會留下 audit。</span>
-                <button type="button" class="btn btn-secondary" id="extensions-close-btn">回到聊天</button>
+                <span class="extension-safety-note"><i data-lucide="shield-check"></i><span data-extension-zh="安裝與權限變更都會留下稽核紀錄。" data-extension-en="Installation and permission changes are recorded in the audit log.">安裝與權限變更都會留下稽核紀錄。</span></span>
+                <button type="button" class="btn btn-secondary" id="extensions-close-btn" data-extension-zh="回到聊天" data-extension-en="Back to chat">回到聊天</button>
             </div>
         </div>
     </main>
@@ -1930,7 +1931,7 @@
         aria-labelledby="extension-permission-title">
         <div class="modal extension-permission-modal-box">
             <div class="modal-header">
-                <h3 id="extension-permission-title"><i data-lucide="shield-alert"></i>權限審查</h3>
+                <h3 id="extension-permission-title"><i data-lucide="shield-alert"></i><span data-extension-zh="權限審查" data-extension-en="Permission review">權限審查</span></h3>
                 <button type="button" class="modal-close" id="extension-permission-close" aria-label="關閉權限審查">
                     <i data-lucide="x"></i>
                 </button>
@@ -1943,9 +1944,9 @@
                 </label>
             </div>
             <div class="modal-footer">
-                <button type="button" class="btn btn-secondary" id="extension-permission-cancel">取消</button>
+                <button type="button" class="btn btn-secondary" id="extension-permission-cancel" data-extension-zh="取消" data-extension-en="Cancel">取消</button>
                 <button type="button" class="btn btn-primary" id="extension-permission-confirm" disabled>
-                    確認並繼續
+                    <span data-extension-zh="確認並繼續" data-extension-en="Confirm and continue">確認並繼續</span>
                 </button>
             </div>
         </div>
@@ -2082,7 +2083,7 @@
         <div class="task-progress-list" id="task-progress-list"></div>
     </section>
 
-    <script src="extension-center.js?v=1.6.1-nvidia-ocr"></script>
+    <script src="extension-center.js?v=1.8.0-i18n"></script>
     <script src="connector-center.js?v=1.0.1-extension-gate"></script>
     <script src="skill-center.js?v=1.0.2-chat-reset"></script>
     <script src="cloud-llm-center.js?v=1.2.0-governance"></script>

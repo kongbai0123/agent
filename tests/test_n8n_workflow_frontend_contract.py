@@ -232,7 +232,7 @@ def test_workflow_header_uses_extension_state_while_details_keep_core_service_co
     assert "service.load_error" in renderer
     assert "workflow-status-pill is-error" in renderer
     assert "Gmail Workflow 已就緒" in renderer
-    for label in ("本機 n8n 服務", "Workflow 管理", "Gmail Workflow", "在瀏覽器開啟", "技術資訊"):
+    for label in ("本機 n8n 服務", "工作流程管理", "Gmail 工作流程", "在瀏覽器開啟", "技術資訊"):
         assert label in EXTENSION_JS
 
 

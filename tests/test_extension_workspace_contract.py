@@ -54,6 +54,7 @@ def test_extension_catalog_is_shallow_and_details_disclose_information_in_order(
         EXTENSIONS.index("function projectOverrideSelect")
     ]
     assert "extension-card-description" in catalog_card
+    assert "extensionDocumentation(item).summary" in catalog_card
     assert "extension-card-summary-footer" in catalog_card
     assert "查看詳情" in catalog_card
     assert "extension-permissions" not in catalog_card
@@ -66,11 +67,53 @@ def test_extension_catalog_is_shallow_and_details_disclose_information_in_order(
         EXTENSIONS.index("async function refreshN8nService")
     ]
     use = detail.index("extensionDetailStage = 'use'")
+    guide = detail.index("appendUsageGuide")
     settings = detail.index("detailSection('settings'")
     features = detail.index("detailSection('features'")
     technical = detail.index("appendTechnicalDetails")
-    assert use < settings < features < technical
+    assert use < guide < settings < features < technical
     assert "立即使用" in detail
+
+
+def test_extension_details_explain_usage_data_approval_tools_and_permissions():
+    for contract in (
+        "這項擴充怎麼使用",
+        "哪些資料會送出去",
+        "系統什麼時候會詢問你",
+        "目前做不到或需要注意的事",
+        "documentation.tools",
+        "tr('技術名稱', 'Technical name')",
+        "extension-permission-detail-list",
+        "extension-permission-purpose",
+        "這項擴充會做什麼",
+        "批准規則",
+    ):
+        assert contract in EXTENSIONS
+    assert ".extension-permission-detail-row" in STYLE
+    assert ".extension-permission-purpose" in STYLE
+
+
+def test_extension_workspace_has_real_bilingual_runtime_switching():
+    assert 'data-extension-zh="AGENT 擴充功能"' in INDEX
+    assert 'data-extension-en="AGENT EXTENSIONS"' in INDEX
+    assert "function applyExtensionLocale()" in EXTENSIONS
+    assert "workbench:language-change" in EXTENSIONS
+    assert "document.documentElement?.lang === 'en-US'" in EXTENSIONS
+    assert "ui_language: settingUiLanguage?.value === 'en-US'" in APP
+    assert "document.documentElement.lang = language" in APP
+    assert "window.location.reload()" in APP
+
+
+def test_traditional_chinese_permission_copy_hides_raw_english_descriptions():
+    for permission_id, label in (
+        ("network.n8n", "連接本機自動化服務"),
+        ("network.ollama", "連接本機模型服務"),
+        ("connector.github.repository.read", "讀取已選取的 GitHub 儲存庫"),
+        ("connector.notion.content.write", "更新 Notion 內容"),
+        ("process.mcp", "啟動本機工具程序"),
+    ):
+        assert permission_id in EXTENSIONS
+        assert label in EXTENSIONS
 
 
 def test_extension_detail_tracks_live_n8n_status_and_preserves_keyboard_focus():
@@ -79,7 +122,7 @@ def test_extension_detail_tracks_live_n8n_status_and_preserves_keyboard_focus():
     assert "function restoreDetailViewState" in EXTENSIONS
     assert "snapshot.technicalOpen" in EXTENSIONS
     assert "target || byId('extension-detail-title')" in EXTENSIONS
-    assert "starting ? '啟動中'" in EXTENSIONS
+    assert "starting ? tr('啟動中', 'Starting')" in EXTENSIONS
     assert "detailReturnExtensionId" in EXTENSIONS
 
     open_detail = EXTENSIONS[
@@ -245,7 +288,8 @@ console.log(JSON.stringify({
     assert result["exploreIds"] == ["builtin.cursor"]
     assert result["installedIds"] == ["builtin.excel"]
     assert result["cursor"]["install"]["disabled"] is True
-    assert "Cursor adapter" in result["cursor"]["install"]["title"]
+    assert "Cursor" in result["cursor"]["install"]["title"]
+    assert "介接器" in result["cursor"]["install"]["title"]
     assert result["cursor"]["hasToggle"] is False
     assert result["cursor"]["policy"]["canInstall"] is False
     assert result["excel"]["open"]["disabled"] is False

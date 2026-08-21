@@ -18,6 +18,7 @@ from extension_catalog import (
     catalog_metadata,
     catalog_record_sha256,
     enabled_settings_extension_ids,
+    settings_extension_documentation,
     settings_manifests,
 )
 from extension_manifest import ExtensionManifest, manifest_sha256, parse_extension_manifest
@@ -896,7 +897,13 @@ class ExtensionRegistry:
 
     def _item(self, row: dict[str, Any], project_id: Optional[str]) -> dict[str, Any]:
         manifest = dict(row["manifest"])
-        metadata = catalog_metadata(row["extension_id"])
+        settings = self.load_settings()
+        locale = str(settings.get("ui_language") or "zh-TW")
+        metadata = catalog_metadata(row["extension_id"], locale=locale)
+        documentation = metadata.get("documentation")
+        record = self._active_records.get(row["extension_id"])
+        if documentation is None and isinstance(record, ExtensionManifest):
+            documentation = settings_extension_documentation(record, settings)
         project_state = self.store.project_state(row["extension_id"], project_id)
         mode = str(project_state["mode"])
         digest = row["manifest_sha256"]
@@ -943,10 +950,16 @@ class ExtensionRegistry:
             "effective_enabled": effective,
             "health": health,
             "source_kind": row["source_kind"],
+            "documentation": copy.deepcopy(documentation) if documentation else None,
         }
 
     def _candidate_item(self, manifest: ExtensionManifest) -> dict[str, Any]:
-        metadata = catalog_metadata(manifest.id)
+        settings = self.load_settings()
+        locale = str(settings.get("ui_language") or "zh-TW")
+        metadata = catalog_metadata(manifest.id, locale=locale)
+        documentation = metadata.get("documentation")
+        if documentation is None:
+            documentation = settings_extension_documentation(manifest, settings)
         return {
             **manifest.model_dump(mode="json"),
             **metadata,
@@ -968,6 +981,7 @@ class ExtensionRegistry:
                 "latency_ms": 0,
             },
             "source_kind": "local_file",
+            "documentation": copy.deepcopy(documentation) if documentation else None,
         }
 
     def _find_record(self, extension_id: str) -> tuple[CatalogRecord, str, str]:

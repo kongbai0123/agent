@@ -468,6 +468,92 @@ def _configure_settings_mcp(registry, settings, *, enabled: bool):
     return registry.get("mcp.demo")
 
 
+def test_settings_mcp_exposes_safe_user_and_technical_documentation(registry_env):
+    registry, settings, _local_dir = registry_env
+    settings["mcp_servers"] = [
+        {
+            "id": "browser-playwright",
+            "label": "Playwright Browser",
+            "transport": "stdio",
+            "executable": "D:/tools/node.exe",
+            "expected_executable_sha256": "a" * 64,
+            "argv": ["D:/tools/playwright/cli.js", "--isolated"],
+            "cwd": "D:/tools/playwright",
+            "allowed_cwd_roots": ["D:/tools/playwright"],
+            "tool_policies": {
+                "browser_snapshot": {
+                    "access": "read",
+                    "risk_level": "external_read",
+                },
+                "browser_click": {
+                    "access": "write",
+                    "risk_level": "external_write",
+                },
+            },
+            "timeout_seconds": 45,
+            "enabled": False,
+        }
+    ]
+
+    item = registry.get("mcp.browser-playwright")
+    documentation = item["documentation"]
+
+    assert "獨立的 Chrome" in documentation["summary"]
+    assert "不是另一個模型" in documentation["overview"]
+    assert documentation["runtime"] == {
+        "transport": "stdio",
+        "tool_count": 2,
+        "timeout_seconds": 45.0,
+        "profile": "隔離、結束後不保存",
+        "automatic_download": False,
+    }
+    assert documentation["tools"] == [
+        {
+            "name": "browser_click",
+            "label": "點擊頁面",
+            "description": "點擊已由頁面快照識別的按鈕、連結或控制項。",
+            "access": "write",
+            "risk": "external_write",
+        },
+        {
+            "name": "browser_snapshot",
+            "label": "讀取頁面結構",
+            "description": "取得可存取性頁面快照，供 Agent 理解文字、連結與控制項。",
+            "access": "read",
+            "risk": "external_read",
+        },
+    ]
+    serialized = json.dumps(documentation, ensure_ascii=False)
+    assert "D:/tools" not in serialized
+    assert "expected_executable_sha256" not in serialized
+
+
+def test_settings_mcp_english_documentation_does_not_mix_chinese(registry_env):
+    registry, settings, _local_dir = registry_env
+    settings["ui_language"] = "en-US"
+    settings["mcp_servers"] = [
+        {
+            "id": "browser-playwright",
+            "label": "Playwright Browser",
+            "transport": "stdio",
+            "executable": "D:/tools/node.exe",
+            "argv": ["D:/tools/playwright/cli.js", "--isolated"],
+            "cwd": "D:/tools/playwright",
+            "allowed_cwd_roots": ["D:/tools/playwright"],
+            "tool_policies": {
+                "browser_snapshot": {"access": "read", "risk_level": "external_read"},
+                "browser_click": {"access": "write", "risk_level": "external_write"},
+            },
+            "enabled": False,
+        }
+    ]
+
+    documentation = registry.get("mcp.browser-playwright")["documentation"]
+    serialized = json.dumps(documentation, ensure_ascii=False)
+    assert "separate Chrome session" in documentation["summary"]
+    assert not any("\u3400" <= character <= "\u9fff" for character in serialized)
+
+
 def _mcp_desired_state_handler(registry, settings, schedules, *, fail_once=False):
     failure = {"armed": fail_once}
 

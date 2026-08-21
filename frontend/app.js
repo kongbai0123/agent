@@ -398,6 +398,7 @@ const btnMcpStatus = document.getElementById('btn-mcp-status');
 const mcpStatusState = document.getElementById('mcp-status-state');
 const mcpStatusMetrics = document.getElementById('mcp-status-metrics');
 const settingMcpServers = document.getElementById('setting-mcp-servers');
+const settingUiLanguage = document.getElementById('setting-ui-language');
 const taskProgressCenter = document.getElementById('task-progress-center');
 const taskProgressList = document.getElementById('task-progress-list');
 const taskProgressCount = document.getElementById('task-progress-count');
@@ -5503,6 +5504,7 @@ function initSettingsControls() {
             return;
         }
         const payload = {
+            ui_language: settingUiLanguage?.value === 'en-US' ? 'en-US' : 'zh-TW',
             ollama_url: settingOllamaUrl.value.trim() || 'http://127.0.0.1:11434',
             model_provider: 'ollama',
             model_providers: collectModelProviders(),
@@ -5570,11 +5572,17 @@ function initSettingsControls() {
                     await loadModels();
                 }
                 currentSettings = { ...currentSettings, ...payload };
+                const previousLanguage = document.documentElement.lang || 'zh-TW';
+                document.documentElement.lang = payload.ui_language;
+                window.dispatchEvent(new CustomEvent('workbench:language-change', {
+                    detail: { language: payload.ui_language }
+                }));
                 applyAgentDisplayNames(payload.agent_display_names);
                 renderAgentCollaboration();
 
                 showToast('設定儲存成功，且已即時熱加載生效！');
                 settingsModal.classList.remove('active');
+                if (previousLanguage !== payload.ui_language) window.location.reload();
             } else {
                 throw new Error('後端回傳儲存失敗');
             }
@@ -5615,6 +5623,13 @@ async function loadSettingsFromServer() {
         const res = await apiFetch(`${API_BASE}/api/settings`);
         const data = await res.json();
         currentSettings = data || {};
+
+        const language = data.ui_language === 'en-US' ? 'en-US' : 'zh-TW';
+        if (settingUiLanguage) settingUiLanguage.value = language;
+        document.documentElement.lang = language;
+        window.dispatchEvent(new CustomEvent('workbench:language-change', {
+            detail: { language }
+        }));
 
         settingOllamaUrl.value = data.ollama_url || '';
         await loadModelProviderSettings(data.model_providers || []);

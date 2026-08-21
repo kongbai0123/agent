@@ -1338,6 +1338,33 @@ async function saveModelProviderSecrets() {
 
     const byId = id => document.getElementById(id);
     const encoded = value => encodeURIComponent(String(value || ''));
+    const isEnglish = () => document.documentElement?.lang === 'en-US';
+    const tr = (zhTw, enUs) => isEnglish() ? enUs : zhTw;
+    function applyExtensionLocale() {
+        const workspace = byId('extension-center-workspace');
+        if (!workspace) return;
+        const suffix = isEnglish() ? 'en' : 'zh';
+        document.querySelectorAll('[data-extension-zh][data-extension-en]').forEach(node => {
+            node.textContent = node.getAttribute(`data-extension-${suffix}`) || '';
+        });
+        document.querySelectorAll('[data-extension-placeholder-zh][data-extension-placeholder-en]').forEach(node => {
+            node.setAttribute('placeholder', node.getAttribute(`data-extension-placeholder-${suffix}`) || '');
+        });
+        workspace.setAttribute('lang', isEnglish() ? 'en-US' : 'zh-TW');
+    }
+    const categoryLabel = value => ({
+        automation: tr('自動化', 'Automation'),
+        development: tr('開發', 'Development'),
+        productivity: tr('生產力', 'Productivity'),
+        tools: tr('工具', 'Tools'),
+        models: tr('模型', 'Models'),
+        other: tr('其他', 'Other'),
+    })[String(value)] || String(value || tr('擴充功能', 'Extension'));
+    const sourceLabel = value => ({
+        builtin: tr('內建', 'Built in'),
+        local: tr('本機', 'Local'),
+        'Local configuration': tr('本機設定', 'Local configuration'),
+    })[String(value)] || String(value || tr('本機', 'Local'));
     const iconFor = item => item?.id === N8N_EXTENSION_ID ? 'workflow' : ({
         workflow: 'workflow',
         integration: 'workflow',
@@ -1357,7 +1384,7 @@ async function saveModelProviderSecrets() {
     }
 
     async function request(path, options = {}) {
-        if (!state.deps?.apiFetch) throw new Error('擴充中心尚未初始化');
+        if (!state.deps?.apiFetch) throw new Error(tr('擴充中心尚未初始化', 'Extension Center is not initialized'));
         const response = await state.deps.apiFetch(`${state.deps.apiBase || ''}${path}`, options);
         const data = await response.json().catch(() => ({}));
         if (!response.ok || data.success === false) {
@@ -1381,13 +1408,13 @@ async function saveModelProviderSecrets() {
         select.replaceChildren();
         const globalOption = document.createElement('option');
         globalOption.value = 'global';
-        globalOption.textContent = '所有專案（全域）';
+        globalOption.textContent = tr('所有專案（全域）', 'All projects (global)');
         select.appendChild(globalOption);
         const projects = state.deps?.getProjects?.() || [];
         projects.filter(project => !project.archived).forEach(project => {
             const option = document.createElement('option');
             option.value = String(project.id);
-            option.textContent = `專案：${project.name}`;
+            option.textContent = `${tr('專案', 'Project')}：${project.name}`;
             select.appendChild(option);
         });
         select.value = prior && projects.some(project => String(project.id) === String(prior))
@@ -1466,11 +1493,25 @@ async function saveModelProviderSecrets() {
     }
 
     function permissionInfo(permission) {
-        if (typeof permission === 'string') return { name: permission, risk: '' };
+        const raw = typeof permission === 'string'
+            ? { id: permission }
+            : (permission || {});
+        const id = String(raw.id || raw.capability || raw.name || '');
+        const localized = {
+            'network.n8n': [tr('連接本機自動化服務', 'Connect to the local automation service'), tr('呼叫你設定的 n8n 服務。', 'Call the configured n8n service.')],
+            'workspace.cursor': [tr('存取專案檔案', 'Access project files'), tr('讀取或修改你選定的專案；目前此功能尚不可用。', 'Read or modify the selected project. This capability is currently unavailable.')],
+            'desktop.excel': [tr('操作 Excel 活頁簿', 'Control Excel workbooks'), tr('讀取、修改或儲存已綁定的活頁簿；目前此功能尚不可用。', 'Read, modify, or save a bound workbook. This capability is currently unavailable.')],
+            'network.ollama': [tr('連接本機模型服務', 'Connect to the local model service'), tr('呼叫你電腦上的 Ollama 服務。', 'Call the Ollama service on this computer.')],
+            'connector.github.repository.read': [tr('讀取已選取的 GitHub 儲存庫', 'Read selected GitHub repositories'), tr('讀取專案已綁定的程式碼、議題、拉取請求與檢查結果。', 'Read code, issues, pull requests, and checks in project-bound repositories.')],
+            'connector.github.issue.write': [tr('更新 GitHub 協作內容', 'Update GitHub collaboration content'), tr('經你逐次同意後建立或更新議題，以及加入一般留言。', 'Create or update issues and add ordinary comments after per-operation approval.')],
+            'connector.notion.content.read': [tr('讀取已選取的 Notion 內容', 'Read selected Notion content'), tr('讀取專案已綁定的頁面、資料庫與其子項。', 'Read project-bound pages, databases, and their descendants.')],
+            'connector.notion.content.write': [tr('更新 Notion 內容', 'Update Notion content'), tr('經你逐次同意後建立頁面、更新頁面或附加內容區塊。', 'Create pages, update pages, or append blocks after per-operation approval.')],
+            'process.mcp': [tr('啟動本機工具程序', 'Start a local tool process'), tr('啟動已信任的本機 MCP 工具服務；不會自動安裝程式。', 'Start a trusted local MCP tool service. No software is installed automatically.')],
+        }[id];
         return {
-            name: permission?.name || permission?.id || permission?.capability || '未命名權限',
-            risk: permission?.risk || permission?.risk_level || '',
-            description: permission?.description || ''
+            name: localized?.[0] || raw.name || id || tr('未命名權限', 'Unnamed permission'),
+            risk: raw.risk || raw.risk_level || '',
+            description: localized?.[1] || raw.description || ''
         };
     }
 
@@ -1509,9 +1550,9 @@ async function saveModelProviderSecrets() {
         if (item?.runtime_available !== false) return '';
         const reason = String(item.availability_reason || 'adapter_unavailable');
         return ({
-            cursor_adapter_not_implemented: '此版本尚未提供 Cursor adapter。',
-            excel_adapter_not_implemented: '此版本尚未提供 Excel adapter。'
-        })[reason] || `此版本暫時無法使用此擴充（${reason}）。`;
+            cursor_adapter_not_implemented: tr('此版本尚未提供 Cursor 介接器。', 'The Cursor adapter is not available in this release.'),
+            excel_adapter_not_implemented: tr('此版本尚未提供 Excel 介接器。', 'The Excel adapter is not available in this release.')
+        })[reason] || tr(`此版本暫時無法使用此擴充（${reason}）。`, `This extension is unavailable in this release (${reason}).`);
     }
 
     function extensionControlPolicy(item) {
@@ -1556,6 +1597,36 @@ async function saveModelProviderSecrets() {
         return element;
     }
 
+    function extensionDocumentation(item) {
+        const documentation = item?.documentation && typeof item.documentation === 'object'
+            ? item.documentation
+            : {};
+        return {
+            summary: String(documentation.summary || item?.description || tr('由 Workbench 管理的選用擴充功能。', 'An optional extension managed by Workbench.')),
+            overview: String(documentation.overview || item?.description || tr('此擴充尚未提供進一步說明。', 'No additional explanation is available for this extension.')),
+            common_tasks: Array.isArray(documentation.common_tasks) ? documentation.common_tasks : [],
+            data_handling: String(documentation.data_handling || tr('資料處理方式尚未提供；啟用前請先檢查權限與來源。', 'Data handling is not documented. Review permissions and origin before enabling.')),
+            approval_policy: String(documentation.approval_policy || tr('所有操作仍受 Workbench 的固定權限與專案政策限制。', 'All actions remain subject to fixed Workbench permission and project policies.')),
+            limitations: Array.isArray(documentation.limitations) ? documentation.limitations : [],
+            tools: Array.isArray(documentation.tools) ? documentation.tools : [],
+            runtime: documentation.runtime && typeof documentation.runtime === 'object'
+                ? documentation.runtime
+                : {},
+        };
+    }
+
+    function riskLabel(value) {
+        return ({
+            read: tr('本機讀取', 'Local read'),
+            external_read: tr('外部讀取', 'External read'),
+            verify: tr('驗證', 'Verification'),
+            write: tr('本機變更', 'Local change'),
+            external_write: tr('外部變更', 'External change'),
+            system: tr('系統程序', 'System process'),
+            irreversible: tr('不可逆操作', 'Irreversible action'),
+        })[String(value)] || String(value || tr('未分類', 'Unclassified'));
+    }
+
     function createExtensionCard(item) {
         const card = document.createElement('article');
         card.className = `extension-card extension-discovery-card ${item.runtime_available === false ? 'is-disabled' : ''}`.trim();
@@ -1579,14 +1650,12 @@ async function saveModelProviderSecrets() {
         const meta = document.createElement('div');
         meta.className = 'extension-card-meta';
         meta.textContent = [
-            item.category || item.kind || '擴充功能',
-            item.publisher || (item.origin === 'builtin' ? 'Workbench' : '本機')
+            categoryLabel(item.category || item.kind),
+            sourceLabel(item.publisher || item.origin)
         ].filter(Boolean).join(' · ');
         const description = document.createElement('div');
         description.className = 'extension-card-description';
-        description.textContent = item.id === N8N_EXTENSION_ID
-            ? '建立及執行本機自動化工作流程，並以 Workbench 治理 Gmail 草稿與核准。'
-            : item.description || '沒有提供說明。';
+        description.textContent = extensionDocumentation(item).summary;
         copy.append(title, meta, description);
         head.append(icon, copy);
 
@@ -1595,15 +1664,15 @@ async function saveModelProviderSecrets() {
         const stateLabel = document.createElement('span');
         stateLabel.className = `extension-card-state ${item.effective_enabled ? 'is-active' : ''}`.trim();
         stateLabel.textContent = item.runtime_available === false
-            ? '目前無法使用'
-            : item.installed ? (item.effective_enabled ? '已啟用' : '已安裝') : '選用擴充';
+            ? tr('目前無法使用', 'Unavailable')
+            : item.installed ? (item.effective_enabled ? tr('已啟用', 'Enabled') : tr('已安裝', 'Installed')) : tr('選用擴充', 'Optional extension');
         const actions = document.createElement('div');
         actions.className = 'extension-card-actions extension-card-primary-action';
         if (!item.installed && (item.available || controlPolicy.unavailable)) {
             const install = actionButton(
                 controlPolicy.unavailable
-                    ? '目前不可安裝'
-                    : '安裝',
+                    ? tr('目前不可安裝', 'Cannot install')
+                    : tr('安裝', 'Install'),
                 'install',
                 'download',
                 'btn btn-primary compact'
@@ -1618,7 +1687,7 @@ async function saveModelProviderSecrets() {
             actions.appendChild(install);
         }
         if (item.installed) {
-            const openButton = actionButton('查看詳情', 'open', 'chevron-right', 'btn btn-secondary compact');
+            const openButton = actionButton(tr('查看詳情', 'View details'), 'open', 'chevron-right', 'btn btn-secondary compact');
             openButton.addEventListener('click', () => openExtensionDetail(item.id));
             actions.appendChild(openButton);
         }
@@ -1641,9 +1710,9 @@ async function saveModelProviderSecrets() {
             && item.global_approval_current === true
         );
         [
-            ['inherit', '繼承全域'],
-            ['enabled', '此專案啟用'],
-            ['disabled', '此專案停用']
+            ['inherit', tr('繼承全域', 'Inherit global setting')],
+            ['enabled', tr('此專案啟用', 'Enable for this project')],
+            ['disabled', tr('此專案停用', 'Disable for this project')]
         ].forEach(([value, label]) => {
             const option = document.createElement('option');
             option.value = value;
@@ -1656,8 +1725,8 @@ async function saveModelProviderSecrets() {
             : 'inherit';
         select.dataset.previousMode = select.value;
         select.title = canEnable
-            ? '設定此專案的擴充覆寫'
-            : '可繼承或停用；如要在此專案啟用，請先完成全域信任與啟用';
+            ? tr('設定此專案的擴充覆寫', 'Set the extension override for this project')
+            : tr('可繼承或停用；如要在此專案啟用，請先完成全域信任與啟用', 'You may inherit or disable it. Complete global trust and enablement before enabling it here.');
         select.addEventListener('change', () => {
             const mode = select.value;
             const previous = select.dataset.previousMode || 'inherit';
@@ -1709,25 +1778,25 @@ async function saveModelProviderSecrets() {
 
     function capabilityLabel(value) {
         return ({
-            workflow_automation: ['工作流程管理', '建立、檢視並執行受治理的本機 Workflow。'],
-            gmail_governed_drafts: ['Gmail Workflow', '接收標籤事件並回到 Workbench 編輯與核准草稿。'],
-            local_models: ['本機模型', '在 Workbench 使用本機推論服務。'],
-            repositories: ['Repositories', '在核准範圍內存取程式碼庫。'],
-            issues: ['Issues', '讀取與管理議題。'],
-            pull_requests: ['Pull Requests', '檢視與管理合併請求。'],
-            checks: ['Checks', '讀取自動化檢查結果。'],
-            pages: ['Pages', '讀取與管理頁面內容。'],
-            databases: ['Databases', '存取已授權的資料庫。'],
-            blocks: ['Blocks', '讀取與更新內容區塊。'],
-        })[String(value)] || [String(value).replaceAll('_', ' '), '由此擴充提供的功能。'];
+            workflow_automation: [tr('工作流程管理', 'Workflow management'), tr('建立、檢視並執行受治理的本機工作流程。', 'Create, inspect, and run governed local workflows.')],
+            gmail_governed_drafts: [tr('Gmail 工作流程', 'Gmail workflow'), tr('接收標籤事件並回到 Workbench 編輯與核准草稿。', 'Receive label events, then edit and approve drafts in Workbench.')],
+            local_models: [tr('本機模型', 'Local models'), tr('在 Workbench 使用本機推論服務。', 'Use a local inference service in Workbench.')],
+            repositories: [tr('程式碼庫', 'Repositories'), tr('在核准範圍內存取程式碼庫。', 'Access repositories within approved scope.')],
+            issues: [tr('議題', 'Issues'), tr('讀取與管理議題。', 'Read and manage issues.')],
+            pull_requests: [tr('合併請求', 'Pull requests'), tr('檢視與管理合併請求。', 'Inspect and manage pull requests.')],
+            checks: [tr('自動化檢查', 'Checks'), tr('讀取自動化檢查結果。', 'Read automated check results.')],
+            pages: [tr('頁面', 'Pages'), tr('讀取與管理頁面內容。', 'Read and manage page content.')],
+            databases: [tr('資料庫', 'Databases'), tr('存取已授權的資料庫。', 'Access authorized databases.')],
+            blocks: [tr('內容區塊', 'Blocks'), tr('讀取與更新內容區塊。', 'Read and update content blocks.')],
+        })[String(value)] || [String(value).replaceAll('_', ' '), tr('由此擴充提供的功能。', 'A capability provided by this extension.')];
     }
 
     function appendExtensionAuthorization(body, item) {
         const controlPolicy = extensionControlPolicy(item);
         const globalEnabled = item.global_enabled === true;
         const authorization = detailSettingRow(
-            'Workbench 擴充權限',
-            globalEnabled ? '已通過全域審查；可再依專案覆寫。' : '目前不會向 Agent 或工作流程提供能力。'
+            tr('Workbench 擴充權限', 'Workbench extension permission'),
+            globalEnabled ? tr('已通過全域審查；可再依專案覆寫。', 'Global review is complete; project overrides remain available.') : tr('目前不會向 Agent 或工作流程提供能力。', 'No capability is currently exposed to the Agent or workflows.')
         );
         const toggle = detailElement('label', 'extension-detail-toggle');
         const checkbox = document.createElement('input');
@@ -1735,7 +1804,7 @@ async function saveModelProviderSecrets() {
         checkbox.checked = globalEnabled;
         checkbox.disabled = !controlPolicy.canToggleGlobal;
         checkbox.dataset.extensionGlobalToggle = String(item.id);
-        toggle.append(checkbox, document.createTextNode(globalEnabled ? '已啟用' : '已停用'));
+        toggle.append(checkbox, document.createTextNode(globalEnabled ? tr('已啟用', 'Enabled') : tr('已停用', 'Disabled')));
         checkbox.addEventListener('change', () => {
             if (checkbox.checked) {
                 checkbox.checked = false;
@@ -1750,19 +1819,19 @@ async function saveModelProviderSecrets() {
         body.appendChild(authorization.row);
 
         if (state.projectId) {
-            const project = detailSettingRow('專案作用範圍', '覆寫目前專案是否能使用此擴充。');
+            const project = detailSettingRow(tr('專案作用範圍', 'Project scope'), tr('覆寫目前專案是否能使用此擴充。', 'Override whether the active project may use this extension.'));
             project.actions.appendChild(projectOverrideSelect(item));
             body.appendChild(project.row);
         }
 
-        const maintenance = detailSettingRow('檢查與管理', '健康狀態與稽核紀錄只在需要時查看。');
-        const healthButton = actionButton('健康檢查', 'health', 'activity');
+        const maintenance = detailSettingRow(tr('檢查與管理', 'Checks and management'), tr('需要時可檢查健康狀態與稽核紀錄。', 'Inspect health and audit records when needed.'));
+        const healthButton = actionButton(tr('健康檢查', 'Health check'), 'health', 'activity');
         healthButton.addEventListener('click', () => refreshHealth(item, healthButton));
-        const auditButton = actionButton('查看 Audit', 'audit', 'scroll-text');
+        const auditButton = actionButton(tr('查看稽核紀錄', 'View audit records'), 'audit', 'scroll-text');
         auditButton.addEventListener('click', () => openAudit(item));
         maintenance.actions.append(healthButton, auditButton);
         if (item.removable) {
-            const remove = actionButton('移除擴充', 'remove', 'trash-2', 'btn btn-danger compact');
+            const remove = actionButton(tr('移除擴充', 'Remove extension'), 'remove', 'trash-2', 'btn btn-danger compact');
             remove.addEventListener('click', () => removeExtension(item, remove));
             maintenance.actions.appendChild(remove);
         }
@@ -1775,18 +1844,18 @@ async function saveModelProviderSecrets() {
         const starting = service.starting === true;
         const runtimeInstalled = service.installed === true;
         const runtime = detailSettingRow(
-            '本機 n8n 服務',
+            tr('本機 n8n 服務', 'Local n8n service'),
             state.n8nServiceLoading
-                ? '正在檢查服務狀態…'
-                : service.load_error || service.message || (running ? '服務已可使用。' : '服務目前未啟動。')
+                ? tr('正在檢查服務狀態…', 'Checking service status…')
+                : service.load_error || service.message || (running ? tr('服務已可使用。', 'The service is available.') : tr('服務目前未啟動。', 'The service is not running.'))
         );
         const status = badge(
-            state.n8nServiceLoading ? '檢查中'
-                : running ? '已啟動' : starting ? '啟動中' : runtimeInstalled ? '未啟動' : '執行環境未就緒',
+            state.n8nServiceLoading ? tr('檢查中', 'Checking')
+                : running ? tr('已啟動', 'Running') : starting ? tr('啟動中', 'Starting') : runtimeInstalled ? tr('未啟動', 'Stopped') : tr('執行環境未就緒', 'Runtime unavailable'),
             running ? 'is-healthy' : service.load_error ? 'is-error' : 'is-warning'
         );
-        const start = actionButton('啟動', 'n8n-start', 'play', 'btn btn-primary compact');
-        const stop = actionButton('停止', 'n8n-stop', 'square');
+        const start = actionButton(tr('啟動', 'Start'), 'n8n-start', 'play', 'btn btn-primary compact');
+        const stop = actionButton(tr('停止', 'Stop'), 'n8n-stop', 'square');
         start.disabled = state.n8nServiceLoading || !item.effective_enabled || !runtimeInstalled || running || service.starting === true;
         stop.disabled = state.n8nServiceLoading || !item.effective_enabled || !running;
         start.addEventListener('click', () => runN8nServiceAction('start', start));
@@ -1798,8 +1867,8 @@ async function saveModelProviderSecrets() {
     function appendN8nFeatures(body, item) {
         const service = state.n8nService || {};
         const running = service.running === true || service.reachable === true;
-        const workflow = detailSettingRow('Workflow 管理', '在 Workbench 規劃、核准並管理 n8n 工作流程。');
-        const use = actionButton('立即使用', 'n8n-use', 'arrow-up-right', 'btn btn-primary compact');
+        const workflow = detailSettingRow(tr('工作流程管理', 'Workflow management'), tr('在 Workbench 規劃、核准並管理 n8n 工作流程。', 'Plan, approve, and manage n8n workflows in Workbench.'));
+        const use = actionButton(tr('立即使用', 'Use now'), 'n8n-use', 'arrow-up-right', 'btn btn-primary compact');
         use.disabled = !item.effective_enabled;
         use.addEventListener('click', openN8nWorkspace);
         workflow.actions.appendChild(use);
@@ -1807,35 +1876,65 @@ async function saveModelProviderSecrets() {
 
         const gmailReady = service.workflow_ready === true;
         const gmail = detailSettingRow(
-            'Gmail Workflow',
-            gmailReady ? '受治理的 Gmail 工作流程已完成驗證。' : '尚未通過 Workflow 與 Credential readiness 檢查。'
+            tr('Gmail 工作流程', 'Gmail workflow'),
+            gmailReady ? tr('受治理的 Gmail 工作流程已完成驗證。', 'The governed Gmail workflow passed verification.') : tr('工作流程與憑證尚未完成就緒檢查。', 'Workflow and credential readiness checks are incomplete.')
         );
-        gmail.actions.appendChild(badge(gmailReady ? '已就緒' : '尚未就緒', gmailReady ? 'is-healthy' : 'is-warning'));
+        gmail.actions.appendChild(badge(gmailReady ? tr('已就緒', 'Ready') : tr('尚未就緒', 'Not ready'), gmailReady ? 'is-healthy' : 'is-warning'));
         body.appendChild(gmail.row);
 
-        const editor = detailSettingRow('n8n 編輯器', '在外部瀏覽器開啟固定的本機端點；不會內嵌到 Workbench。');
-        const open = actionButton('在瀏覽器開啟', 'n8n-open', 'external-link');
+        const editor = detailSettingRow(tr('n8n 編輯器', 'n8n editor'), tr('在外部瀏覽器開啟固定的本機端點；不會內嵌到 Workbench。', 'Open the fixed local endpoint in an external browser; it is not embedded in Workbench.'));
+        const open = actionButton(tr('在瀏覽器開啟', 'Open in browser'), 'n8n-open', 'external-link');
         open.disabled = !item.effective_enabled || !running || !service.editor_url;
         open.addEventListener('click', () => window.workbenchN8nWorkflows?.openEditor?.());
         editor.actions.appendChild(open);
         body.appendChild(editor.row);
     }
 
+    function appendUsageGuide(container, item) {
+        const documentation = extensionDocumentation(item);
+        const guide = detailSection(
+            'guide',
+            tr('使用說明', 'HOW IT WORKS'),
+            tr('這項擴充怎麼使用', 'How to use this extension'),
+            documentation.overview
+        );
+        documentation.common_tasks.forEach(task => {
+            const title = typeof task === 'string' ? task : task?.title;
+            const description = typeof task === 'string' ? '' : task?.description;
+            if (title) guide.body.appendChild(detailSettingRow(title, description || '').row);
+        });
+        guide.body.appendChild(detailSettingRow(tr('哪些資料會送出去', 'What data leaves Workbench'), documentation.data_handling).row);
+        guide.body.appendChild(detailSettingRow(tr('系統什麼時候會詢問你', 'When Workbench asks for approval'), documentation.approval_policy).row);
+        if (documentation.limitations.length) {
+            guide.body.appendChild(detailSettingRow(
+                tr('目前做不到或需要注意的事', 'Current limitations and cautions'),
+                documentation.limitations.map(value => String(value)).join('；')
+            ).row);
+        }
+        container.appendChild(guide.section);
+    }
+
     function appendTechnicalDetails(container, item) {
         const service = item.id === N8N_EXTENSION_ID ? state.n8nService || {} : {};
+        const documentation = extensionDocumentation(item);
         const details = detailElement('details', 'extension-technical-details');
         details.dataset.extensionDetailStage = 'technical';
-        details.appendChild(detailElement('summary', '', '技術資訊'));
+        details.appendChild(detailElement('summary', '', tr('技術資訊', 'Technical information')));
         const metrics = detailElement('dl', 'extension-detail-metrics');
         const values = item.id === N8N_EXTENSION_ID ? [
-            ['n8n 版本', service.version || '—'],
-            ['本機端點', service.editor_url || N8N_EDITOR_URL],
-            ['Gmail Workflow', service.workflow_ready === true ? '已就緒' : '尚未就緒'],
-            ['擴充版本', item.version || '—'],
+            [tr('n8n 版本', 'n8n version'), service.version || '—'],
+            [tr('本機端點', 'Local endpoint'), service.editor_url || N8N_EDITOR_URL],
+            [tr('Gmail 工作流程', 'Gmail workflow'), service.workflow_ready === true ? tr('已就緒', 'Ready') : tr('尚未就緒', 'Not ready')],
+            [tr('擴充版本', 'Extension version'), item.version || '—'],
         ] : [
-            ['版本', item.version || '—'],
-            ['來源', item.publisher || item.origin || '—'],
-            ['類型', item.kind || '—'],
+            [tr('版本', 'Version'), item.version || '—'],
+            [tr('來源', 'Source'), sourceLabel(item.publisher || item.origin || '—')],
+            [tr('類型', 'Type'), categoryLabel(item.kind || '—')],
+            ...(documentation.runtime.transport ? [[tr('MCP 傳輸方式', 'MCP transport'), documentation.runtime.transport]] : []),
+            ...(Number.isFinite(Number(documentation.runtime.tool_count)) ? [[tr('允許工具數', 'Allowed tools'), String(documentation.runtime.tool_count)]] : []),
+            ...(documentation.runtime.timeout_seconds ? [[tr('工具逾時', 'Tool timeout'), `${documentation.runtime.timeout_seconds} ${tr('秒', 'seconds')}`]] : []),
+            ...(documentation.runtime.profile ? [[tr('執行設定檔', 'Runtime profile'), documentation.runtime.profile]] : []),
+            ...(documentation.runtime.automatic_download === false ? [[tr('自動下載套件', 'Automatic package download'), tr('不允許', 'Not allowed')]] : []),
         ];
         values.forEach(([label, value]) => {
             const row = detailElement('div');
@@ -1845,20 +1944,32 @@ async function saveModelProviderSecrets() {
         details.appendChild(metrics);
 
         const permissions = detailElement('div', 'extension-detail-permissions');
-        permissions.appendChild(detailElement('strong', '', '權限與安全'));
+        permissions.appendChild(detailElement('strong', '', tr('權限與安全', 'Permissions and safety')));
         const chips = detailElement('div', 'extension-permissions');
         const permissionItems = (item.permissions || []).map(permissionInfo);
-        (permissionItems.length ? permissionItems : [{ name: '未要求額外權限', risk: '' }]).forEach(permission => {
+        (permissionItems.length ? permissionItems : [{ name: tr('未要求額外權限', 'No additional permission requested'), risk: '' }]).forEach(permission => {
             const chip = detailElement(
                 'span',
                 `extension-permission-chip ${['system', 'irreversible', 'external_write'].includes(permission.risk) ? 'is-danger' : ''}`.trim(),
-                permission.risk ? `${permission.name} · ${permission.risk}` : permission.name
+                permission.risk ? `${permission.name} · ${riskLabel(permission.risk)}` : permission.name
             );
             chip.title = permission.description || chip.textContent;
             chips.appendChild(chip);
         });
         permissions.appendChild(chips);
-        const digest = detailElement('code', 'extension-detail-digest', item.manifest_sha256 || '未提供 manifest digest');
+        const permissionDetails = detailElement('div', 'extension-permission-detail-list');
+        permissionItems.forEach(permission => {
+            const row = detailElement('div', 'extension-permission-detail-row');
+            const copy = detailElement('div');
+            copy.append(
+                detailElement('strong', '', permission.name),
+                detailElement('span', '', permission.description || tr('未提供權限說明。', 'No permission description is available.'))
+            );
+            row.append(copy, badge(riskLabel(permission.risk), ['system', 'irreversible', 'external_write'].includes(permission.risk) ? 'is-error' : ''));
+            permissionDetails.appendChild(row);
+        });
+        if (permissionItems.length) permissions.appendChild(permissionDetails);
+        const digest = detailElement('code', 'extension-detail-digest', item.manifest_sha256 || tr('未提供資訊清單摘要', 'Manifest digest is unavailable'));
         permissions.appendChild(digest);
         details.appendChild(permissions);
         container.appendChild(details);
@@ -1919,32 +2030,27 @@ async function saveModelProviderSecrets() {
         iconNode.dataset.lucide = iconFor(item);
         icon.appendChild(iconNode);
         const copy = detailElement('div');
-        copy.appendChild(detailElement('span', 'workflow-eyebrow', item.category || 'EXTENSION'));
+        copy.appendChild(detailElement('span', 'workflow-eyebrow', categoryLabel(item.category || item.kind)));
         const title = detailElement('h1', '', item.name || item.id);
         title.id = 'extension-detail-title';
         title.tabIndex = -1;
         copy.appendChild(title);
-        copy.appendChild(detailElement(
-            'p', '',
-            item.id === N8N_EXTENSION_ID
-                ? '將本機自動化工作流程連接至 Workbench，保留人工核准與安全邊界。'
-                : item.description || '由 Workbench 管理的選用擴充功能。'
-        ));
+        copy.appendChild(detailElement('p', '', extensionDocumentation(item).summary));
         identity.append(icon, copy);
         const heroActions = detailElement('div', 'extension-detail-hero-actions');
         heroActions.appendChild(badge(
-            item.effective_enabled ? '可使用' : item.installed ? '已安裝，未啟用' : '尚未安裝',
+            item.effective_enabled ? tr('可使用', 'Available') : item.installed ? tr('已安裝，未啟用', 'Installed but disabled') : tr('尚未安裝', 'Not installed'),
             item.effective_enabled ? 'is-healthy' : 'is-warning'
         ));
         if (!item.installed) {
-            const install = actionButton('安裝', 'install', 'download', 'btn btn-primary');
+            const install = actionButton(tr('安裝', 'Install'), 'install', 'download', 'btn btn-primary');
             install.disabled = !extensionControlPolicy(item).canInstall;
             install.addEventListener('click', () => openPermissionReview(item, 'install', {
                 onComplete: () => openExtensionDetail(item.id),
             }));
             heroActions.appendChild(install);
         } else if (!item.effective_enabled) {
-            const enable = actionButton('審查並啟用', 'enable', 'power', 'btn btn-primary');
+            const enable = actionButton(tr('審查並啟用', 'Review and enable'), 'enable', 'power', 'btn btn-primary');
             enable.addEventListener('click', () => openPermissionReview(
                 item,
                 state.projectId && item.global_enabled ? 'project_enable' : 'enable',
@@ -1954,11 +2060,11 @@ async function saveModelProviderSecrets() {
             ));
             heroActions.appendChild(enable);
         } else if (item.id === N8N_EXTENSION_ID) {
-            const use = actionButton('立即使用', 'n8n-use', 'arrow-up-right', 'btn btn-primary');
+            const use = actionButton(tr('立即使用', 'Use now'), 'n8n-use', 'arrow-up-right', 'btn btn-primary');
             use.addEventListener('click', openN8nWorkspace);
             heroActions.appendChild(use);
         } else if (item.connection_required) {
-            const connect = actionButton('設定連線', 'connections', 'link', 'btn btn-primary');
+            const connect = actionButton(tr('設定連線', 'Set up connection'), 'connections', 'link', 'btn btn-primary');
             connect.addEventListener('click', () => {
                 closeExtensionDetail();
                 void selectWorkspaceTab('connections');
@@ -1968,18 +2074,34 @@ async function saveModelProviderSecrets() {
         hero.append(identity, heroActions);
         container.appendChild(hero);
 
+        appendUsageGuide(container, item);
+
         if (item.installed) {
-            const settings = detailSection('settings', 'SETTINGS', '設定', '先管理服務與擴充權限，再視需要查看其他能力。');
+            const settings = detailSection('settings', tr('設定', 'SETTINGS'), tr('設定', 'Settings'), tr('先管理服務與擴充權限，再視需要查看其他能力。', 'Manage service and extension permission before using other capabilities.'));
             if (item.id === N8N_EXTENSION_ID) appendN8nRuntimeSetting(settings.body, item);
             appendExtensionAuthorization(settings.body, item);
             container.appendChild(settings.section);
 
-            const features = detailSection('features', 'FEATURES', '功能', '安裝後可使用的主要能力。');
+            const features = detailSection('features', tr('可用功能', 'FEATURES'), tr('Agent 可以使用哪些功能', 'Capabilities available to the Agent'), tr('以下只列出已通過政策並會實際提供給 Agent 的能力。', 'Only capabilities that passed policy and are actually exposed to the Agent are listed.'));
             if (item.id === N8N_EXTENSION_ID) {
                 appendN8nFeatures(features.body, item);
             } else {
+                const documentation = extensionDocumentation(item);
+                if (documentation.tools.length) {
+                    documentation.tools.forEach(tool => {
+                        const row = detailSettingRow(
+                            tool.label || tool.name,
+                            `${tool.description || tr('由此外掛提供的工具。', 'A tool provided by this extension.')} ${tr('技術名稱', 'Technical name')}：${tool.name}`
+                        );
+                        row.actions.appendChild(badge(
+                            `${tool.access === 'write' ? tr('每次需批准', 'Approval required each time') : tr('可直接讀取', 'Read allowed directly')} · ${riskLabel(tool.risk)}`,
+                            tool.access === 'write' ? 'is-warning' : ''
+                        ));
+                        features.body.appendChild(row.row);
+                    });
+                }
                 const capabilities = Array.isArray(item.capabilities) ? item.capabilities : [];
-                (capabilities.length ? capabilities : ['extension_capability']).forEach(capability => {
+                (documentation.tools.length ? [] : (capabilities.length ? capabilities : ['extension_capability'])).forEach(capability => {
                     const [label, description] = capabilityLabel(capability);
                     features.body.appendChild(detailSettingRow(label, description).row);
                 });
@@ -2000,7 +2122,7 @@ async function saveModelProviderSecrets() {
                 ? await workflows.refreshService()
                 : await request('/api/integrations/n8n/status');
         } catch (error) {
-            state.n8nService = { load_error: `無法取得 n8n 狀態：${error.message}` };
+            state.n8nService = { load_error: `${tr('無法取得 n8n 狀態', 'Unable to load n8n status')}：${error.message}` };
         } finally {
             state.n8nServiceLoading = false;
             if (state.selectedExtensionId === N8N_EXTENSION_ID) renderExtensionDetail();
@@ -2018,7 +2140,7 @@ async function saveModelProviderSecrets() {
             }
             await refreshN8nService();
         } catch (error) {
-            state.deps?.showToast?.(`n8n 操作失敗：${error.message}`, 'error');
+            state.deps?.showToast?.(`${tr('n8n 操作失敗', 'n8n operation failed')}：${error.message}`, 'error');
             button.disabled = false;
         }
     }
@@ -2073,7 +2195,9 @@ async function saveModelProviderSecrets() {
             const node = byId(`extension-${section}-count`);
             if (!node) return;
             node.textContent = String(count);
-            node.setAttribute('aria-label', `${count} 個${section === 'installed' ? '已安裝' : '未安裝'}`);
+            node.setAttribute('aria-label', section === 'installed'
+                ? tr(`${count} 個已安裝`, `${count} installed`)
+                : tr(`${count} 個未安裝`, `${count} not installed`));
         });
         ['installed', 'available', 'local'].forEach(section => {
             const list = byId(`extension-${section}-list`);
@@ -2087,10 +2211,10 @@ async function saveModelProviderSecrets() {
             ].some(value => String(value || '').toLocaleLowerCase().includes(query)));
             list.replaceChildren();
             if (!items.length) {
-                list.appendChild(stateBlock(query ? '找不到符合的擴充。' : {
-                    installed: '尚未安裝任何擴充。',
-                    available: '目前沒有未安裝的擴充。',
-                    local: '尚未註冊本機受信任擴充。'
+                list.appendChild(stateBlock(query ? tr('找不到符合的擴充。', 'No matching extension was found.') : {
+                    installed: tr('尚未安裝任何擴充。', 'No extension is installed.'),
+                    available: tr('目前沒有未安裝的擴充。', 'There are no extensions available to install.'),
+                    local: tr('尚未註冊本機受信任擴充。', 'No trusted local extension is registered.')
                 }[section]));
                 return;
             }
@@ -2101,17 +2225,17 @@ async function saveModelProviderSecrets() {
 
     function loading() {
         ['installed', 'available'].forEach(section => {
-            byId(`extension-${section}-list`)?.replaceChildren(stateBlock('載入擴充中…', 'is-loading'));
+            byId(`extension-${section}-list`)?.replaceChildren(stateBlock(tr('載入擴充中…', 'Loading extensions…'), 'is-loading'));
         });
         if (state.activeTab === 'local' && !byId('extension-local-path')?.value) {
-            byId('extension-local-list')?.replaceChildren(stateBlock('載入本機擴充中…', 'is-loading'));
+        byId('extension-local-list')?.replaceChildren(stateBlock(tr('載入本機擴充中…', 'Loading local extensions…'), 'is-loading'));
         }
     }
 
     function renderError(error) {
         ['installed', 'available', 'local'].forEach(section => {
             byId(`extension-${section}-list`)?.replaceChildren(
-                stateBlock(`無法載入擴充：${error.message}`, 'is-error')
+                stateBlock(`${tr('無法載入擴充', 'Unable to load extensions')}：${error.message}`, 'is-error')
             );
         });
     }
@@ -2145,7 +2269,9 @@ async function saveModelProviderSecrets() {
                     manifest_sha256: enabled ? item.manifest_sha256 : null
                 })
             });
-            state.deps?.showToast?.(`${item.name || item.id} 已${enabled ? '啟用' : '停用'}。`, 'success');
+            state.deps?.showToast?.(enabled
+                ? tr(`${item.name || item.id} 已啟用。`, `${item.name || item.id} was enabled.`)
+                : tr(`${item.name || item.id} 已停用。`, `${item.name || item.id} was disabled.`), 'success');
             await loadCatalog();
             if (item.id === N8N_EXTENSION_ID) {
                 await window.workbenchN8nWorkflows?.refreshExtensionState?.();
@@ -2153,7 +2279,7 @@ async function saveModelProviderSecrets() {
             }
             await state.deps?.reloadProject?.();
         } catch (error) {
-            state.deps?.showToast?.(`更新擴充失敗：${error.message}`, 'error');
+            state.deps?.showToast?.(`${tr('更新擴充失敗', 'Unable to update extension')}：${error.message}`, 'error');
             // A failed cleanup response may still have committed an
             // authority-reducing disable. Reload the server snapshot instead
             // of restoring a stale client-side enabled control.
@@ -2177,14 +2303,14 @@ async function saveModelProviderSecrets() {
                 })
             });
             control.dataset.previousMode = mode;
-            state.deps?.showToast?.(`${item.name || item.id} 的專案設定已更新。`, 'success');
+            state.deps?.showToast?.(tr(`${item.name || item.id} 的專案設定已更新。`, `Project settings for ${item.name || item.id} were updated.`), 'success');
             if (!byId('extension-center-workspace')?.hidden) await loadCatalog();
             if (item.id === N8N_EXTENSION_ID) {
                 await window.workbenchN8nWorkflows?.refreshExtensionState?.();
             }
             await renderProjectAssignments(byId('project-settings-extension-list'), projectId);
         } catch (error) {
-            state.deps?.showToast?.(`更新專案擴充失敗：${error.message}`, 'error');
+            state.deps?.showToast?.(`${tr('更新專案擴充失敗', 'Unable to update the project extension')}：${error.message}`, 'error');
             // Project disable is also fail-closed when runtime cleanup fails.
             // Re-read the persisted mode before deciding which option to show.
             await loadCatalog().catch(() => {
@@ -2199,11 +2325,12 @@ async function saveModelProviderSecrets() {
     }
 
     function reviewDescription(operation, item) {
-        if (operation === 'trust') return `信任擴充「${item.name || item.id}」的目前 manifest`;
-        if (operation === 'install') return `安裝、信任並啟用「${item.name || item.id}」的下列能力`;
-        if (operation === 'project_enable') return `允許「${item.name || item.id}」在指定專案生效`;
-        if (operation === 'activate') return `允許並啟用「${item.name || item.id}」作為聊天模型`;
-        return `重新啟用「${item.name || item.id}」及下列能力`;
+        const name = item.name || item.id;
+        if (operation === 'trust') return tr(`信任擴充「${name}」目前的資訊清單`, `Trust the current manifest for “${name}”`);
+        if (operation === 'install') return tr(`安裝、信任並啟用「${name}」`, `Install, trust, and enable “${name}”`);
+        if (operation === 'project_enable') return tr(`允許「${name}」在指定專案生效`, `Allow “${name}” in the selected project`);
+        if (operation === 'activate') return tr(`允許並啟用「${name}」作為聊天模型`, `Allow and enable “${name}” as a chat model`);
+        return tr(`重新啟用「${name}」`, `Enable “${name}” again`);
     }
 
     function openPermissionReview(item, operation, context = {}) {
@@ -2228,16 +2355,27 @@ async function saveModelProviderSecrets() {
         const name = document.createElement('strong');
         name.textContent = reviewDescription(operation, item);
         const source = document.createElement('span');
-        source.textContent = `來源：${item.origin || 'unknown'} · 版本：${item.version || '--'}`;
+        source.textContent = `${tr('來源', 'Source')}：${sourceLabel(item.origin || 'unknown')} · ${tr('版本', 'Version')}：${item.version || '--'}`;
         const digest = document.createElement('span');
-        digest.textContent = `Manifest SHA-256：${item.manifest_sha256 || '未提供'}`;
+        digest.textContent = `${tr('資訊清單 SHA-256', 'Manifest SHA-256')}：${item.manifest_sha256 || tr('未提供', 'Unavailable')}`;
         identity.append(name, source, digest);
         summary.appendChild(identity);
+
+        const documentation = extensionDocumentation(item);
+        const purpose = document.createElement('div');
+        purpose.className = 'extension-permission-purpose';
+        purpose.append(
+            detailElement('strong', '', tr('這項擴充會做什麼', 'What this extension does')),
+            detailElement('p', '', documentation.summary),
+            detailElement('strong', '', tr('批准規則', 'Approval rules')),
+            detailElement('p', '', documentation.approval_policy)
+        );
+        summary.appendChild(purpose);
 
         const list = document.createElement('div');
         list.className = 'extension-permission-list';
         const permissions = (item.permissions || []).map(permissionInfo);
-        (permissions.length ? permissions : [{ name: '未要求額外能力', risk: '', description: '仍受 Workbench 能力閘門與 audit 約束。' }])
+        (permissions.length ? permissions : [{ name: tr('未要求額外能力', 'No additional capability requested'), risk: '', description: tr('仍受 Workbench 能力閘門與稽核限制。', 'Workbench capability gates and audit rules still apply.') }])
             .forEach(permission => {
                 const row = document.createElement('div');
                 row.className = 'extension-permission-row';
@@ -2249,8 +2387,8 @@ async function saveModelProviderSecrets() {
         const trustCopy = byId('extension-trust-confirm')?.closest('label')?.querySelector('span');
         if (trustCopy) {
             trustCopy.textContent = item.origin === 'local'
-                ? '我已確認本機來源、manifest digest 與上述權限，並信任此擴充。'
-                : '我已閱讀上述權限，確認允許此內建擴充在選定範圍生效。';
+                ? tr('我已確認本機來源、資訊清單摘要與上述權限，並信任此擴充。', 'I verified the local source, manifest digest, and permissions, and I trust this extension.')
+                : tr('我已閱讀上述權限，確認允許此內建擴充在選定範圍生效。', 'I reviewed these permissions and allow this built-in extension in the selected scope.');
         }
         trust.checked = false;
         confirm.disabled = true;
@@ -2326,7 +2464,7 @@ async function saveModelProviderSecrets() {
                 });
                 current = result.extension || current;
             }
-            state.deps?.showToast?.(`${item.name || item.id} 的權限操作已完成。`, 'success');
+            state.deps?.showToast?.(tr(`${item.name || item.id} 的權限操作已完成。`, `The permission update for ${item.name || item.id} is complete.`), 'success');
             closePermissionReview();
             if (!byId('extension-center-workspace')?.hidden) await loadCatalog();
             if (item.id === N8N_EXTENSION_ID) {
@@ -2341,7 +2479,7 @@ async function saveModelProviderSecrets() {
                 await selectWorkspaceTab('connections');
             }
         } catch (error) {
-            state.deps?.showToast?.(`權限操作失敗：${error.message}`, 'error');
+            state.deps?.showToast?.(`${tr('權限操作失敗', 'Permission update failed')}：${error.message}`, 'error');
             confirm.disabled = false;
             if (!byId('extension-center-workspace')?.hidden) await loadCatalog().catch(() => {});
         }
@@ -2350,7 +2488,7 @@ async function saveModelProviderSecrets() {
     async function reviewProviderModel(extensionId, onComplete) {
         const catalog = await loadCatalog();
         const item = catalog.extensions.find(entry => entry.id === extensionId);
-        if (!item) throw new Error(`找不到 API 模型權限項目：${extensionId}`);
+        if (!item) throw new Error(tr(`找不到 API 模型權限項目：${extensionId}`, `No API model permission entry was found: ${extensionId}`));
         if (item.effective_enabled) {
             await onComplete?.();
             return;
@@ -2367,12 +2505,12 @@ async function saveModelProviderSecrets() {
             const failed = ['error', 'failed', 'unavailable'].includes(health.status);
             const detail = health.message ? `：${health.message}` : '';
             state.deps?.showToast?.(
-                `${item.name || item.id} 健康狀態：${health.status}${detail}`,
+                tr(`${item.name || item.id} 健康狀態：${health.status}${detail}`, `${item.name || item.id} health: ${health.status}${detail}`),
                 healthy ? 'success' : (failed ? 'error' : 'warning')
             );
             await loadCatalog();
         } catch (error) {
-            state.deps?.showToast?.(`健康檢查失敗：${error.message}`, 'error');
+            state.deps?.showToast?.(`${tr('健康檢查失敗', 'Health check failed')}：${error.message}`, 'error');
             button.disabled = false;
         }
     }
@@ -2381,21 +2519,21 @@ async function saveModelProviderSecrets() {
         const panel = byId('extension-audit-panel');
         const list = byId('extension-audit-list');
         byId('extension-audit-subtitle').textContent = item.name || item.id;
-        list.replaceChildren(stateBlock('載入 audit 中…', 'is-loading'));
+        list.replaceChildren(stateBlock(tr('載入稽核紀錄中…', 'Loading audit records…'), 'is-loading'));
         panel.hidden = false;
         try {
             const data = await request(`/api/extensions/${encoded(item.id)}/audits?limit=50`);
             const audits = Array.isArray(data.audits) ? data.audits : [];
             list.replaceChildren();
             if (!audits.length) {
-                list.appendChild(stateBlock('尚無執行紀錄。'));
+                list.appendChild(stateBlock(tr('尚無執行紀錄。', 'No activity has been recorded.')));
                 return;
             }
             audits.forEach(audit => {
                 const row = document.createElement('div');
                 row.className = 'extension-audit-row';
                 const title = document.createElement('strong');
-                title.textContent = audit.capability_name || audit.action || audit.event || '擴充操作';
+                title.textContent = audit.capability_name || audit.action || audit.event || tr('擴充操作', 'Extension activity');
                 const meta = document.createElement('span');
                 meta.textContent = [
                     audit.status || audit.outcome,
@@ -2407,22 +2545,22 @@ async function saveModelProviderSecrets() {
                 list.appendChild(row);
             });
         } catch (error) {
-            list.replaceChildren(stateBlock(`無法載入 audit：${error.message}`, 'is-error'));
+            list.replaceChildren(stateBlock(`${tr('無法載入稽核紀錄', 'Unable to load audit records')}：${error.message}`, 'is-error'));
         }
     }
 
     async function removeExtension(item, button) {
         if (!item.removable) return;
         const retentionNote = item.origin === 'local'
-            ? '來源資料夾不會被刪除。'
+            ? tr('來源資料夾不會被刪除。', 'The source folder will not be deleted.')
             : item.connection_required
-                ? '已保存的帳號憑證不會一併刪除；如不再使用，請先在「連線」中斷開帳號。'
-                : '內建目錄項目仍會保留，之後可重新安裝。';
-        if (!window.confirm(`確定移除擴充「${item.name || item.id}」？${retentionNote}`)) return;
+                ? tr('已保存的帳號憑證不會一併刪除；如不再使用，請先在「連線」中斷開帳號。', 'Saved account credentials are retained. Disconnect the account under Connections if it is no longer needed.')
+                : tr('內建目錄項目仍會保留，之後可重新安裝。', 'The built-in catalog entry remains available for later installation.');
+        if (!window.confirm(tr(`確定移除擴充「${item.name || item.id}」？${retentionNote}`, `Remove “${item.name || item.id}”? ${retentionNote}`))) return;
         button.disabled = true;
         try {
             await request(`/api/extensions/${encoded(item.id)}`, { method: 'DELETE' });
-            state.deps?.showToast?.(`${item.name || item.id} 已移除註冊。`, 'success');
+            state.deps?.showToast?.(tr(`${item.name || item.id} 已移除註冊。`, `${item.name || item.id} was removed.`), 'success');
             if (state.selectedExtensionId === item.id) closeExtensionDetail();
             await loadCatalog();
             if (item.id === N8N_EXTENSION_ID) {
@@ -2430,7 +2568,7 @@ async function saveModelProviderSecrets() {
             }
             await state.deps?.reloadProject?.();
         } catch (error) {
-            state.deps?.showToast?.(`移除擴充失敗：${error.message}`, 'error');
+            state.deps?.showToast?.(`${tr('移除擴充失敗', 'Unable to remove extension')}：${error.message}`, 'error');
             button.disabled = false;
         }
     }
@@ -2441,7 +2579,7 @@ async function saveModelProviderSecrets() {
         if (!filename || !button) return;
         button.disabled = true;
         const list = byId('extension-local-list');
-        list.replaceChildren(stateBlock('正在驗證本機 manifest…', 'is-loading'));
+        list.replaceChildren(stateBlock(tr('正在驗證本機擴充資訊清單…', 'Validating the local extension manifest…'), 'is-loading'));
         try {
             const data = await request(`/api/extensions/local/inspect${projectQuery()}`, {
                 method: 'POST',
@@ -2449,7 +2587,7 @@ async function saveModelProviderSecrets() {
                 body: JSON.stringify({ filename })
             });
             const item = data.extension || data.inspection || data.manifest || data;
-            if (!item?.id) throw new Error('後端未回傳可識別的 extension manifest');
+            if (!item?.id) throw new Error(tr('後端未回傳可識別的擴充資訊清單', 'The backend did not return an identifiable extension manifest'));
             list.replaceChildren(createExtensionCard(item));
             safeCreateIcons();
             if (!item.installed) {
@@ -2457,10 +2595,10 @@ async function saveModelProviderSecrets() {
             } else if (!item.trusted) {
                 openPermissionReview(item, 'trust');
             } else {
-                state.deps?.showToast?.(`${item.name || item.id} 的目前 manifest 已安裝並信任。`, 'success');
+                state.deps?.showToast?.(tr(`${item.name || item.id} 的目前資訊清單已安裝並信任。`, `The current manifest for ${item.name || item.id} is installed and trusted.`), 'success');
             }
         } catch (error) {
-            list.replaceChildren(stateBlock(`Manifest 驗證失敗：${error.message}`, 'is-error'));
+            list.replaceChildren(stateBlock(`${tr('資訊清單驗證失敗', 'Manifest validation failed')}：${error.message}`, 'is-error'));
         } finally {
             button.disabled = false;
         }
@@ -2468,13 +2606,13 @@ async function saveModelProviderSecrets() {
 
     async function renderProjectAssignments(container, projectId) {
         if (!container || !projectId) return;
-        container.replaceChildren(stateBlock('載入專案擴充中…', 'is-loading'));
+        container.replaceChildren(stateBlock(tr('載入專案擴充中…', 'Loading project extensions…'), 'is-loading'));
         try {
             const data = await request(`/api/extensions?project_id=${encoded(projectId)}`);
             const items = (data.extensions || []).filter(item => item.installed);
             container.replaceChildren();
             if (!items.length) {
-                container.appendChild(stateBlock('尚未安裝可分配給此專案的擴充。'));
+                container.appendChild(stateBlock(tr('尚未安裝可分配給此專案的擴充。', 'No installed extension can be assigned to this project.')));
                 return;
             }
             items.forEach(item => {
@@ -2485,14 +2623,14 @@ async function saveModelProviderSecrets() {
                 title.textContent = item.name || item.id;
                 const meta = document.createElement('small');
                 meta.textContent = item.global_enabled === false
-                    ? '全域已停用，專案無法啟用'
+                    ? tr('全域已停用，專案無法啟用', 'Globally disabled; this project cannot enable it')
                     : `${item.publisher || item.origin || 'Workbench'} · ${item.version || '--'}`;
                 copy.append(title, meta);
                 row.append(copy, projectOverrideSelect(item, projectId));
                 container.appendChild(row);
             });
         } catch (error) {
-            container.replaceChildren(stateBlock(`無法載入專案擴充：${error.message}`, 'is-error'));
+            container.replaceChildren(stateBlock(`${tr('無法載入專案擴充', 'Unable to load project extensions')}：${error.message}`, 'is-error'));
         }
     }
 
@@ -2527,7 +2665,7 @@ async function saveModelProviderSecrets() {
         if (!project?.id || !state.initialized) return;
         closePermissionReview({ restoreFocus: false });
         state.settingsProject = { ...project };
-        byId('project-settings-title').lastChild.textContent = `專案設定 · ${project.name}`;
+        byId('project-settings-title').lastChild.textContent = tr(`專案設定 · ${project.name}`, `Project settings · ${project.name}`);
         byId('project-settings-name').value = project.name || '';
         byId('project-settings-root-path').value = project.root_path || '';
         byId('project-settings-permission-mode').value = [
@@ -2557,7 +2695,7 @@ async function saveModelProviderSecrets() {
         const rootPath = byId('project-settings-root-path').value.trim();
         const permissionMode = byId('project-settings-permission-mode').value;
         if (!name || !rootPath) {
-            state.deps?.showToast?.('專案名稱與資料夾不可留空。', 'error');
+            state.deps?.showToast?.(tr('專案名稱與資料夾不可留空。', 'Project name and folder are required.'), 'error');
             return;
         }
         const save = byId('project-settings-save');
@@ -2575,11 +2713,11 @@ async function saveModelProviderSecrets() {
                     body: JSON.stringify({ root_path: rootPath })
                 });
             }
-            state.deps?.showToast?.('專案設定已儲存。', 'success');
+            state.deps?.showToast?.(tr('專案設定已儲存。', 'Project settings were saved.'), 'success');
             closeProjectSettings();
             await state.deps?.reloadProject?.();
         } catch (error) {
-            state.deps?.showToast?.(`儲存專案設定失敗：${error.message}`, 'error');
+            state.deps?.showToast?.(`${tr('儲存專案設定失敗', 'Unable to save project settings')}：${error.message}`, 'error');
         } finally {
             save.disabled = false;
         }
@@ -2606,6 +2744,7 @@ async function saveModelProviderSecrets() {
 
     async function open(tab = 'installed', projectId = null) {
         if (!state.initialized) return;
+        applyExtensionLocale();
         closePermissionReview({ restoreFocus: false });
         state.selectedExtensionId = null;
         state.n8nService = null;
@@ -2641,7 +2780,7 @@ async function saveModelProviderSecrets() {
         const item = (state.response.extensions || [])
             .find(entry => String(entry.id) === String(extensionId));
         if (!item) {
-            state.deps?.showToast?.('找不到指定的擴充功能。', 'warning');
+            state.deps?.showToast?.(tr('找不到指定的擴充功能。', 'The requested extension was not found.'), 'warning');
             return;
         }
         if (item.installed) {
@@ -2678,6 +2817,13 @@ async function saveModelProviderSecrets() {
         if (workspace && workbenchBody && workspace.parentElement !== workbenchBody) {
             workbenchBody.appendChild(workspace);
         }
+        applyExtensionLocale();
+        window.addEventListener('workbench:language-change', () => {
+            applyExtensionLocale();
+            projectOptions(state.projectId);
+            renderLists();
+            if (state.selectedExtensionId) renderExtensionDetail();
+        });
         byId('extensions-close')?.addEventListener('click', close);
         byId('extensions-close-btn')?.addEventListener('click', close);
         byId('extension-detail-back')?.addEventListener('click', closeExtensionDetail);
