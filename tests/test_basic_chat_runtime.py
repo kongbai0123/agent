@@ -531,6 +531,131 @@ def test_basic_stream_runs_global_mcp_tool_in_independent_chat(monkeypatch):
     assert fake_db.messages[-1]["content"] == "已開啟瀏覽器並搜尋 n8n。"
 
 
+def test_chat_model_without_native_tool_calls_uses_governed_compat_protocol(monkeypatch):
+    fake_db = FakeDatabase()
+    monkeypatch.setattr(chat_runtime, "database", fake_db)
+    monkeypatch.setattr(
+        chat_runtime,
+        "model_supports_tools",
+        lambda _settings, _model, *, project_id=None: False,
+    )
+    digest = hashlib.sha256(b"compat-browser-mcp").hexdigest()
+    executions = []
+
+    def navigate(call):
+        executions.append(dict(call.arguments))
+        return {"title": "n8n", "url": call.arguments["url"]}
+
+    definition = ToolDefinition(
+        name="mcp.browser.browser_navigate",
+        description="Navigate the isolated browser",
+        input_schema={
+            "type": "object",
+            "properties": {"url": {"type": "string"}},
+            "required": ["url"],
+            "additionalProperties": False,
+        },
+        access=ToolAccess.READ,
+        handler=navigate,
+        extension_id="mcp.browser-playwright",
+        manifest_sha256=digest,
+    )
+    registry = ToolRegistry()
+    registry.register(definition, project_ids=("__independent_chat__",))
+    dispatcher = ToolDispatcher(
+        registry,
+        scope_resolver=lambda _definition, _call: ToolScopeState(
+            installed=True,
+            trusted=True,
+            enabled=True,
+            healthy=True,
+            resource_allowed=True,
+            manifest_sha256=digest,
+        ),
+    )
+
+    class ReadOnlyApprovals:
+        def event_queue(self, _run_id):
+            return asyncio.Queue()
+
+        async def approval_callback(self, _request):
+            raise AssertionError("read tools must not request approval")
+
+        def mark_consumed(self, _approval_id):
+            return None
+
+        def close_run(self, _run_id):
+            return None
+
+    runtime = HostToolRuntime(
+        registry=registry,
+        dispatcher=dispatcher,
+        approval_broker=ReadOnlyApprovals(),
+        independent_scope_id="__independent_chat__",
+    )
+    compat_response = FakeResponse([
+        encoded_chunk(
+            '<workbench_tool_call>{"name":"mcp.browser.browser_navigate",'
+            '"arguments":{"url":"https://www.google.com/search?q=n8n"}}'
+            '</workbench_tool_call>'
+        ),
+        encoded_chunk(done=True, done_reason="stop"),
+    ])
+    final_response = FakeResponse([
+        encoded_chunk("已完成搜尋。"),
+        encoded_chunk(done=True, done_reason="stop"),
+    ])
+    payloads = []
+
+    def fake_post_chat(_settings, payload, **_kwargs):
+        payloads.append(payload)
+        return compat_response if len(payloads) == 1 else final_response
+
+    control = ChatRunControl(
+        "run_compat_tools", "sess_basic", "turn_current", "model-a", "chat"
+    )
+    control.start_deadline(60)
+    events = parse_sse(asyncio.run(collect_stream(
+        request=SimpleNamespace(messages=[]),
+        settings={"ollama_url": "http://127.0.0.1:11434", "model_provider": "ollama"},
+        model="model-a",
+        session_id="sess_basic",
+        turn_id="turn_current",
+        run_id="run_compat_tools",
+        prompt_sha256="digest",
+        user_message_id=3,
+        user_query="請開啟瀏覽器搜尋 n8n",
+        temporary_context="",
+        images=[],
+        run_control=control,
+        project_id=None,
+        post_chat=fake_post_chat,
+        host_tool_runtime=runtime,
+    )))
+
+    assert executions == [{"url": "https://www.google.com/search?q=n8n"}]
+    assert [name for name, _payload in events] == [
+        "meta", "tool_start", "tool_end", "token", "metrics", "done"
+    ]
+    assert "tools" not in payloads[0]
+    assert "tool_choice" not in payloads[0]
+    assert any(
+        "compatible MCP protocol" in message.get("content", "")
+        for message in payloads[0]["messages"]
+    )
+    assert any(
+        message.get("role") == "system"
+        and "Governed Workbench tool result" in message.get("content", "")
+        for message in payloads[1]["messages"]
+    )
+    assert all(
+        "<workbench_tool_call>" not in payload.get("content", "")
+        for name, payload in events if name == "token"
+    )
+    assert fake_db.messages[-1]["content"] == "已完成搜尋。"
+    assert fake_db.runs[-1]["metrics"]["model_eval"]["tool_protocol"] == "compatible"
+
+
 def test_basic_stream_never_retries_an_indeterminate_external_write(monkeypatch):
     fake_db = FakeDatabase()
     monkeypatch.setattr(chat_runtime, "database", fake_db)
