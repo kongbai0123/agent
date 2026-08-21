@@ -116,6 +116,44 @@ def test_traditional_chinese_permission_copy_hides_raw_english_descriptions():
         assert label in EXTENSIONS
 
 
+def test_unavailable_detail_uses_localized_fallback_and_cannot_enable():
+    detail = EXTENSIONS[
+        EXTENSIONS.index("function renderExtensionDetail"):
+        EXTENSIONS.index("async function refreshN8nService")
+    ]
+    assert "controlPolicy.unavailable" in detail
+    assert "tr('目前無法使用', 'Unavailable')" in detail
+    assert "tr('目前無法啟用', 'Cannot enable')" in detail
+    assert "enable.disabled = !canEnableHere" in detail
+    assert "if (canEnableHere)" in detail
+    assert "cursor_adapter_not_implemented" in EXTENSIONS
+    assert "此版本尚未提供 Cursor 介接器，因此目前不能使用。" in EXTENSIONS
+    assert "目前不會啟動 Cursor、不會讀取專案，也不會修改任何檔案。" in EXTENSIONS
+
+    script = r"""
+global.window = {};
+global.document = { documentElement: { lang: 'zh-TW' } };
+require('./frontend/extension-center.js');
+const documentation = window.workbenchExtensions.__testing.extensionDocumentation({
+    id: 'builtin.cursor',
+    description: 'Cursor adapter is not available in this release.',
+    availability_reason: 'cursor_adapter_not_implemented'
+});
+console.log(JSON.stringify(documentation));
+"""
+    completed = subprocess.run(
+        ["node", "-e", script],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    documentation = json.loads(completed.stdout)
+    assert documentation["summary"] == "此版本尚未提供 Cursor 介接器，因此目前不能使用。"
+    assert "Cursor adapter is not available" not in json.dumps(documentation, ensure_ascii=False)
+
+
 def test_extension_detail_tracks_live_n8n_status_and_preserves_keyboard_focus():
     assert "workbench:n8n-service-state" in EXTENSIONS
     assert "function captureDetailViewState" in EXTENSIONS

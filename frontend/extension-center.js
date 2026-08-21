@@ -1601,13 +1601,30 @@ async function saveModelProviderSecrets() {
         const documentation = item?.documentation && typeof item.documentation === 'object'
             ? item.documentation
             : {};
+        const unavailableFallback = ({
+            cursor_adapter_not_implemented: {
+                summary: tr('此版本尚未提供 Cursor 介接器，因此目前不能使用。', 'The Cursor adapter is not available in this release.'),
+                overview: tr('這是預留的 Cursor Agent 整合位置。目前不會啟動 Cursor、不會讀取專案，也不會修改任何檔案。', 'This is a reserved integration point for Cursor Agent. It does not start Cursor, read a project, or modify files in this release.'),
+                data_handling: tr('目前不會讀取、修改或傳送任何專案資料。', 'No project data is read, modified, or sent.'),
+                approval_policy: tr('因為介接器尚未完成，系統不允許啟用此功能。', 'The unavailable adapter cannot be enabled.'),
+                limitations: [tr('要等 Cursor 介接器完成並通過安全驗證後才能使用。', 'The Cursor adapter must be implemented and pass security verification before use.')],
+            },
+            excel_adapter_not_implemented: {
+                summary: tr('此版本尚未提供 Excel 介接器，因此目前不能使用。', 'The Excel adapter is not available in this release.'),
+                overview: tr('這是預留的 Microsoft Excel 整合位置。目前不會開啟 Excel，也不會讀取或修改活頁簿。', 'This is a reserved Microsoft Excel integration point. It does not open Excel or read or modify workbooks in this release.'),
+                data_handling: tr('目前不會讀取、修改或傳送任何活頁簿資料。', 'No workbook data is read, modified, or sent.'),
+                approval_policy: tr('因為介接器尚未完成，系統不允許啟用此功能。', 'The unavailable adapter cannot be enabled.'),
+                limitations: [tr('要等 Excel 介接器完成並通過安全驗證後才能使用。', 'The Excel adapter must be implemented and pass security verification before use.')],
+            },
+        })[String(item?.availability_reason || '')] || {};
+        const rawDescription = isEnglish() ? item?.description : '';
         return {
-            summary: String(documentation.summary || item?.description || tr('由 Workbench 管理的選用擴充功能。', 'An optional extension managed by Workbench.')),
-            overview: String(documentation.overview || item?.description || tr('此擴充尚未提供進一步說明。', 'No additional explanation is available for this extension.')),
+            summary: String(documentation.summary || unavailableFallback.summary || rawDescription || tr('由 Workbench 管理的選用擴充功能。', 'An optional extension managed by Workbench.')),
+            overview: String(documentation.overview || unavailableFallback.overview || rawDescription || tr('此擴充尚未提供進一步說明。', 'No additional explanation is available for this extension.')),
             common_tasks: Array.isArray(documentation.common_tasks) ? documentation.common_tasks : [],
-            data_handling: String(documentation.data_handling || tr('資料處理方式尚未提供；啟用前請先檢查權限與來源。', 'Data handling is not documented. Review permissions and origin before enabling.')),
-            approval_policy: String(documentation.approval_policy || tr('所有操作仍受 Workbench 的固定權限與專案政策限制。', 'All actions remain subject to fixed Workbench permission and project policies.')),
-            limitations: Array.isArray(documentation.limitations) ? documentation.limitations : [],
+            data_handling: String(documentation.data_handling || unavailableFallback.data_handling || tr('資料處理方式尚未提供；啟用前請先檢查權限與來源。', 'Data handling is not documented. Review permissions and origin before enabling.')),
+            approval_policy: String(documentation.approval_policy || unavailableFallback.approval_policy || tr('所有操作仍受 Workbench 的固定權限與專案政策限制。', 'All actions remain subject to fixed Workbench permission and project policies.')),
+            limitations: Array.isArray(documentation.limitations) ? documentation.limitations : (unavailableFallback.limitations || []),
             tools: Array.isArray(documentation.tools) ? documentation.tools : [],
             runtime: documentation.runtime && typeof documentation.runtime === 'object'
                 ? documentation.runtime
@@ -1632,7 +1649,6 @@ async function saveModelProviderSecrets() {
         card.className = `extension-card extension-discovery-card ${item.runtime_available === false ? 'is-disabled' : ''}`.trim();
         card.dataset.extensionId = String(item.id);
         const controlPolicy = extensionControlPolicy(item);
-
         const head = document.createElement('div');
         head.className = 'extension-card-head';
         const icon = document.createElement('span');
@@ -2038,8 +2054,20 @@ async function saveModelProviderSecrets() {
         copy.appendChild(detailElement('p', '', extensionDocumentation(item).summary));
         identity.append(icon, copy);
         const heroActions = detailElement('div', 'extension-detail-hero-actions');
+        const controlPolicy = extensionControlPolicy(item);
+        const canEnableHere = controlPolicy.canEnable || !!(
+            !controlPolicy.unavailable
+            && state.projectId
+            && item.installed
+            && item.trusted
+            && item.global_enabled
+            && item.global_approval_current === true
+            && item.configuration_enabled !== false
+        );
         heroActions.appendChild(badge(
-            item.effective_enabled ? tr('可使用', 'Available') : item.installed ? tr('已安裝，未啟用', 'Installed but disabled') : tr('尚未安裝', 'Not installed'),
+            controlPolicy.unavailable
+                ? tr('目前無法使用', 'Unavailable')
+                : item.effective_enabled ? tr('可使用', 'Available') : item.installed ? tr('已安裝，未啟用', 'Installed but disabled') : tr('尚未安裝', 'Not installed'),
             item.effective_enabled ? 'is-healthy' : 'is-warning'
         ));
         if (!item.installed) {
@@ -2050,14 +2078,23 @@ async function saveModelProviderSecrets() {
             }));
             heroActions.appendChild(install);
         } else if (!item.effective_enabled) {
-            const enable = actionButton(tr('審查並啟用', 'Review and enable'), 'enable', 'power', 'btn btn-primary');
-            enable.addEventListener('click', () => openPermissionReview(
-                item,
-                state.projectId && item.global_enabled ? 'project_enable' : 'enable',
-                state.projectId && item.global_enabled
-                    ? { projectId: state.projectId, onComplete: () => openExtensionDetail(item.id) }
-                    : { onComplete: () => openExtensionDetail(item.id) }
-            ));
+            const enable = actionButton(
+                controlPolicy.unavailable ? tr('目前無法啟用', 'Cannot enable') : tr('審查並啟用', 'Review and enable'),
+                'enable',
+                'power',
+                'btn btn-primary'
+            );
+            enable.disabled = !canEnableHere;
+            if (controlPolicy.unavailable) enable.title = controlPolicy.explanation;
+            if (canEnableHere) {
+                enable.addEventListener('click', () => openPermissionReview(
+                    item,
+                    state.projectId && item.global_enabled ? 'project_enable' : 'enable',
+                    state.projectId && item.global_enabled
+                        ? { projectId: state.projectId, onComplete: () => openExtensionDetail(item.id) }
+                        : { onComplete: () => openExtensionDetail(item.id) }
+                ));
+            }
             heroActions.appendChild(enable);
         } else if (item.id === N8N_EXTENSION_ID) {
             const use = actionButton(tr('立即使用', 'Use now'), 'n8n-use', 'arrow-up-right', 'btn btn-primary');
@@ -2888,6 +2925,7 @@ async function saveModelProviderSecrets() {
         __testing: Object.freeze({
             catalogSectionItems,
             extensionControlPolicy,
+            extensionDocumentation,
             createExtensionCard,
             renderExtensionDetail
         })
