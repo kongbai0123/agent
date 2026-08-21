@@ -22,7 +22,7 @@ from extension_catalog import (
     settings_manifests,
 )
 from extension_manifest import ExtensionManifest, manifest_sha256, parse_extension_manifest
-from extension_store import ExtensionStore, PROJECT_MODES
+from extension_store import ExtensionStore, PERMISSION_LEVELS, PROJECT_MODES
 
 
 MAX_LOCAL_MANIFEST_BYTES = 256 * 1024
@@ -775,6 +775,45 @@ class ExtensionRegistry:
                 + ", ".join(type(exc).__name__ for exc in rollback_errors)
             )
 
+    def set_project_permission(
+        self,
+        extension_id: str,
+        project_id: str,
+        level: str,
+        *,
+        expected_revision: int,
+        actor: str = "local_user",
+    ) -> dict[str, Any]:
+        try:
+            with self._sync_lock:
+                if level not in PERMISSION_LEVELS:
+                    raise ExtensionConflict(
+                        f"unsupported extension permission level: {level}"
+                    )
+                self._validate_project(project_id)
+                self.sync()
+                self._required_row(extension_id)
+                try:
+                    self.store.set_project_permission(
+                        extension_id,
+                        project_id,
+                        level,
+                        expected_revision=expected_revision,
+                        actor=actor,
+                    )
+                except ValueError as exc:
+                    raise ExtensionConflict(str(exc)) from exc
+                return self._item(self._required_row(extension_id), project_id)
+        except Exception as exc:
+            self._record_failure(
+                extension_id,
+                "project_permission_level",
+                exc,
+                actor=actor,
+                project_id=project_id,
+            )
+            raise
+
     def get(
         self,
         extension_id: str,
@@ -905,6 +944,7 @@ class ExtensionRegistry:
         if documentation is None and isinstance(record, ExtensionManifest):
             documentation = settings_extension_documentation(record, settings)
         project_state = self.store.project_state(row["extension_id"], project_id)
+        project_permission = self.store.project_permission(row["extension_id"], project_id)
         mode = str(project_state["mode"])
         digest = row["manifest_sha256"]
         global_approval_current = row.get("global_approved_manifest_sha256") == digest
@@ -946,6 +986,7 @@ class ExtensionRegistry:
             "global_enabled": row["global_enabled"],
             "global_approval_current": global_approval_current,
             "project_override": mode,
+            "project_permission": project_permission,
             "project_approval_current": project_approval_current,
             "effective_enabled": effective,
             "health": health,

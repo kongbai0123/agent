@@ -449,3 +449,36 @@ def test_host_tool_runtime_routes_connector_context_but_not_mcp(monkeypatch):
     ]
     assert workbench_app.host_tool_runtime.dispatcher is workbench_app.tool_dispatcher
     assert workbench_app.tool_dispatcher.hooks is workbench_app.hook_dispatcher
+
+
+@pytest.mark.parametrize(
+    ("level", "access", "tool_name", "risk_level", "expected"),
+    [
+        ("blocked", "read", "mcp.browser.browser_snapshot", "external_read", "deny"),
+        ("restricted", "read", "mcp.browser.browser_snapshot", "external_read", "allow"),
+        ("restricted", "write", "mcp.browser.browser_tabs", "external_write", "allow"),
+        ("restricted", "write", "mcp.browser.browser_type", "external_write", "require_approval"),
+        ("restricted", "write", "connector.github.issue_update", "irreversible", "require_approval"),
+        ("open", "write", "connector.github.issue_update", "irreversible", "allow"),
+    ],
+)
+def test_project_permission_level_controls_fixed_tool_policy(
+    monkeypatch, level, access, tool_name, risk_level, expected
+):
+    class Registry:
+        def get(self, extension_id, project_id, *, synchronize=False):
+            assert extension_id == "mcp.browser" or extension_id == "connector.github"
+            assert project_id == "project-one"
+            assert synchronize is False
+            return {"project_permission": {"level": level, "revision": 3}}
+
+    monkeypatch.setattr(workbench_app, "extension_registry", Registry())
+    definition = SimpleNamespace(
+        extension_id="connector.github" if tool_name.startswith("connector.") else "mcp.browser",
+        name=tool_name,
+        risk_level=risk_level,
+        access=workbench_app.ToolAccess(access),
+    )
+    call = SimpleNamespace(project_id="project-one")
+    decision = workbench_app._evaluate_tool_permission(definition, call, None)
+    assert decision.action.value == expected

@@ -2,7 +2,7 @@
 
 from typing import Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class _StrictRequest(BaseModel):
@@ -35,3 +35,15 @@ class ProjectExtensionStateRequest(_StrictRequest):
         default=None,
         pattern=r"^[a-f0-9]{64}$",
     )
+
+
+class ProjectExtensionPermissionRequest(_StrictRequest):
+    level: Literal["blocked", "restricted", "open"]
+    revision: int = Field(ge=0)
+    acknowledge_risk: bool = False
+
+    @model_validator(mode="after")
+    def require_open_risk_acknowledgement(self):
+        if self.level == "open" and self.acknowledge_risk is not True:
+            raise ValueError("open permission requires explicit risk acknowledgement")
+        return self

@@ -28,6 +28,26 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def operation_risk_class(tool_name: str, risk: str) -> str:
+    """Map a governed tool call to the user-facing permission class."""
+
+    tool_name = str(tool_name or "")
+    risk = str(risk or "external_write")
+    suffix = tool_name.rsplit(".", 1)[-1]
+    if risk == "irreversible":
+        return "high_risk"
+    if risk == "system":
+        return "system"
+    if suffix in {"browser_tabs", "browser_close"}:
+        return "low_risk"
+    if suffix in {
+        "browser_type", "browser_fill_form", "browser_select_option",
+        "browser_file_upload",
+    }:
+        return "data_input"
+    return "external_write"
+
+
 def approval_risk_presentation(request: ToolApprovalRequest) -> dict[str, Any]:
     """Return a redacted, user-facing explanation of one exact operation."""
 
@@ -58,19 +78,7 @@ def approval_risk_presentation(request: ToolApprovalRequest) -> dict[str, Any]:
         input_summary = f"準備上傳 {len(paths)} 個檔案；核准前仍須通過專案檔案範圍驗證。"
     else:
         input_summary = "沒有可安全顯示的輸入內容；請依操作名稱與可能後果判斷。"
-    if risk == "irreversible":
-        operation_class = "high_risk"
-    elif risk == "system":
-        operation_class = "system"
-    elif suffix in {"browser_tabs", "browser_close"}:
-        operation_class = "low_risk"
-    elif suffix in {
-        "browser_type", "browser_fill_form", "browser_select_option",
-        "browser_file_upload",
-    }:
-        operation_class = "data_input"
-    else:
-        operation_class = "external_write"
+    operation_class = operation_risk_class(tool_name, risk)
 
     copy = {
         "low_risk": {

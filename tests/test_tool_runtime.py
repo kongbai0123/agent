@@ -11,6 +11,8 @@ from backend.hook_runtime import GuardAction, GuardDecision, HookDispatcher, Hoo
 from backend.tool_runtime import (
     ApprovalStatus,
     InMemoryApprovalStore,
+    PolicyAction,
+    PolicyDecision,
     ToolAccess,
     ToolApprovalDecision,
     ToolApprovalError,
@@ -274,6 +276,33 @@ def test_write_without_callback_returns_resumable_approval_and_consumes_once():
             run_id="run-1", project_id="project-a", tool_name="notion.update_page",
             arguments={"value": 2}, call_id="call-fixed", approval_id=request.approval_id,
         ))
+
+
+def test_explicit_open_policy_allows_write_without_approval_prompt():
+    calls = []
+    tool = definition(
+        lambda call: calls.append(call.arguments) or {"ok": True},
+        name="browser.submit",
+        access=ToolAccess.WRITE,
+    )
+    dispatcher = ToolDispatcher(
+        ToolRegistry((tool,)),
+        scope_resolver=lambda _definition, _call: allowed_scope(),
+        policy_evaluator=lambda _definition, _call, _scope: PolicyDecision(
+            PolicyAction.ALLOW,
+            "project explicitly selected open permission",
+        ),
+    )
+
+    result = asyncio.run(dispatcher.execute(
+        run_id="run-open",
+        project_id="project-a",
+        tool_name="browser.submit",
+        arguments={"value": 9},
+    ))
+
+    assert calls == [{"value": 9}]
+    assert result.approval_id is None
 
 
 def test_argument_transform_is_revalidated_and_guard_denial_prevents_approval():

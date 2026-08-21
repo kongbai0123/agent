@@ -1807,6 +1807,102 @@ async function saveModelProviderSecrets() {
         })[String(value)] || [String(value).replaceAll('_', ' '), tr('由此擴充提供的功能。', 'A capability provided by this extension.')];
     }
 
+    function permissionLevelDescriptions() {
+        return {
+            blocked: {
+                label: tr('不開放權限', 'Blocked'),
+                summary: tr('完全不允許 Agent 使用此外掛工具。當任務需要這項能力時，系統會回報專案權限限制。', 'The Agent cannot use this extension. Tasks that require it report a project permission restriction.'),
+            },
+            restricted: {
+                label: tr('限制權限', 'Restricted'),
+                summary: tr('唯讀與低風險操作可直接進行；輸入資料、外部寫入、系統操作或不可逆操作會先列出風險與後果，再詢問你是否僅允許本次。', 'Read-only and low-risk actions run directly. Data input, external writes, system actions, and irreversible actions require an explicit one-time approval with risks and consequences.'),
+            },
+            open: {
+                label: tr('開放權限', 'Open'),
+                summary: tr('此外掛的所有已註冊工具都可直接執行，不再逐次詢問。網站內容可能誘導 Agent 輸入資料、送出表單、刪除內容、授權或付款。', 'Every registered tool from this extension can run without another prompt. Website content may induce the Agent to disclose data, submit forms, delete content, grant access, or trigger payments.'),
+            },
+        };
+    }
+
+    async function mutateProjectPermission(item, select, requestedLevel) {
+        if (!state.projectId) return;
+        const previousLevel = String((item.project_permission || {}).level || 'restricted');
+        const descriptions = permissionLevelDescriptions();
+        const copy = descriptions[requestedLevel] || descriptions.restricted;
+        if (requestedLevel === 'open') {
+            const accepted = window.confirm(
+                tr(
+                    `確定要為此專案選擇「${copy.label}」嗎？\n\n啟用後，Agent 不會再針對此外掛的輸入、外部寫入、高風險或不可逆操作詢問你。\n\n不可信網站內容可能誘導 Agent 送出資料、建立或刪除內容、授權帳號、下載檔案或觸發付款。只有在你信任此外掛、目前網站與任務內容時才應開放。`,
+                    `Use “${copy.label}” for this project?\n\nThe Agent will no longer ask before data input, external writes, high-risk actions, or irreversible actions from this extension.\n\nUntrusted website content may induce the Agent to disclose data, create or delete content, grant account access, download files, or trigger payments. Use this only when you trust the extension, current website, and task.`
+                )
+            );
+            if (!accepted) {
+                select.value = previousLevel;
+                return;
+            }
+        }
+        select.disabled = true;
+        try {
+            await request(`/api/projects/${encoded(state.projectId)}/extensions/${encoded(item.id)}/permission`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    level: requestedLevel,
+                    revision: Number((item.project_permission || {}).revision || 0),
+                    acknowledge_risk: requestedLevel === 'open',
+                }),
+            });
+            state.deps?.showToast?.(tr(`${item.name || item.id} 已切換為「${copy.label}」。`, `${item.name || item.id} is now “${copy.label}”.`), 'success');
+            await loadCatalog();
+        } catch (error) {
+            state.deps?.showToast?.(`${tr('更新權限等級失敗', 'Unable to update permission level')}：${error.message}`, 'error');
+            await loadCatalog().catch(() => {
+                select.disabled = false;
+                select.value = previousLevel;
+            });
+        }
+    }
+
+    function appendProjectPermissionLevel(body, item) {
+        const permission = item.project_permission || { level: 'restricted', revision: 0 };
+        const currentLevel = String(permission.level || 'restricted');
+        const setting = detailSettingRow(
+            tr('Agent 操作權限等級', 'Agent operation permission level'),
+            state.projectId
+                ? tr('只套用到目前專案；不會影響其他專案。', 'Applies only to the active project.')
+                : tr('請先在頁面上方選擇一個專案，才能調整權限等級。', 'Select a project above before changing the permission level.')
+        );
+        const select = document.createElement('select');
+        select.className = 'settings-input extension-permission-level-select';
+        select.dataset.extensionPermissionLevel = String(item.id);
+        const descriptions = permissionLevelDescriptions();
+        Object.entries(descriptions).forEach(([value, copy]) => {
+            const option = document.createElement('option');
+            option.value = value;
+            option.textContent = copy.label;
+            select.appendChild(option);
+        });
+        select.value = descriptions[currentLevel] ? currentLevel : 'restricted';
+        select.disabled = !state.projectId;
+        select.addEventListener('change', () => void mutateProjectPermission(item, select, select.value));
+        setting.actions.appendChild(select);
+        body.appendChild(setting.row);
+
+        const guide = detailElement('div', 'extension-permission-level-guide');
+        Object.entries(descriptions).forEach(([value, copy]) => {
+            const option = detailElement('article', `extension-permission-level-option is-${value}${value === currentLevel ? ' is-current' : ''}`);
+            option.append(
+                detailElement('strong', '', copy.label),
+                detailElement('p', '', copy.summary)
+            );
+            if (value === currentLevel && state.projectId) {
+                option.appendChild(badge(tr('目前設定', 'Current setting'), value === 'open' ? 'is-error' : value === 'restricted' ? 'is-warning' : ''));
+            }
+            guide.appendChild(option);
+        });
+        body.appendChild(guide);
+    }
+
     function appendExtensionAuthorization(body, item) {
         const controlPolicy = extensionControlPolicy(item);
         const globalEnabled = item.global_enabled === true;
@@ -1839,6 +1935,8 @@ async function saveModelProviderSecrets() {
             project.actions.appendChild(projectOverrideSelect(item));
             body.appendChild(project.row);
         }
+
+        appendProjectPermissionLevel(body, item);
 
         const maintenance = detailSettingRow(tr('檢查與管理', 'Checks and management'), tr('需要時可檢查健康狀態與稽核紀錄。', 'Inspect health and audit records when needed.'));
         const healthButton = actionButton(tr('健康檢查', 'Health check'), 'health', 'activity');
@@ -2002,7 +2100,7 @@ async function saveModelProviderSecrets() {
             snapshot.focus = { type: 'id', value: active.id };
             return snapshot;
         }
-        for (const key of ['extensionAction', 'extensionGlobalToggle', 'extensionProjectOverride']) {
+        for (const key of ['extensionAction', 'extensionGlobalToggle', 'extensionProjectOverride', 'extensionPermissionLevel']) {
             const value = active.dataset?.[key];
             if (value) {
                 snapshot.focus = { type: key, value };
@@ -2024,7 +2122,7 @@ async function saveModelProviderSecrets() {
         } else if (snapshot.focus.type === 'summary') {
             target = technical?.querySelector('summary') || null;
         } else {
-            target = [...container.querySelectorAll('[data-extension-action], [data-extension-global-toggle], [data-extension-project-override]')]
+            target = [...container.querySelectorAll('[data-extension-action], [data-extension-global-toggle], [data-extension-project-override], [data-extension-permission-level]')]
                 .find(node => node.dataset?.[snapshot.focus.type] === snapshot.focus.value) || null;
         }
         if (target?.disabled) target = null;

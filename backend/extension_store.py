@@ -19,6 +19,7 @@ from structured_log import redact
 
 
 PROJECT_MODES = frozenset({"inherit", "enabled", "disabled"})
+PERMISSION_LEVELS = frozenset({"blocked", "restricted", "open"})
 
 
 def _now() -> str:
@@ -82,6 +83,14 @@ class ExtensionStore:
                         project_id TEXT NOT NULL,
                         mode TEXT NOT NULL,
                         approved_manifest_sha256 TEXT,
+                        updated_at TEXT NOT NULL,
+                        PRIMARY KEY (extension_id, project_id)
+                    );
+                    CREATE TABLE IF NOT EXISTS extension_project_permissions (
+                        extension_id TEXT NOT NULL,
+                        project_id TEXT NOT NULL,
+                        permission_level TEXT NOT NULL DEFAULT 'restricted',
+                        revision INTEGER NOT NULL DEFAULT 1,
                         updated_at TEXT NOT NULL,
                         PRIMARY KEY (extension_id, project_id)
                     );
@@ -328,6 +337,10 @@ class ExtensionStore:
                 )
                 conn.execute(
                     "DELETE FROM extension_project_state WHERE extension_id=?",
+                    (extension_id,),
+                )
+                conn.execute(
+                    "DELETE FROM extension_project_permissions WHERE extension_id=?",
                     (extension_id,),
                 )
                 conn.execute(
@@ -629,6 +642,84 @@ class ExtensionStore:
                 before=before,
                 after={"mode": mode},
             )
+
+    def project_permission(self, extension_id: str, project_id: Optional[str]) -> dict[str, Any]:
+        self.ensure_schema()
+        if not project_id:
+            return {"level": "restricted", "revision": 0, "updated_at": None}
+        with database.get_db_conn() as conn:
+            row = conn.execute(
+                """
+                SELECT permission_level, revision, updated_at
+                FROM extension_project_permissions
+                WHERE extension_id=? AND project_id=?
+                """,
+                (extension_id, project_id),
+            ).fetchone()
+        if not row:
+            return {"level": "restricted", "revision": 0, "updated_at": None}
+        return {
+            "level": str(row["permission_level"]),
+            "revision": int(row["revision"]),
+            "updated_at": row["updated_at"],
+        }
+
+    def set_project_permission(
+        self,
+        extension_id: str,
+        project_id: str,
+        level: str,
+        *,
+        expected_revision: int,
+        actor: str = "local_user",
+    ) -> dict[str, Any]:
+        if level not in PERMISSION_LEVELS:
+            raise ValueError(f"unsupported extension permission level: {level}")
+        self.ensure_schema()
+        now = _now()
+        with database.get_db_conn() as conn:
+            snapshot = self._snapshot_conn(conn, extension_id)
+            if snapshot is None:
+                raise KeyError(extension_id)
+            row = conn.execute(
+                """
+                SELECT permission_level, revision, updated_at
+                FROM extension_project_permissions
+                WHERE extension_id=? AND project_id=?
+                """,
+                (extension_id, project_id),
+            ).fetchone()
+            current = {
+                "level": str(row["permission_level"]) if row else "restricted",
+                "revision": int(row["revision"]) if row else 0,
+                "updated_at": row["updated_at"] if row else None,
+            }
+            if int(expected_revision) != current["revision"]:
+                raise ValueError("extension permission revision changed; reload and try again")
+            next_revision = current["revision"] + 1
+            conn.execute(
+                """
+                INSERT INTO extension_project_permissions(
+                    extension_id, project_id, permission_level, revision, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(extension_id, project_id) DO UPDATE SET
+                    permission_level=excluded.permission_level,
+                    revision=excluded.revision,
+                    updated_at=excluded.updated_at
+                """,
+                (extension_id, project_id, level, next_revision, now),
+            )
+            after = {"level": level, "revision": next_revision, "updated_at": now}
+            self._audit_conn(
+                conn,
+                extension_id,
+                "project_permission_level",
+                actor,
+                project_id=project_id,
+                before=current,
+                after=after,
+            )
+        return after
 
     def set_health(
         self,

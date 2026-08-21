@@ -166,8 +166,12 @@ from tool_approval_broker import (
     ToolApprovalBroker,
     ToolApprovalBrokerError,
     ToolApprovalNotFound,
+    operation_risk_class,
 )
 from tool_runtime import (
+    PolicyAction,
+    PolicyDecision,
+    ToolAccess,
     ToolDispatcher,
     ToolRegistry,
     ToolScopeState,
@@ -184,7 +188,7 @@ from workspace import (
 )
 
 
-APP_VERSION = "0.9.0-model-catalog-beta.2"
+APP_VERSION = "0.9.0-model-catalog-beta.3"
 SETTINGS_PATH = str(
     Path(
         os.environ.get("WORKBENCH_SETTINGS_PATH")
@@ -1665,10 +1669,52 @@ def _resolve_tool_scope(definition: Any, call: Any) -> ToolScopeState:
     )
 
 
+def _evaluate_tool_permission(definition, call, _scope) -> PolicyDecision:
+    """Apply the active project's explicit extension permission level."""
+
+    level = "restricted"
+    if call.project_id:
+        try:
+            item = extension_registry.get(
+                definition.extension_id,
+                call.project_id,
+                synchronize=False,
+            )
+            level = str((item.get("project_permission") or {}).get("level") or "restricted")
+        except ExtensionError:
+            level = "restricted"
+    if level == "blocked":
+        return PolicyDecision(
+            PolicyAction.DENY,
+            "此專案未開放這項擴充權限；請到外掛詳細頁調整權限等級。",
+        )
+    if definition.access is ToolAccess.READ:
+        return PolicyDecision(PolicyAction.ALLOW, "唯讀操作已允許")
+    if level == "open":
+        return PolicyDecision(
+            PolicyAction.ALLOW,
+            "此專案已明確選擇開放權限",
+        )
+    operation_class = operation_risk_class(
+        definition.name,
+        definition.risk_level,
+    )
+    if operation_class == "low_risk":
+        return PolicyDecision(
+            PolicyAction.ALLOW,
+            "限制權限允許低風險操作",
+        )
+    return PolicyDecision(
+        PolicyAction.REQUIRE_APPROVAL,
+        "此操作可能輸入資料、改變外部狀態或造成不可逆結果，需要使用者批准。",
+    )
+
+
 tool_dispatcher = ToolDispatcher(
     tool_registry,
     scope_resolver=_resolve_tool_scope,
     hook_dispatcher=hook_dispatcher,
+    policy_evaluator=_evaluate_tool_permission,
 )
 host_tool_runtime = HostToolRuntime(
     registry=tool_registry,

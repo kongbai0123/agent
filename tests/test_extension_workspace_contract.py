@@ -93,6 +93,26 @@ def test_extension_details_explain_usage_data_approval_tools_and_permissions():
     assert ".extension-permission-purpose" in STYLE
 
 
+def test_extension_detail_exposes_project_permission_levels_with_explicit_effects():
+    for contract in (
+        "Agent 操作權限等級",
+        "不開放權限",
+        "限制權限",
+        "開放權限",
+        "完全不允許 Agent 使用此外掛工具",
+        "輸入資料、外部寫入、系統操作或不可逆操作",
+        "不可信網站內容可能誘導 Agent",
+        "只套用到目前專案",
+        "extensionPermissionLevel",
+        "/permission`,",
+        "revision: Number((item.project_permission || {}).revision || 0)",
+    ):
+        assert contract in EXTENSIONS
+    assert ".extension-permission-level-guide" in STYLE
+    assert ".extension-permission-level-option.is-open" in STYLE
+    assert "window.confirm(" in EXTENSIONS
+
+
 def test_extension_workspace_has_real_bilingual_runtime_switching():
     assert 'data-extension-zh="AGENT 擴充功能"' in INDEX
     assert 'data-extension-en="AGENT EXTENSIONS"' in INDEX
@@ -229,6 +249,7 @@ def test_frontend_paths_and_payload_keys_match_the_strict_backend_contract():
         '@router.post("/api/extensions/{extension_id}/trust")',
         '@router.patch("/api/extensions/{extension_id}/state")',
         '@router.put("/api/projects/{project_id}/extensions/{extension_id}")',
+        '@router.put("/api/projects/{project_id}/extensions/{extension_id}/permission")',
         '@router.post("/api/extensions/{extension_id}/health")',
         '@router.delete("/api/extensions/{extension_id}")',
     ):
@@ -237,6 +258,7 @@ def test_frontend_paths_and_payload_keys_match_the_strict_backend_contract():
     assert "class ExtensionTrustRequest" in SCHEMAS
     assert "global_enabled: bool" in SCHEMAS
     assert 'mode: Literal["inherit", "enabled", "disabled"]' in SCHEMAS
+    assert 'level: Literal["blocked", "restricted", "open"]' in SCHEMAS
     assert "manifest_sha256: current.manifest_sha256" in EXTENSIONS
     assert "global_enabled: true" in EXTENSIONS
 

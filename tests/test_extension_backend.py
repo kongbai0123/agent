@@ -824,6 +824,37 @@ def test_extension_api_contract_and_mutation_guard(registry_env):
         "/api/projects/project_1/extensions/connector.github",
         json={"mode": "disabled"},
     ).status_code == 200
+    unacknowledged = client.put(
+        "/api/projects/project_1/extensions/connector.github/permission",
+        json={"level": "open", "revision": 0},
+    )
+    assert unacknowledged.status_code == 422
+    permission = client.put(
+        "/api/projects/project_1/extensions/connector.github/permission",
+        json={"level": "open", "revision": 0, "acknowledge_risk": True},
+    )
+    assert permission.status_code == 200
+    assert permission.json()["extension"]["project_permission"]["level"] == "open"
+    assert permission.json()["extension"]["project_permission"]["revision"] == 1
+    stale = client.put(
+        "/api/projects/project_1/extensions/connector.github/permission",
+        json={"level": "blocked", "revision": 0},
+    )
+    assert stale.status_code == 409
+    restricted = client.put(
+        "/api/projects/project_1/extensions/connector.github/permission",
+        json={"level": "restricted", "revision": 1},
+    )
+    assert restricted.status_code == 200
+    assert restricted.json()["extension"]["project_permission"] == {
+        "level": "restricted",
+        "revision": 2,
+        "updated_at": restricted.json()["extension"]["project_permission"]["updated_at"],
+    }
+    assert any(
+        audit["action"] == "project_permission_level"
+        for audit in registry.audits("connector.github")
+    )
     assert client.post("/api/extensions/connector.github/health").status_code == 200
     assert client.get("/api/extensions/connector.github/audits").status_code == 200
     assert client.delete("/api/extensions/connector.github").status_code == 200
@@ -846,6 +877,9 @@ def test_extension_api_contract_and_mutation_guard(registry_env):
     assert [method for method, _path in guard_calls] == [
         "POST",
         "PATCH",
+        "PUT",
+        "PUT",
+        "PUT",
         "PUT",
         "POST",
         "DELETE",

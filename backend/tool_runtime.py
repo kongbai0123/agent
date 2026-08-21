@@ -1102,9 +1102,11 @@ class ToolDispatcher:
         call = replace(call, arguments=transformed)
         scope = await self._resolve_scope(definition, call)
         fixed, guard = await self._policy(definition, call, scope)
+        # WRITE still requires approval under the default fixed policy.  An
+        # explicitly selected project permission level may return ALLOW;
+        # trusted guards can independently retain an approval requirement.
         needs_approval = (
-            definition.access is ToolAccess.WRITE
-            or fixed.action is PolicyAction.REQUIRE_APPROVAL
+            fixed.action is PolicyAction.REQUIRE_APPROVAL
             or guard.action is GuardAction.REQUIRE_APPROVAL
         )
 

@@ -8967,6 +8967,28 @@ html[data-theme="dark"] .sidebar-dialog { background: #171721; }
 }
 .extension-detail-setting-actions .btn { width: auto; min-height: 32px; padding: 6px 10px; font-size: 12px; }
 
+.extension-permission-level-select { min-width: 180px; }
+.extension-permission-level-guide {
+    padding: 14px 20px 18px;
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 10px;
+    border-bottom: 1px solid var(--ink-05);
+}
+.extension-permission-level-option {
+    position: relative;
+    min-width: 0;
+    padding: 13px;
+    border: 1px solid var(--panel-border);
+    border-radius: 12px;
+    background: var(--surface-subtle);
+}
+.extension-permission-level-option.is-current { border-color: var(--primary-color); }
+.extension-permission-level-option.is-open { border-color: color-mix(in srgb, var(--danger-color) 45%, var(--panel-border)); }
+.extension-permission-level-option strong { display: block; margin-bottom: 6px; font-size: 13px; }
+.extension-permission-level-option p { margin: 0; color: var(--text-muted); font-size: 12px; line-height: 1.55; }
+.extension-permission-level-option .extension-badge { margin-top: 9px; }
+
 .extension-detail-toggle {
     display: inline-flex;
     align-items: center;
@@ -9077,6 +9099,8 @@ html[data-theme="dark"] .sidebar-dialog { background: #171721; }
     .extension-detail-hero-actions { width: 100%; justify-content: flex-start; }
     .extension-detail-setting-row { align-items: flex-start; flex-direction: column; }
     .extension-detail-setting-actions { width: 100%; justify-content: flex-start; }
+    .extension-permission-level-select { width: 100%; min-width: 0; }
+    .extension-permission-level-guide { grid-template-columns: 1fr; }
     .extension-detail-metrics { grid-template-columns: 1fr; }
     .extension-permission-detail-row { flex-direction: column; }
 }

@@ -12,6 +12,7 @@ from api.schemas.extensions import (
     ExtensionTrustRequest,
     LocalExtensionInspectRequest,
     ProjectExtensionStateRequest,
+    ProjectExtensionPermissionRequest,
 )
 from extension_registry import (
     ExtensionConflict,
@@ -168,6 +169,25 @@ def build_extensions_router(
                 project_id,
                 body.mode,
                 expected_sha256=body.manifest_sha256,
+            )
+            return {"success": True, "extension": item}
+        except ExtensionError as exc:
+            raise _failure(exc, error_payload) from exc
+
+    @router.put("/api/projects/{project_id}/extensions/{extension_id}/permission")
+    def project_permission(
+        project_id: str,
+        extension_id: str,
+        body: ProjectExtensionPermissionRequest,
+        request: Request,
+    ):
+        require_local(request)
+        try:
+            item = registry.set_project_permission(
+                extension_id,
+                project_id,
+                body.level,
+                expected_revision=body.revision,
             )
             return {"success": True, "extension": item}
         except ExtensionError as exc:
