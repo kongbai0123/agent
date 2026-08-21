@@ -103,8 +103,10 @@ def test_extension_detail_exposes_project_permission_levels_with_explicit_effect
         "輸入資料、外部寫入、系統操作或不可逆操作",
         "不可信網站內容可能誘導 Agent",
         "只套用到目前專案",
+        "所有專案的預設權限",
+        "select.disabled = false",
         "extensionPermissionLevel",
-        "/permission`,",
+        "`/api/extensions/${encoded(item.id)}/permission`",
         "revision: Number((item.project_permission || {}).revision || 0)",
     ):
         assert contract in EXTENSIONS
@@ -250,6 +252,7 @@ def test_frontend_paths_and_payload_keys_match_the_strict_backend_contract():
         '@router.patch("/api/extensions/{extension_id}/state")',
         '@router.put("/api/projects/{project_id}/extensions/{extension_id}")',
         '@router.put("/api/projects/{project_id}/extensions/{extension_id}/permission")',
+        '@router.put("/api/extensions/{extension_id}/permission")',
         '@router.post("/api/extensions/{extension_id}/health")',
         '@router.delete("/api/extensions/{extension_id}")',
     ):

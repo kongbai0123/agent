@@ -824,6 +824,17 @@ def test_extension_api_contract_and_mutation_guard(registry_env):
         "/api/projects/project_1/extensions/connector.github",
         json={"mode": "disabled"},
     ).status_code == 200
+    global_permission = client.put(
+        "/api/extensions/connector.github/permission",
+        json={"level": "open", "revision": 0, "acknowledge_risk": True},
+    )
+    assert global_permission.status_code == 200
+    assert global_permission.json()["extension"]["project_permission"]["scope"] == "global"
+    assert global_permission.json()["extension"]["project_permission"]["level"] == "open"
+    inherited = client.get("/api/extensions?project_id=project_1").json()["extensions"]
+    inherited_github = next(item for item in inherited if item["id"] == "connector.github")
+    assert inherited_github["project_permission"]["level"] == "open"
+    assert inherited_github["project_permission"]["inherited"] is True
     unacknowledged = client.put(
         "/api/projects/project_1/extensions/connector.github/permission",
         json={"level": "open", "revision": 0},
@@ -846,11 +857,12 @@ def test_extension_api_contract_and_mutation_guard(registry_env):
         json={"level": "restricted", "revision": 1},
     )
     assert restricted.status_code == 200
-    assert restricted.json()["extension"]["project_permission"] == {
-        "level": "restricted",
-        "revision": 2,
-        "updated_at": restricted.json()["extension"]["project_permission"]["updated_at"],
-    }
+    restricted_permission = restricted.json()["extension"]["project_permission"]
+    assert restricted_permission["level"] == "restricted"
+    assert restricted_permission["revision"] == 2
+    assert restricted_permission["scope"] == "project"
+    assert restricted_permission["inherited"] is False
+    assert restricted_permission["global_level"] == "open"
     assert any(
         audit["action"] == "project_permission_level"
         for audit in registry.audits("connector.github")
@@ -877,6 +889,7 @@ def test_extension_api_contract_and_mutation_guard(registry_env):
     assert [method for method, _path in guard_calls] == [
         "POST",
         "PATCH",
+        "PUT",
         "PUT",
         "PUT",
         "PUT",

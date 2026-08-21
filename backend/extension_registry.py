@@ -814,6 +814,41 @@ class ExtensionRegistry:
             )
             raise
 
+    def set_global_permission(
+        self,
+        extension_id: str,
+        level: str,
+        *,
+        expected_revision: int,
+        actor: str = "local_user",
+    ) -> dict[str, Any]:
+        try:
+            with self._sync_lock:
+                if level not in PERMISSION_LEVELS:
+                    raise ExtensionConflict(
+                        f"unsupported extension permission level: {level}"
+                    )
+                self.sync()
+                self._required_row(extension_id)
+                try:
+                    self.store.set_global_permission(
+                        extension_id,
+                        level,
+                        expected_revision=expected_revision,
+                        actor=actor,
+                    )
+                except ValueError as exc:
+                    raise ExtensionConflict(str(exc)) from exc
+                return self._item(self._required_row(extension_id), None)
+        except Exception as exc:
+            self._record_failure(
+                extension_id,
+                "global_permission_level",
+                exc,
+                actor=actor,
+            )
+            raise
+
     def get(
         self,
         extension_id: str,

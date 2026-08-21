@@ -188,7 +188,7 @@ from workspace import (
 )
 
 
-APP_VERSION = "0.9.0-model-catalog-beta.3"
+APP_VERSION = "0.9.0-model-catalog-beta.4"
 SETTINGS_PATH = str(
     Path(
         os.environ.get("WORKBENCH_SETTINGS_PATH")

@@ -193,6 +193,23 @@ def build_extensions_router(
         except ExtensionError as exc:
             raise _failure(exc, error_payload) from exc
 
+    @router.put("/api/extensions/{extension_id}/permission")
+    def global_permission(
+        extension_id: str,
+        body: ProjectExtensionPermissionRequest,
+        request: Request,
+    ):
+        require_local(request)
+        try:
+            item = registry.set_global_permission(
+                extension_id,
+                body.level,
+                expected_revision=body.revision,
+            )
+            return {"success": True, "extension": item}
+        except ExtensionError as exc:
+            raise _failure(exc, error_payload) from exc
+
     @router.post("/api/extensions/{extension_id}/health")
     def health(
         extension_id: str,

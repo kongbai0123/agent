@@ -94,6 +94,12 @@ class ExtensionStore:
                         updated_at TEXT NOT NULL,
                         PRIMARY KEY (extension_id, project_id)
                     );
+                    CREATE TABLE IF NOT EXISTS extension_global_permissions (
+                        extension_id TEXT PRIMARY KEY,
+                        permission_level TEXT NOT NULL DEFAULT 'restricted',
+                        revision INTEGER NOT NULL DEFAULT 1,
+                        updated_at TEXT NOT NULL
+                    );
                     CREATE TABLE IF NOT EXISTS extension_health (
                         extension_id TEXT PRIMARY KEY,
                         status TEXT NOT NULL,
@@ -341,6 +347,10 @@ class ExtensionStore:
                 )
                 conn.execute(
                     "DELETE FROM extension_project_permissions WHERE extension_id=?",
+                    (extension_id,),
+                )
+                conn.execute(
+                    "DELETE FROM extension_global_permissions WHERE extension_id=?",
                     (extension_id,),
                 )
                 conn.execute(
@@ -645,9 +655,25 @@ class ExtensionStore:
 
     def project_permission(self, extension_id: str, project_id: Optional[str]) -> dict[str, Any]:
         self.ensure_schema()
-        if not project_id:
-            return {"level": "restricted", "revision": 0, "updated_at": None}
         with database.get_db_conn() as conn:
+            global_row = conn.execute(
+                """
+                SELECT permission_level, revision, updated_at
+                FROM extension_global_permissions WHERE extension_id=?
+                """,
+                (extension_id,),
+            ).fetchone()
+            global_permission = {
+                "level": str(global_row["permission_level"]) if global_row else "restricted",
+                "revision": int(global_row["revision"]) if global_row else 0,
+                "updated_at": global_row["updated_at"] if global_row else None,
+            }
+            if not project_id:
+                return {
+                    **global_permission,
+                    "scope": "global",
+                    "inherited": False,
+                }
             row = conn.execute(
                 """
                 SELECT permission_level, revision, updated_at
@@ -657,12 +683,76 @@ class ExtensionStore:
                 (extension_id, project_id),
             ).fetchone()
         if not row:
-            return {"level": "restricted", "revision": 0, "updated_at": None}
+            return {
+                **global_permission,
+                "revision": 0,
+                "scope": "project",
+                "inherited": True,
+                "global_level": global_permission["level"],
+                "global_revision": global_permission["revision"],
+            }
         return {
             "level": str(row["permission_level"]),
             "revision": int(row["revision"]),
             "updated_at": row["updated_at"],
+            "scope": "project",
+            "inherited": False,
+            "global_level": global_permission["level"],
+            "global_revision": global_permission["revision"],
         }
+
+    def set_global_permission(
+        self,
+        extension_id: str,
+        level: str,
+        *,
+        expected_revision: int,
+        actor: str = "local_user",
+    ) -> dict[str, Any]:
+        if level not in PERMISSION_LEVELS:
+            raise ValueError(f"unsupported extension permission level: {level}")
+        self.ensure_schema()
+        now = _now()
+        with database.get_db_conn() as conn:
+            if self._snapshot_conn(conn, extension_id) is None:
+                raise KeyError(extension_id)
+            row = conn.execute(
+                """
+                SELECT permission_level, revision, updated_at
+                FROM extension_global_permissions WHERE extension_id=?
+                """,
+                (extension_id,),
+            ).fetchone()
+            current = {
+                "level": str(row["permission_level"]) if row else "restricted",
+                "revision": int(row["revision"]) if row else 0,
+                "updated_at": row["updated_at"] if row else None,
+            }
+            if int(expected_revision) != current["revision"]:
+                raise ValueError("extension permission revision changed; reload and try again")
+            next_revision = current["revision"] + 1
+            conn.execute(
+                """
+                INSERT INTO extension_global_permissions(
+                    extension_id, permission_level, revision, updated_at
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(extension_id) DO UPDATE SET
+                    permission_level=excluded.permission_level,
+                    revision=excluded.revision,
+                    updated_at=excluded.updated_at
+                """,
+                (extension_id, level, next_revision, now),
+            )
+            after = {"level": level, "revision": next_revision, "updated_at": now}
+            self._audit_conn(
+                conn,
+                extension_id,
+                "global_permission_level",
+                actor,
+                before=current,
+                after=after,
+            )
+        return after
 
     def set_project_permission(
         self,

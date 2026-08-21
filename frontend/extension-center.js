@@ -1825,15 +1825,17 @@ async function saveModelProviderSecrets() {
     }
 
     async function mutateProjectPermission(item, select, requestedLevel) {
-        if (!state.projectId) return;
         const previousLevel = String((item.project_permission || {}).level || 'restricted');
         const descriptions = permissionLevelDescriptions();
         const copy = descriptions[requestedLevel] || descriptions.restricted;
+        const scopeLabel = state.projectId
+            ? tr('此專案', 'this project')
+            : tr('所有專案的預設值', 'the default for all projects');
         if (requestedLevel === 'open') {
             const accepted = window.confirm(
                 tr(
-                    `確定要為此專案選擇「${copy.label}」嗎？\n\n啟用後，Agent 不會再針對此外掛的輸入、外部寫入、高風險或不可逆操作詢問你。\n\n不可信網站內容可能誘導 Agent 送出資料、建立或刪除內容、授權帳號、下載檔案或觸發付款。只有在你信任此外掛、目前網站與任務內容時才應開放。`,
-                    `Use “${copy.label}” for this project?\n\nThe Agent will no longer ask before data input, external writes, high-risk actions, or irreversible actions from this extension.\n\nUntrusted website content may induce the Agent to disclose data, create or delete content, grant account access, download files, or trigger payments. Use this only when you trust the extension, current website, and task.`
+                    `確定要將${scopeLabel}設為「${copy.label}」嗎？\n\n啟用後，Agent 不會再針對此外掛的輸入、外部寫入、高風險或不可逆操作詢問你。\n\n不可信網站內容可能誘導 Agent 送出資料、建立或刪除內容、授權帳號、下載檔案或觸發付款。只有在你信任此外掛、目前網站與任務內容時才應開放。`,
+                    `Use “${copy.label}” as ${scopeLabel}?\n\nThe Agent will no longer ask before data input, external writes, high-risk actions, or irreversible actions from this extension.\n\nUntrusted website content may induce the Agent to disclose data, create or delete content, grant account access, download files, or trigger payments. Use this only when you trust the extension, current website, and task.`
                 )
             );
             if (!accepted) {
@@ -1843,7 +1845,10 @@ async function saveModelProviderSecrets() {
         }
         select.disabled = true;
         try {
-            await request(`/api/projects/${encoded(state.projectId)}/extensions/${encoded(item.id)}/permission`, {
+            const path = state.projectId
+                ? `/api/projects/${encoded(state.projectId)}/extensions/${encoded(item.id)}/permission`
+                : `/api/extensions/${encoded(item.id)}/permission`;
+            await request(path, {
                 method: 'PUT',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
@@ -1869,8 +1874,10 @@ async function saveModelProviderSecrets() {
         const setting = detailSettingRow(
             tr('Agent 操作權限等級', 'Agent operation permission level'),
             state.projectId
-                ? tr('只套用到目前專案；不會影響其他專案。', 'Applies only to the active project.')
-                : tr('請先在頁面上方選擇一個專案，才能調整權限等級。', 'Select a project above before changing the permission level.')
+                ? (permission.inherited
+                    ? tr('目前繼承全域預設；變更後只套用到此專案。', 'Currently inherited from the global default. A change applies only to this project.')
+                    : tr('只套用到目前專案；不會影響其他專案。', 'Applies only to the active project.'))
+                : tr('這是所有專案的預設權限；已有專案覆寫不會被取代。', 'This is the default for all projects. Existing project overrides are preserved.')
         );
         const select = document.createElement('select');
         select.className = 'settings-input extension-permission-level-select';
@@ -1883,7 +1890,7 @@ async function saveModelProviderSecrets() {
             select.appendChild(option);
         });
         select.value = descriptions[currentLevel] ? currentLevel : 'restricted';
-        select.disabled = !state.projectId;
+        select.disabled = false;
         select.addEventListener('change', () => void mutateProjectPermission(item, select, select.value));
         setting.actions.appendChild(select);
         body.appendChild(setting.row);
