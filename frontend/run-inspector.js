@@ -414,11 +414,35 @@
             element('strong', '', approval.capability || approval.tool || '系統能力'),
             element('span', 'run-inspector-status is-warning', approval.deciding ? '送出中' : '等待核准')
         );
-        card.append(title, element('p', 'run-inspector-description', approval.message || approval.summary || '此操作需要你的核准。'));
-        if (approval.risk) card.appendChild(element('div', 'run-inspector-meta', `風險：${approval.risk}`));
+        const approvalDescription = approval.risk_title
+            ? `Agent 準備執行「${approval.operation_label || approval.capability || '受控操作'}」。請先確認下列風險與後果。`
+            : (approval.message || approval.summary || '此操作需要你的核准。');
+        card.append(title, element('p', 'run-inspector-description', approvalDescription));
+        if (approval.risk_title) {
+            card.appendChild(element('strong', 'run-inspector-approval-risk-title', approval.risk_title));
+        }
+        if (approval.target) {
+            card.appendChild(element('div', 'run-inspector-meta', `操作目標：${approval.target}`));
+        }
+        if (approval.input_summary) {
+            card.appendChild(element('div', 'run-inspector-meta', `輸入摘要：${approval.input_summary}`));
+        }
+        if (approval.consequence) {
+            card.appendChild(element('div', 'run-inspector-approval-warning', `可能後果：${approval.consequence}`));
+        }
+        if (approval.data_disclosure) {
+            card.appendChild(element('div', 'run-inspector-meta', `資料範圍：${approval.data_disclosure}`));
+        }
+        if (approval.reversibility) {
+            card.appendChild(element('div', 'run-inspector-meta', `能否復原：${approval.reversibility}`));
+        }
+        if (approval.approval_scope) {
+            card.appendChild(element('div', 'run-inspector-meta', `本次授權：${approval.approval_scope}`));
+        }
+        if (approval.risk && !approval.risk_title) card.appendChild(element('div', 'run-inspector-meta', `風險：${approval.risk}`));
         const actions = element('div', 'run-inspector-actions');
         const reject = element('button', 'run-inspector-button secondary', '拒絕');
-        const approve = element('button', 'run-inspector-button primary', '核准');
+        const approve = element('button', 'run-inspector-button primary', '僅允許本次');
         markInteraction(reject, interactionKey(approvalKey, 'reject'), { focus: true });
         markInteraction(approve, interactionKey(approvalKey, 'approve'), { focus: true });
         reject.type = approve.type = 'button';

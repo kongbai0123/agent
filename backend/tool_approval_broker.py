@@ -28,6 +28,92 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def approval_risk_presentation(request: ToolApprovalRequest) -> dict[str, Any]:
+    """Return a redacted, user-facing explanation of one exact operation."""
+
+    tool_name = str(request.binding.tool_name or "")
+    risk = str(request.summary.get("risk_level") or "external_write")
+    suffix = tool_name.rsplit(".", 1)[-1]
+    operation_label = {
+        "browser_tabs": "管理瀏覽器頁籤",
+        "browser_close": "關閉目前頁面",
+        "browser_type": "在網頁欄位輸入文字",
+        "browser_fill_form": "填寫網頁表單",
+        "browser_select_option": "選擇網頁選項",
+        "browser_file_upload": "上傳檔案到網站",
+        "browser_click": "點擊網頁控制項",
+        "browser_press_key": "在網頁中按下鍵盤按鍵",
+        "browser_handle_dialog": "回應網站對話框",
+    }.get(suffix, f"執行工具「{tool_name}」")
+    arguments = request.summary.get("arguments")
+    safe_arguments = arguments if isinstance(arguments, Mapping) else {}
+    text_value = safe_arguments.get("text")
+    field_values = safe_arguments.get("fields")
+    paths = safe_arguments.get("paths")
+    if isinstance(text_value, str):
+        input_summary = f"準備輸入 {len(text_value)} 個字元；內容不會顯示在稽核事件中。"
+    elif isinstance(field_values, list):
+        input_summary = f"準備填寫 {len(field_values)} 個欄位；欄位內容不會顯示在稽核事件中。"
+    elif isinstance(paths, list):
+        input_summary = f"準備上傳 {len(paths)} 個檔案；核准前仍須通過專案檔案範圍驗證。"
+    else:
+        input_summary = "沒有可安全顯示的輸入內容；請依操作名稱與可能後果判斷。"
+    if risk == "irreversible":
+        operation_class = "high_risk"
+    elif risk == "system":
+        operation_class = "system"
+    elif suffix in {"browser_tabs", "browser_close"}:
+        operation_class = "low_risk"
+    elif suffix in {
+        "browser_type", "browser_fill_form", "browser_select_option",
+        "browser_file_upload",
+    }:
+        operation_class = "data_input"
+    else:
+        operation_class = "external_write"
+
+    copy = {
+        "low_risk": {
+            "risk_title": "低風險瀏覽器操作",
+            "consequence": "可能切換或關閉頁籤，並使尚未送出的頁面內容遺失。",
+            "data_disclosure": "不會因這次核准而取得其他專案檔案或秘密。",
+            "reversibility": "通常可以重新開啟頁面，但未儲存的表單內容可能無法復原。",
+        },
+        "data_input": {
+            "risk_title": "資料輸入",
+            "consequence": "輸入內容會交給目前網站；網站可能保存、分析或轉交這些資料。",
+            "data_disclosure": "只允許本次工具呼叫所綁定的輸入；不會授權網站讀取其他對話或檔案。",
+            "reversibility": "文字在送出前通常可修改；一旦表單送出，可能無法由 Workbench 撤回。",
+        },
+        "external_write": {
+            "risk_title": "外部網站操作",
+            "consequence": "可能觸發導覽、送出表單、建立資料、發布內容、授權或其他網站副作用。",
+            "data_disclosure": "網站元素可能來自不可信內容；只在你理解目標與後果時允許。",
+            "reversibility": "實際結果由網站決定，部分操作可能無法撤回。",
+        },
+        "high_risk": {
+            "risk_title": "高風險且可能不可逆",
+            "consequence": "可能造成付款、刪除、正式發布、帳號授權或其他重大外部變更。",
+            "data_disclosure": "可能向第三方提交資料或授予權限。核准前應自行確認網站、對象與內容。",
+            "reversibility": "可能無法撤回；Workbench 不會把這類同意記住為專案自動授權。",
+        },
+        "system": {
+            "risk_title": "系統操作",
+            "consequence": "可能啟動程式、變更本機環境或接觸電腦資料。",
+            "data_disclosure": "核准前必須確認程式、路徑、資料範圍與外部目的地。",
+            "reversibility": "可能難以復原；Workbench 不會把這類同意記住為專案自動授權。",
+        },
+    }[operation_class]
+    return {
+        "operation_class": operation_class,
+        "operation_label": operation_label,
+        "target": request.binding.resource_id or "目前開啟的網站或工具目標",
+        "input_summary": input_summary,
+        **copy,
+        "approval_scope": "僅允許這一次完全相同的操作；10 分鐘內有效，使用後立即失效。",
+    }
+
+
 class ToolApprovalBrokerError(RuntimeError):
     code = "TOOL_APPROVAL_INVALID"
 
@@ -171,18 +257,21 @@ class ToolApprovalBroker:
     @staticmethod
     def public_event(request: ToolApprovalRequest) -> dict[str, Any]:
         resource = request.binding.resource_id
+        presentation = approval_risk_presentation(request)
         summary = f"{request.binding.tool_name}"
         if resource:
             summary += f" · {resource}"
         return {
             "approval_id": request.approval_id,
-            "capability": request.binding.tool_name,
+            "capability": presentation["operation_label"],
+            "tool_name": request.binding.tool_name,
             "message": request.reason or "Agent 要求執行外部寫入。",
             "summary": summary,
             "run_id": request.binding.run_id,
             "risk": str(request.summary.get("risk_level") or "external_write"),
             "status": "pending",
             "choices": ["once", "deny"],
+            **presentation,
             "updated_at": _now_iso(),
         }
 

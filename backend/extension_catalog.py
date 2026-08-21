@@ -535,7 +535,7 @@ def settings_extension_documentation(
                     else "The MCP server runs in a separate local process. Tool inputs and results still pass validation, redaction, size limits, and audit logging."
                 ),
                 "approval_policy": (
-                    "Reading, navigation, and page search may run directly. Clicking, typing, forms, dialogs, and tab changes require per-operation approval."
+                    "Read-only browsing may run directly. Before any click, text entry, form action, dialog response, or tab change, Workbench shows the target, input summary, possible consequences, reversibility, and exact one-time authorization scope. Rejecting the request performs no action."
                     if playwright
                     else "Each tool is classified as read or write. Write tools remain subject to Workbench human-approval policy."
                 ),
@@ -582,7 +582,7 @@ def settings_extension_documentation(
                 else "MCP 在獨立本機程序中執行；輸入與結果仍會經 ToolDispatcher 驗證、遮罩、大小限制與 Audit。"
             ),
             "approval_policy": (
-                "開啟、閱讀與搜尋頁面可直接進行；點擊按鈕、輸入文字、送出表單、處理網站對話框或變更頁籤前，系統會逐次詢問你。"
+                "開啟、閱讀與搜尋頁面可直接進行。點擊、輸入、表單、網站對話框與頁籤變更前，Workbench 會列出操作目標、輸入摘要、可能後果、能否復原與精確的一次性授權範圍；拒絕後不會執行該操作。"
                 if playwright
                 else "讀寫行為依每個 tool policy 分級；寫入工具必須遵守 Workbench 的固定人工核准政策。"
             ),

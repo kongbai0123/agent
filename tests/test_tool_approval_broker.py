@@ -9,7 +9,11 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "backend"))
 
-from tool_approval_broker import ToolApprovalBroker, ToolApprovalConflict
+from tool_approval_broker import (
+    ToolApprovalBroker,
+    ToolApprovalConflict,
+    approval_risk_presentation,
+)
 from tool_runtime import (
     ApprovalStatus,
     ToolApprovalBinding,
@@ -98,6 +102,10 @@ def test_broker_emits_redacted_event_and_delivers_single_decision(tmp_path):
         callback = asyncio.create_task(broker.approval_callback(request))
         event = await asyncio.wait_for(broker.event_queue("run-1").get(), 1)
         assert event["approval_id"] == "approval-1"
+        assert event["operation_class"] == "external_write"
+        assert event["risk_title"] == "外部網站操作"
+        assert event["target"] == "owner/repo"
+        assert event["approval_scope"].startswith("僅允許這一次")
         assert "secret body" not in str(event)
 
         result = await asyncio.to_thread(
@@ -140,3 +148,40 @@ def test_broker_rejects_cross_run_decision(tmp_path):
             await callback
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "risk", "operation_class", "risk_title"),
+    [
+        ("mcp.browser.browser_tabs", "external_write", "low_risk", "低風險瀏覽器操作"),
+        ("mcp.browser.browser_type", "external_write", "data_input", "資料輸入"),
+        ("mcp.browser.browser_click", "external_write", "external_write", "外部網站操作"),
+        ("danger.delete", "irreversible", "high_risk", "高風險且可能不可逆"),
+        ("system.shell", "system", "system", "系統操作"),
+    ],
+)
+def test_approval_risk_presentation_is_explicit_and_single_use(
+    tool_name, risk, operation_class, risk_title
+):
+    request = approval_request()
+    binding = ToolApprovalBinding(
+        **{**request.binding.__dict__, "tool_name": tool_name}
+    )
+    request = ToolApprovalRequest(
+        **{
+            **request.__dict__,
+            "binding": binding,
+            "binding_sha256": binding.digest,
+            "summary": {"risk_level": risk},
+        }
+    )
+    presentation = approval_risk_presentation(request)
+    assert presentation["operation_class"] == operation_class
+    assert presentation["risk_title"] == risk_title
+    assert presentation["operation_label"]
+    assert presentation["target"]
+    assert presentation["input_summary"]
+    assert presentation["consequence"]
+    assert presentation["data_disclosure"]
+    assert presentation["reversibility"]
+    assert "僅允許這一次" in presentation["approval_scope"]

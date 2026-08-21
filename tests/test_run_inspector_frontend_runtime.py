@@ -553,9 +553,18 @@ api.init({
     };
 
     api.handleEvent('approval_required', {
-        run_id: 'run-a', approval_id: 'approval-a', capability: 'github.issue.write',
+        run_id: 'run-a', approval_id: 'approval-a', capability: '在網頁欄位輸入文字',
+        operation_label: '在網頁欄位輸入文字',
+        risk_title: '資料輸入',
+        target: '目前開啟的網站或工具目標',
+        input_summary: '準備輸入 12 個字元；內容不會顯示在稽核事件中。',
+        consequence: '輸入內容會交給目前網站。',
+        data_disclosure: '只允許本次工具呼叫所綁定的輸入。',
+        reversibility: '文字在送出前通常可修改。',
+        approval_scope: '僅允許這一次完全相同的操作；10 分鐘內有效，使用後立即失效。',
     }, source);
     const originalApprove = findFocus(':approve');
+    const approvalText = all(panel).map(node => node.textContent).join('\n');
     originalApprove.focus();
     panes.execution.scrollTop = 88;
     api.handleEvent('progress', { run_id: 'run-a', message: 'still running' }, source);
@@ -564,6 +573,11 @@ api.init({
         replaced: restoredApprove !== originalApprove,
         focusRestored: document.activeElement === restoredApprove,
         scrollTop: panes.execution.scrollTop,
+        explainsRisk: approvalText.includes('可能後果：輸入內容會交給目前網站。')
+            && approvalText.includes('操作目標：目前開啟的網站或工具目標')
+            && approvalText.includes('輸入摘要：準備輸入 12 個字元')
+            && approvalText.includes('本次授權：僅允許這一次完全相同的操作'),
+        explicitOnce: originalApprove.textContent === '僅允許本次',
     };
 
     api.setAvailable(false);
@@ -615,6 +629,8 @@ api.init({
             "replaced": True,
             "focusRestored": True,
             "scrollTop": 88,
+            "explainsRisk": True,
+            "explicitOnce": True,
         },
         "hiddenApproval": {
             "tone": "warning",

@@ -38,7 +38,7 @@ $hermesProjectsRoot = Join-Path $projectRoot "projects"
 $hermesStartScript = Join-Path $projectRoot "scripts\start_hermes_sidecar.ps1"
 $hermesProductionOps = Join-Path $projectRoot "scripts\hermes_production_ops.py"
 $backendUrl = "http://127.0.0.1:$BackendPort"
-$frontendVersion = "0.9.0-model-catalog-beta.1"
+$frontendVersion = "0.9.0-model-catalog-beta.2"
 $launcherShutdownHandoffMilliseconds = 75000
 $websiteUrl = "$backendUrl/index.html?v=$frontendVersion"
 $discoveryConfigPath = Join-Path $runtimeDir "server-discovery-config.json"

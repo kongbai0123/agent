@@ -3628,10 +3628,19 @@ async function handleChatSubmit(e) {
                                     chatAbort?.signal
                                 );
                             } else {
+                                const approvalIntro = eventData.risk_title
+                                    ? `Agent 準備執行「${eventData.operation_label || capabilityName}」。請先確認下列風險與後果。`
+                                    : (eventData.message || 'Agent 要求執行受控能力。');
                                 approved = window.confirm(
-                                    `${eventData.message || 'Agent 要求執行系統級能力。'}\n\n`
-                                    + `能力：${capabilityName}\n風險：${riskLabel(eventData.risk)}\n\n`
-                                    + '只有在你了解這項操作時才按「確定」。'
+                                    `${approvalIntro}\n\n`
+                                    + `能力：${capabilityName}\n風險：${eventData.risk_title || riskLabel(eventData.risk)}\n`
+                                    + `操作目標：${eventData.target || '目前開啟的網站或工具目標'}\n`
+                                    + `輸入摘要：${eventData.input_summary || '沒有可安全顯示的輸入內容。'}\n`
+                                    + `可能後果：${eventData.consequence || '可能變更外部網站或本機狀態。'}\n`
+                                    + `資料範圍：${eventData.data_disclosure || '請確認操作目標與輸入內容。'}\n`
+                                    + `能否復原：${eventData.reversibility || '實際結果由目標服務決定。'}\n\n`
+                                    + `${eventData.approval_scope || '只核准這一次操作。'}\n\n`
+                                    + '只有在你理解上述風險與後果時才按「確定」。'
                                 );
                                 const approvalRunId = eventData.run_id || currentChatRunId;
                                 const approvalResponse = await apiFetch(

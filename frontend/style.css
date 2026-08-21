@@ -3946,6 +3946,18 @@ html:not([data-theme="dark"]) ::-webkit-scrollbar-thumb:hover {
 }
 .run-inspector-event time { color: var(--text-muted); }
 .run-inspector-approval { border-color: color-mix(in srgb, var(--warning-color) 52%, var(--panel-border)); }
+.run-inspector-approval-risk-title {
+    display: block;
+    margin-top: 8px;
+    color: var(--warning-color);
+}
+.run-inspector-approval-warning {
+    margin-top: 6px;
+    padding: 8px 10px;
+    border-inline-start: 3px solid var(--warning-color);
+    background: color-mix(in srgb, var(--warning-color) 10%, transparent);
+    line-height: 1.55;
+}
 .run-inspector-actions { justify-content: flex-end; margin-top: 9px; }
 .run-inspector-button {
     min-height: 32px;
