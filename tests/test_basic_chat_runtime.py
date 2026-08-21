@@ -414,6 +414,120 @@ def test_basic_stream_runs_project_scoped_read_tool_before_final_answer(monkeypa
     assert fake_db.runs[-1]["metrics"]["model_eval"]["tool_calls"] == 1
 
 
+def test_basic_stream_runs_global_mcp_tool_in_independent_chat(monkeypatch):
+    fake_db = FakeDatabase()
+    monkeypatch.setattr(chat_runtime, "database", fake_db)
+    monkeypatch.setattr(
+        chat_runtime,
+        "model_supports_tools",
+        lambda _settings, _model, *, project_id=None: True,
+    )
+    digest = hashlib.sha256(b"browser-mcp-test").hexdigest()
+    definition = ToolDefinition(
+        name="mcp.browser.browser_navigate",
+        description="Navigate the isolated browser",
+        input_schema={
+            "type": "object",
+            "properties": {"url": {"type": "string"}},
+            "required": ["url"],
+            "additionalProperties": False,
+        },
+        access=ToolAccess.READ,
+        handler=lambda call: {"url": call.arguments["url"], "title": "n8n"},
+        extension_id="mcp.browser-playwright",
+        manifest_sha256=digest,
+    )
+    registry = ToolRegistry()
+    registry.register(definition, project_ids=("__independent_chat__",))
+    dispatcher = ToolDispatcher(
+        registry,
+        scope_resolver=lambda _definition, _call: ToolScopeState(
+            installed=True,
+            trusted=True,
+            enabled=True,
+            healthy=True,
+            resource_allowed=True,
+            manifest_sha256=digest,
+        ),
+    )
+
+    class ReadOnlyApprovals:
+        def event_queue(self, _run_id):
+            return asyncio.Queue()
+
+        async def approval_callback(self, _request):
+            raise AssertionError("read tools must not request approval")
+
+        def mark_consumed(self, _approval_id):
+            return None
+
+        def close_run(self, _run_id):
+            return None
+
+    runtime = HostToolRuntime(
+        registry=registry,
+        dispatcher=dispatcher,
+        approval_broker=ReadOnlyApprovals(),
+        independent_scope_id="__independent_chat__",
+    )
+    tool_response = FakeResponse([
+        json.dumps({
+            "message": {
+                "content": "",
+                "tool_calls": [{
+                    "id": "browser-call-1",
+                    "function": {
+                        "name": "mcp.browser.browser_navigate",
+                        "arguments": {"url": "https://www.google.com/search?q=n8n"},
+                    },
+                }],
+            },
+            "done": True,
+            "done_reason": "tool_calls",
+        }).encode("utf-8")
+    ])
+    final_response = FakeResponse([
+        encoded_chunk("已開啟瀏覽器並搜尋 n8n。"),
+        encoded_chunk(done=True, prompt_eval_count=12, eval_count=5, done_reason="stop"),
+    ])
+    payloads = []
+
+    def fake_post_chat(_settings, payload, **_kwargs):
+        payloads.append(payload)
+        return tool_response if len(payloads) == 1 else final_response
+
+    control = ChatRunControl(
+        "run_independent_tools", "sess_basic", "turn_current", "model-a", "chat"
+    )
+    control.start_deadline(60)
+    events = parse_sse(asyncio.run(collect_stream(
+        request=SimpleNamespace(messages=[]),
+        settings={"ollama_url": "http://127.0.0.1:11434", "model_provider": "ollama"},
+        model="model-a",
+        session_id="sess_basic",
+        turn_id="turn_current",
+        run_id="run_independent_tools",
+        prompt_sha256="digest",
+        user_message_id=3,
+        user_query="請開啟瀏覽器搜尋 n8n",
+        temporary_context="",
+        images=[],
+        run_control=control,
+        project_id=None,
+        post_chat=fake_post_chat,
+        host_tool_runtime=runtime,
+    )))
+
+    assert [name for name, _payload in events] == [
+        "meta", "tool_start", "tool_end", "token", "metrics", "done"
+    ]
+    assert payloads[0]["tools"][0]["function"]["name"] == (
+        "mcp.browser.browser_navigate"
+    )
+    assert any(message.get("role") == "tool" for message in payloads[1]["messages"])
+    assert fake_db.messages[-1]["content"] == "已開啟瀏覽器並搜尋 n8n。"
+
+
 def test_basic_stream_never_retries_an_indeterminate_external_write(monkeypatch):
     fake_db = FakeDatabase()
     monkeypatch.setattr(chat_runtime, "database", fake_db)

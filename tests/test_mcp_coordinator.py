@@ -122,7 +122,14 @@ class FakeExtensionRegistry:
 
     def get(self, extension_id, project_id=None, *, synchronize=True):
         assert extension_id == self.item["id"]
-        return dict(self.item)
+        return {
+            **self.item,
+            "effective_enabled": bool(self.enabled.get(project_id, False)),
+            "project_permission": {
+                "level": "restricted",
+                "scope": "global" if project_id is None else "project",
+            },
+        }
 
     def is_effectively_enabled(self, extension_id, project_id=None):
         return extension_id == self.item["id"] and bool(self.enabled.get(project_id, False))
@@ -260,11 +267,51 @@ def test_coordinator_runs_only_effective_project_and_exposes_only_reviewed_tools
 
             extensions.enabled["project-b"] = False
             disabled = await coordinator.sync_from_settings(settings)
-            assert disabled["running"] == 0
-            assert coordinator.health("mcp.echo")["status"] == "disabled"
+            assert disabled["running"] == 1
+            assert coordinator.health("mcp.echo")["status"] == "healthy"
+            assert coordinator.health("mcp.echo")["projects"] == []
             with pytest.raises(ToolUnavailableError):
                 tools.get("project-a", "mcp.echo.echo")
             assert tools.get("project-a", "system.ping").name == "system.ping"
+            assert [
+                item.name for item in coordinator.definitions_for_global_scope(
+                    "__independent_chat__"
+                )
+            ] == ["mcp.echo.echo"]
+        finally:
+            await coordinator.stop_all()
+
+    asyncio.run(scenario())
+
+
+def test_coordinator_exposes_global_mcp_tools_to_independent_chat_scope(tmp_path):
+    script = tmp_path / "fixture_mcp.py"
+    _write_fixture_server(script)
+    settings = _settings(tmp_path, script)
+    extensions = FakeExtensionRegistry(settings)
+    tools = ToolRegistry()
+    coordinator = MCPSettingsCoordinator(
+        extension_registry=extensions,
+        tool_registry=tools,
+        allowed_cwd_roots=(tmp_path,),
+        project_ids_provider=lambda: ("project-a",),
+    )
+
+    async def scenario():
+        try:
+            await coordinator.sync_from_settings(settings)
+            definitions = coordinator.definitions_for_global_scope(
+                "__independent_chat__"
+            )
+            assert [item.name for item in definitions] == ["mcp.echo.echo"]
+            assert definitions[0].availability("__independent_chat__") is True
+            assert definitions[0].availability("project-a") is False
+
+            extensions.enabled[None] = False
+            assert definitions[0].availability("__independent_chat__") is False
+            assert coordinator.definitions_for_global_scope(
+                "__independent_chat__"
+            ) == ()
         finally:
             await coordinator.stop_all()
 

@@ -385,6 +385,69 @@ class MCPSettingsCoordinator:
             and self.extension_registry.is_effectively_enabled(extension_id, project_id)
         )
 
+    def definitions_for_global_scope(
+        self,
+        scope_id: str,
+    ) -> tuple[ToolDefinition, ...]:
+        """Expose trusted local MCP tools to an independent-chat virtual scope.
+
+        This deliberately does not register connector or provider tools.  The
+        returned definitions remain bound to the globally approved extension
+        state and to the live MCP child process.
+        """
+
+        normalized_scope = _bounded_text(scope_id, "scope_id", maximum=128)
+        with self._state_lock:
+            active_snapshot = tuple(self._active.items())
+        definitions: list[ToolDefinition] = []
+        for extension_id, active in active_snapshot:
+            if not getattr(active.client, "running", False):
+                continue
+            try:
+                item = self.extension_registry.get(
+                    extension_id, None, synchronize=False
+                )
+            except Exception:
+                continue
+            permission = item.get("project_permission") or {}
+            if (
+                not bool(item.get("effective_enabled"))
+                or str(permission.get("level") or "restricted") == "blocked"
+            ):
+                continue
+            for definition in active.definitions:
+                definitions.append(
+                    replace(
+                        definition,
+                        availability=(
+                            lambda project_id,
+                            _extension_id=extension_id,
+                            _scope=normalized_scope: bool(
+                                project_id == _scope
+                                and self._global_scope_available(_extension_id)
+                            )
+                        ),
+                    )
+                )
+        return tuple(definitions)
+
+    def _global_scope_available(self, extension_id: str) -> bool:
+        with self._state_lock:
+            active = self._active.get(extension_id)
+        if active is None or not getattr(active.client, "running", False):
+            return False
+        try:
+            item = self.extension_registry.get(
+                extension_id, None, synchronize=False
+            )
+        except Exception:
+            return False
+        permission = item.get("project_permission") or {}
+        return bool(
+            item.get("effective_enabled")
+            and str(permission.get("level") or "restricted") != "blocked"
+        )
+
     def _safe_unregister(self, project_id: str, tool_name: str, owner: str) -> None:
         try:
             current = self.tool_registry.get(project_id, tool_name)
@@ -547,7 +610,10 @@ class MCPSettingsCoordinator:
                     globally_enabled = self.extension_registry.is_effectively_enabled(
                         extension_id, None
                     )
-                    should_run = bool(enabled_projects) if projects else globally_enabled
+                    # A globally enabled local MCP also serves the isolated
+                    # independent-chat scope, even when every named Project
+                    # has an explicit disabled override.
+                    should_run = globally_enabled or bool(enabled_projects)
                     if should_run:
                         desired[extension_id] = (
                             runtime_settings,

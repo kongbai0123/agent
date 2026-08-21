@@ -36,12 +36,14 @@ class HostToolRuntime:
         approval_broker: ToolApprovalBroker,
         prepare_project: Optional[ProjectPreparer] = None,
         resolve_call_context: Optional[CallContextResolver] = None,
+        independent_scope_id: Optional[str] = None,
     ) -> None:
         self.registry = registry
         self.dispatcher = dispatcher
         self.approval_broker = approval_broker
         self.prepare_project = prepare_project
         self.resolve_call_context_callback = resolve_call_context
+        self.independent_scope_id = str(independent_scope_id or "").strip() or None
         self._event_queues: dict[str, asyncio.Queue[tuple[str, dict[str, Any]]]] = {}
         self._prior_audit_sink = dispatcher.audit_sink
         dispatcher.audit_sink = self._audit_sink

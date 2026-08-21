@@ -482,3 +482,26 @@ def test_project_permission_level_controls_fixed_tool_policy(
     call = SimpleNamespace(project_id="project-one")
     decision = workbench_app._evaluate_tool_permission(definition, call, None)
     assert decision.action.value == expected
+
+
+def test_independent_chat_uses_global_extension_permission(monkeypatch):
+    calls = []
+
+    class Registry:
+        def get(self, extension_id, project_id, *, synchronize=False):
+            calls.append((extension_id, project_id, synchronize))
+            return {"project_permission": {"level": "open", "revision": 2}}
+
+    monkeypatch.setattr(workbench_app, "extension_registry", Registry())
+    definition = SimpleNamespace(
+        extension_id="mcp.browser-playwright",
+        name="mcp.browser.browser_type",
+        risk_level="external_write",
+        access=workbench_app.ToolAccess.WRITE,
+    )
+    call = SimpleNamespace(project_id=workbench_app.INDEPENDENT_TOOL_SCOPE)
+
+    decision = workbench_app._evaluate_tool_permission(definition, call, None)
+
+    assert decision.action.value == "allow"
+    assert calls == [("mcp.browser-playwright", None, False)]

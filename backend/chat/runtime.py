@@ -815,7 +815,10 @@ async def _stream_model_tool_loop(
     state: _GenerationState,
     host_tool_runtime: Any,
 ) -> AsyncIterator[str]:
-    if not project_id:
+    tool_scope_id = project_id or str(
+        getattr(host_tool_runtime, "independent_scope_id", "") or ""
+    ).strip()
+    if not tool_scope_id:
         plain_payload = _payload_with_tool_availability_note(
             payload,
             "No tools were supplied because this conversation is an independent "
@@ -858,17 +861,17 @@ async def _stream_model_tool_loop(
             yield event
         return
     try:
-        definitions = await host_tool_runtime.definitions_for_project(project_id)
+        definitions = await host_tool_runtime.definitions_for_project(tool_scope_id)
     except Exception as exc:
         LOGGER.warning("Project tools unavailable (%s).", type(exc).__name__)
         definitions = ()
     if not definitions:
         plain_payload = _payload_with_tool_availability_note(
             payload,
-            "No project tool is currently available under the installed, trusted, "
-            "enabled, healthy, and project-scope policies. Do not claim a permanent "
-            "Agent limitation; explain that the relevant extension or project "
-            "permission must be made available.",
+            "No governed tool is currently available under the installed, trusted, "
+            "enabled, healthy, and active-scope policies. Do not claim a permanent "
+            "Agent limitation; explain that the relevant extension and permission "
+            "must be made available.",
         )
         async for event in _stream_model_tokens(
             settings=settings,
@@ -889,9 +892,10 @@ async def _stream_model_tool_loop(
     if governed_payload["messages"] and governed_payload["messages"][0].get("role") == "system":
         governed_payload["messages"][0]["content"] = (
             str(governed_payload["messages"][0].get("content") or "")
-            + " Project-scoped tools listed in this request are available. Use only "
+            + " Governed tools listed in this request are available. Use only "
               "those tools, never invent a tool result, and ask before assuming a resource. "
-              "External writes pause for one explicit local approval."
+              "Tool execution follows the active extension permission policy; if an "
+              "approval is required, wait for the local user to decide."
         )
     governed_payload["tools"] = [definition.model_schema() for definition in definitions]
     governed_payload["tool_choice"] = "auto"
@@ -1072,7 +1076,7 @@ async def _stream_model_tool_loop(
                     call_id=call_id,
                     run_id=run_id,
                     session_id=session_id,
-                    project_id=project_id,
+                    project_id=tool_scope_id,
                     run_control=run_control,
                     result_holder=result_holder,
                 ):

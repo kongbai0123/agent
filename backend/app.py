@@ -1513,6 +1513,7 @@ def _manifest_digest(extension_id: str) -> str:
 
 tool_registry = ToolRegistry()
 tool_approval_broker = ToolApprovalBroker(database_module=database)
+INDEPENDENT_TOOL_SCOPE = "__independent_chat__"
 mcp_coordinator = MCPSettingsCoordinator(
     extension_registry=extension_registry,
     tool_registry=tool_registry,
@@ -1532,6 +1533,12 @@ async def _prepare_project_tools(project_id: str) -> None:
         # MCP health/audit remains inspectable while connector tools and chat
         # continue to operate normally.
         print(f"[MCP] Project tool preparation failed: {type(exc).__name__}")
+    if project_id == INDEPENDENT_TOOL_SCOPE:
+        tool_registry.replace_project(
+            project_id,
+            mcp_coordinator.definitions_for_global_scope(project_id),
+        )
+        return
     mcp_definitions = tuple(
         definition
         for definition in tool_registry.for_project(project_id)
@@ -1565,10 +1572,12 @@ async def _prepare_project_tools(project_id: str) -> None:
 
 def _resolve_tool_scope(definition: Any, call: Any) -> ToolScopeState:
     if str(definition.extension_id).startswith("mcp."):
+        independent_scope = call.project_id == INDEPENDENT_TOOL_SCOPE
+        registry_project_id = None if independent_scope else call.project_id
         try:
             item = extension_registry.get(
                 definition.extension_id,
-                call.project_id,
+                registry_project_id,
                 synchronize=False,
             )
             health = mcp_coordinator.health(definition.extension_id)
@@ -1582,7 +1591,9 @@ def _resolve_tool_scope(definition: Any, call: Any) -> ToolScopeState:
             installed=bool(item.get("installed")),
             trusted=bool(item.get("trusted")),
             enabled=bool(item.get("effective_enabled")),
-            healthy=bool(health.get("running")) and call.project_id in active_projects,
+            healthy=bool(health.get("running")) and (
+                independent_scope or call.project_id in active_projects
+            ),
             resource_allowed=not bool(definition.requires_resource),
             manifest_sha256=str(item.get("manifest_sha256") or ""),
             resource_revision=0,
@@ -1674,10 +1685,13 @@ def _evaluate_tool_permission(definition, call, _scope) -> PolicyDecision:
 
     level = "restricted"
     if call.project_id:
+        registry_project_id = (
+            None if call.project_id == INDEPENDENT_TOOL_SCOPE else call.project_id
+        )
         try:
             item = extension_registry.get(
                 definition.extension_id,
-                call.project_id,
+                registry_project_id,
                 synchronize=False,
             )
             level = str((item.get("project_permission") or {}).get("level") or "restricted")
@@ -1721,6 +1735,7 @@ host_tool_runtime = HostToolRuntime(
     dispatcher=tool_dispatcher,
     approval_broker=tool_approval_broker,
     prepare_project=_prepare_project_tools,
+    independent_scope_id=INDEPENDENT_TOOL_SCOPE,
     resolve_call_context=lambda project_id, definition, arguments: (
         connector_service.resolve_host_call_context(
             project_id,
