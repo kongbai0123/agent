@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import sys
 from contextlib import contextmanager
@@ -32,6 +33,7 @@ from hermes import (  # noqa: E402
 )
 from hermes_integration import HermesIntegrationDecision  # noqa: E402
 from hermes_project_skills_bridge import HermesProjectSkillsAttachment  # noqa: E402
+from factual_verifier import EvidenceBundle, EvidenceRecord  # noqa: E402
 
 
 def parse_events(frames):
@@ -100,6 +102,7 @@ class FakeManager:
         self.cancelled = []
         self.approvals = []
         self.abandoned = []
+        self.start_calls = []
 
     def prepare_project_skills(self, session_id, _query, *, run_id, consume_turn):
         if self.prepare_error:
@@ -112,6 +115,7 @@ class FakeManager:
         return HermesIntegrationDecision(True, "rollout_all", "", SimpleNamespace())
 
     def start_run(self, **kwargs):
+        self.start_calls.append(dict(kwargs))
         if self.start_error:
             raise self.start_error
         return HermesRunSnapshot(
@@ -159,7 +163,17 @@ def setup_turn(label, *, project_id=None):
     return session_id, turn_id, run_id, user_id, control
 
 
-async def collect(manager, label, fallback=None):
+async def collect(
+    manager,
+    label,
+    fallback=None,
+    *,
+    temporary_context="",
+    knowledge_context="",
+    knowledge_sources=None,
+    evidence_bundle=None,
+    answer_verification_mode="warn",
+):
     session_id, turn_id, run_id, user_id, control = setup_turn(
         label, project_id=manager.project_id
     )
@@ -180,11 +194,342 @@ async def collect(manager, label, fallback=None):
         prompt_sha256="digest",
         user_message_id=user_id,
         user_query="hello",
+        temporary_context=temporary_context,
+        knowledge_context=knowledge_context,
+        knowledge_sources=knowledge_sources,
+        evidence_bundle=evidence_bundle,
+        answer_verification_mode=answer_verification_mode,
         run_control=control,
         fallback_stream_factory=basic,
     ):
         frames.append(frame)
     return parse_events(frames), session_id, run_id
+
+
+def factual_evidence_fixture(*, project_id, content="法國的首都是巴黎。"):
+    context = (
+        "[evidence:knowledge:chunk-one]\n"
+        f"[知識來源 1：專案指南]\n{content}"
+    )
+    digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    citation = {
+        "project_id": project_id,
+        "source_id": "guide.md",
+        "title": "專案指南",
+        "document_id": "document-one",
+        "chunk_id": "chunk-one",
+        "chunk_sha256": digest,
+    }
+    sources = [
+        {
+            "kind": "project_knowledge",
+            "project_id": project_id,
+            "source": "專案指南",
+            "document_id": "document-one",
+            "chunk_id": "chunk-one",
+            "snippet_sha256": digest,
+            "citation": citation,
+        }
+    ]
+    evidence = EvidenceBundle(
+        (
+            EvidenceRecord(
+                "knowledge:chunk-one",
+                content,
+                project_id=project_id,
+                citation=citation,
+            ),
+        ),
+        project_id=project_id,
+    )
+    return context, sources, evidence
+
+
+def test_enabled_hermes_receives_bounded_rag_and_persists_only_safe_citations():
+    project_id = "project-hermes-rag"
+    raw_source_snippet = "RAW-SOURCE-SNIPPET-MUST-NOT-PERSIST"
+    knowledge_context = "[知識來源 1：規格]\nSIDECAR-RAG-CONTEXT"
+    manager = FakeManager(
+        [
+            SSEEvent(
+                "message",
+                json.dumps(
+                    {
+                        "event": "run.completed",
+                        "output": "RAG answer",
+                        "usage": {},
+                    }
+                ),
+            )
+        ],
+        project_id=project_id,
+    )
+    sources = [
+        {
+            "kind": "project_knowledge",
+            "project_id": project_id,
+            "source": "規格",
+            "content": raw_source_snippet,
+            "score": 0.9,
+            "document_id": "document-one",
+            "chunk_id": "chunk-one",
+            "snippet_sha256": "a" * 64,
+            "citation": {
+                "project_id": project_id,
+                "document_id": "document-one",
+                "chunk_id": "chunk-one",
+                "title": "規格",
+                "chunk_sha256": "b" * 64,
+                "private_excerpt": raw_source_snippet,
+            },
+        }
+    ]
+
+    events, session_id, run_id = asyncio.run(
+        collect(
+            manager,
+            "enabled-rag",
+            knowledge_context=knowledge_context,
+            knowledge_sources=sources,
+        )
+    )
+
+    instructions = manager.start_calls[0]["base_instructions"]
+    assert "SIDECAR-RAG-CONTEXT" in instructions
+    assert "未受信任的 Workbench Project 知識片段" in instructions
+    assert events[-2][1]["hermes_context_budget"]["knowledge_source_count"] == 1
+    assert events[-2][1]["hermes_context_budget"][
+        "knowledge_context_input_chars"
+    ] == len(knowledge_context)
+    run = database.get_run(run_id)
+    message = database.get_messages_by_session(session_id)[-1]
+    knowledge_run_sources = [
+        item for item in run["sources"] if item.get("kind") == "project_knowledge"
+    ]
+    knowledge_message_sources = [
+        item for item in message["sources"] if item.get("kind") == "project_knowledge"
+    ]
+    assert knowledge_run_sources == knowledge_message_sources
+    assert knowledge_run_sources[0]["content"] == ""
+    assert knowledge_run_sources[0]["snippet_sha256"] == "a" * 64
+    persisted = json.dumps(
+        {"events": events, "run_sources": run["sources"], "message_sources": message["sources"]},
+        ensure_ascii=False,
+    )
+    assert raw_source_snippet not in persisted
+    assert "private_excerpt" not in persisted
+
+
+def test_hermes_strict_factual_gate_never_emits_or_persists_unverified_answer():
+    project_id = "project-hermes-factual-strict"
+    context, sources, evidence = factual_evidence_fixture(project_id=project_id)
+    unverified_answer = "法國的首都是里昂。[evidence:knowledge:chunk-one]"
+    manager = FakeManager(
+        [
+            SSEEvent(
+                "message",
+                json.dumps(
+                    {
+                        "event": "message.delta",
+                        "delta": unverified_answer,
+                    }
+                ),
+            ),
+            SSEEvent(
+                "message",
+                json.dumps(
+                    {
+                        "event": "run.completed",
+                        "output": unverified_answer,
+                        "usage": {},
+                    }
+                ),
+            ),
+        ],
+        project_id=project_id,
+    )
+
+    events, session_id, run_id = asyncio.run(
+        collect(
+            manager,
+            "factual-strict",
+            knowledge_context=context,
+            knowledge_sources=sources,
+            evidence_bundle=evidence,
+            answer_verification_mode="strict",
+        )
+    )
+
+    assert [name for name, _payload in events] == ["meta", "validation", "error"]
+    assert not any(name == "token" for name, _payload in events)
+    validation = events[1][1]
+    assert validation["name"] == "answer_factuality"
+    assert validation["passed"] is False
+    assert events[-1][1]["code"] == "ANSWER_FACT_VERIFICATION_FAILED"
+    assert database.get_run(run_id)["status"] == "failed"
+    assert [message["role"] for message in database.get_messages_by_session(session_id)] == [
+        "user"
+    ]
+    assert manager.abandoned[-1][1] == "answer_verification_failed"
+    public_state = json.dumps(
+        {"events": events, "run": database.get_run(run_id)},
+        ensure_ascii=False,
+    )
+    assert unverified_answer not in public_state
+
+
+def test_hermes_strict_rejection_cleanup_failure_cannot_trigger_fallback(monkeypatch):
+    project_id = "project-hermes-factual-cleanup"
+    context, sources, evidence = factual_evidence_fixture(project_id=project_id)
+    unverified_answer = "法國的首都是里昂。[evidence:knowledge:chunk-one]"
+    fallback = [encode_sse("token", {"content": "must-not-fallback"})]
+    manager = FakeManager(
+        [
+            SSEEvent(
+                "message",
+                json.dumps(
+                    {
+                        "event": "run.completed",
+                        "output": unverified_answer,
+                        "usage": {},
+                    }
+                ),
+            )
+        ],
+        fallback_safe=True,
+        project_id=project_id,
+    )
+
+    def fail_persistence(**_kwargs):
+        raise OSError("injected failure persistence error")
+
+    def fail_abandon(_decision, *, reason="cancelled"):
+        raise RuntimeError(reason)
+
+    monkeypatch.setattr("chat.hermes_runtime._persist_failure", fail_persistence)
+    manager.abandon = fail_abandon
+
+    events, session_id, _run_id = asyncio.run(
+        collect(
+            manager,
+            "factual-cleanup",
+            fallback,
+            knowledge_context=context,
+            knowledge_sources=sources,
+            evidence_bundle=evidence,
+            answer_verification_mode="strict",
+        )
+    )
+
+    assert [name for name, _payload in events] == ["meta", "validation", "error"]
+    assert "must-not-fallback" not in json.dumps(events)
+    assert unverified_answer not in json.dumps(events, ensure_ascii=False)
+    assert [message["role"] for message in database.get_messages_by_session(session_id)] == [
+        "user"
+    ]
+
+
+def test_hermes_warn_gate_adds_fixed_warning_without_exposing_evidence_text():
+    project_id = "project-hermes-factual-warn"
+    raw_evidence = "法國的首都是巴黎。PRIVATE-EVIDENCE-MUST-NOT-LEAK"
+    context, sources, evidence = factual_evidence_fixture(
+        project_id=project_id,
+        content=raw_evidence,
+    )
+    unverified_answer = "法國的首都是里昂。[evidence:knowledge:chunk-one]"
+    manager = FakeManager(
+        [
+            SSEEvent(
+                "message",
+                json.dumps(
+                    {
+                        "event": "run.completed",
+                        "output": unverified_answer,
+                        "usage": {},
+                    }
+                ),
+            )
+        ],
+        project_id=project_id,
+    )
+
+    events, session_id, run_id = asyncio.run(
+        collect(
+            manager,
+            "factual-warn",
+            knowledge_context=context,
+            knowledge_sources=sources,
+            evidence_bundle=evidence,
+        )
+    )
+
+    assert [name for name, _payload in events] == [
+        "meta",
+        "validation",
+        "token",
+        "token",
+        "metrics",
+        "done",
+    ]
+    visible = "".join(
+        payload["content"] for name, payload in events if name == "token"
+    )
+    assert visible.startswith("⚠️ 事實驗證提醒：")
+    assert visible.endswith(unverified_answer)
+    assert database.get_messages_by_session(session_id)[-1]["content"] == visible
+    assert "事實引用規則" in manager.start_calls[0]["base_instructions"]
+    public_state = json.dumps(
+        {
+            "events": events,
+            "run": database.get_run(run_id),
+            "message": database.get_messages_by_session(session_id)[-1],
+        },
+        ensure_ascii=False,
+    )
+    assert "PRIVATE-EVIDENCE-MUST-NOT-LEAK" not in public_state
+
+
+def test_hermes_verified_answer_passes_gate_before_first_token():
+    project_id = "project-hermes-factual-verified"
+    context, sources, evidence = factual_evidence_fixture(project_id=project_id)
+    verified_answer = "法國的首都是巴黎。[evidence:knowledge:chunk-one]"
+    manager = FakeManager(
+        [
+            SSEEvent(
+                "message",
+                json.dumps(
+                    {
+                        "event": "run.completed",
+                        "output": verified_answer,
+                        "usage": {},
+                    }
+                ),
+            )
+        ],
+        project_id=project_id,
+    )
+
+    events, session_id, _run_id = asyncio.run(
+        collect(
+            manager,
+            "factual-verified",
+            knowledge_context=context,
+            knowledge_sources=sources,
+            evidence_bundle=evidence,
+            answer_verification_mode="strict",
+        )
+    )
+
+    assert [name for name, _payload in events] == [
+        "meta",
+        "validation",
+        "token",
+        "metrics",
+        "done",
+    ]
+    assert events[1][1]["passed"] is True
+    assert events[2][1]["content"] == verified_answer
+    assert database.get_messages_by_session(session_id)[-1]["content"] == verified_answer
 
 
 def test_pinned_v0182_events_fill_missing_authoritative_suffix_and_persist():

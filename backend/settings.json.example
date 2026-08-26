@@ -34,6 +34,18 @@
   "hermes_allowed_capabilities": [],
   "hermes_readonly_project_id": "",
   "hermes_fallback_enabled": true,
+  "rag_k": 4,
+  "rag_rerank_threshold": 0.2,
+  "rag_embedding_provider_id": "",
+  "rag_reranker_provider_id": "",
+  "rag_local_embedding_model_path": "",
+  "rag_local_reranker_model_path": "",
+  "chunk_size": 600,
+  "chunk_overlap": 120,
+  "agent_max_tool_calls": 8,
+  "agent_max_repair_rounds": 2,
+  "agent_auto_validate": true,
+  "answer_verification_mode": "warn",
   "settings_modal_width": 1040,
   "settings_modal_height": 760
 }

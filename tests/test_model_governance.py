@@ -173,7 +173,201 @@ def test_routing_defaults_to_ask_and_remembered_consent_becomes_project_policy(s
     assert "nvidia" in policy["allowed_providers"]
     assert policy["data_consent"]["documents"] is True
     assert service.consume_proposal(result["proposal_id"], project_id="p1", requested_model="nvidia::rerank-model") == "nvidia::chat-model"
+    assert not service.proposal_grants_data(
+        result["proposal_id"],
+        data_type="documents",
+        project_id="p1",
+        run_id="r1",
+        requested_model="nvidia::rerank-model",
+    )
     assert service.consume_proposal(result["proposal_id"], project_id="p1", requested_model="nvidia::rerank-model") is None
+
+
+def test_document_consent_proposal_is_model_run_and_project_bound_single_use(service):
+    proposal = service.create_data_consent_proposal(
+        project_id="p1",
+        run_id="run-consent-1",
+        requested_model="connection::original-chat",
+        selected_model="connection3::nvidia/selected-chat",
+        provider_id="nvidia",
+    )
+
+    assert proposal["requirements"] == {"documents": True}
+    assert proposal["requested_model"] == "connection::original-chat"
+    assert proposal["selected_model"] == "connection3::nvidia/selected-chat"
+    assert proposal["provider"] == "nvidia"
+    expires = datetime.fromisoformat(proposal["expires_at"])
+    assert 590 <= (expires - datetime.now(timezone.utc)).total_seconds() <= 600
+
+    service.approve_proposal(proposal["proposal_id"], remember_project=False)
+    assert service.consume_proposal(
+        proposal["proposal_id"],
+        project_id="p1",
+        requested_model="connection::original-chat",
+        run_id="wrong-run",
+    ) is None
+    assert service.consume_proposal(
+        proposal["proposal_id"],
+        project_id="p1",
+        requested_model="connection::original-chat",
+        run_id="run-consent-1",
+    ) == "connection3::nvidia/selected-chat"
+    assert service.proposal_grants_data(
+        proposal["proposal_id"],
+        data_type="documents",
+        project_id="p1",
+        run_id="run-consent-1",
+        requested_model="connection::original-chat",
+    )
+    assert service.consume_proposal(
+        proposal["proposal_id"],
+        project_id="p1",
+        requested_model="connection::original-chat",
+        run_id="run-consent-1",
+    ) is None
+
+
+def test_unprojected_image_and_document_consent_is_once_only(service):
+    proposal = service.create_data_consent_proposal(
+        project_id=None,
+        run_id="run-independent-consent",
+        requested_model="nvidia::chat",
+        selected_model="nvidia::chat",
+        provider_id="nvidia",
+        data_types=("images", "documents"),
+    )
+
+    assert proposal["project_id"] is None
+    assert proposal["requirements"] == {"documents": True, "images": True}
+    with pytest.raises(GovernanceError) as remember_error:
+        service.approve_proposal(proposal["proposal_id"], remember_project=True)
+    assert remember_error.value.code == "ROUTING_PROJECT_REQUIRED"
+
+    service.approve_proposal(proposal["proposal_id"], remember_project=False)
+    assert service.consume_proposal(
+        proposal["proposal_id"],
+        project_id=None,
+        requested_model="nvidia::chat",
+        run_id="run-independent-consent",
+    ) == "nvidia::chat"
+    for data_type in ("images", "documents"):
+        assert service.proposal_grants_data(
+            proposal["proposal_id"],
+            data_type=data_type,
+            project_id=None,
+            run_id="run-independent-consent",
+            requested_model="nvidia::chat",
+        )
+    assert service.consume_proposal(
+        proposal["proposal_id"],
+        project_id=None,
+        requested_model="nvidia::chat",
+        run_id="run-independent-consent",
+    ) is None
+
+
+def test_remembered_document_consent_uses_explicit_provider_not_model_prefix(service):
+    proposal = service.create_data_consent_proposal(
+        project_id="p1",
+        run_id="run-consent-remember",
+        requested_model="connection3::nvidia/nemotron-chat",
+        selected_model="connection3::nvidia/nemotron-chat",
+        provider_id="nvidia",
+    )
+
+    service.approve_proposal(proposal["proposal_id"], remember_project=True)
+    policy = service.get_routing_policy("p1")
+
+    assert policy["mode"] == "auto_within_policy"
+    assert policy["allowed_providers"] == ["nvidia"]
+    assert policy["data_consent"]["documents"] is True
+    assert "connection3" not in policy["allowed_providers"]
+    assert service.consume_proposal(
+        proposal["proposal_id"],
+        project_id="p1",
+        requested_model="connection3::nvidia/nemotron-chat",
+        run_id="run-consent-remember",
+    ) == "connection3::nvidia/nemotron-chat"
+
+
+def test_remembered_data_consent_keeps_remote_ollama_provider_allowlist(service):
+    proposal = service.create_data_consent_proposal(
+        project_id="p1",
+        run_id="run-remote-ollama-consent",
+        requested_model="remote-ollama-chat",
+        selected_model="remote-ollama-chat",
+        provider_id="ollama",
+        data_types=("documents",),
+    )
+
+    service.approve_proposal(proposal["proposal_id"], remember_project=True)
+    policy = service.get_routing_policy("p1")
+
+    assert "ollama" in policy["allowed_providers"]
+    assert policy["data_consent"]["documents"] is True
+
+
+def test_document_consent_rejects_policy_revision_change_and_digest_tampering(service):
+    stale = service.create_data_consent_proposal(
+        project_id="p1",
+        run_id="run-stale",
+        requested_model="nvidia::chat",
+        selected_model="nvidia::chat",
+        provider_id="nvidia",
+    )
+    service.put_routing_policy(
+        "p1",
+        revision=0,
+        mode="ask",
+        allowed_providers=[],
+        data_consent={},
+        preferred_models=[],
+    )
+    with pytest.raises(GovernanceError) as conflict:
+        service.approve_proposal(stale["proposal_id"], remember_project=False)
+    assert conflict.value.code == "ROUTING_PROPOSAL_STALE"
+
+    tampered = service.create_data_consent_proposal(
+        project_id="p1",
+        run_id="run-tampered",
+        requested_model="nvidia::chat",
+        selected_model="nvidia::chat",
+        provider_id="nvidia",
+    )
+    with database.get_db_conn() as conn:
+        conn.execute(
+            "UPDATE model_routing_proposals SET requirements_json=? WHERE proposal_id=?",
+            ('{"documents":true,"policy_revision":1,"provider":"other"}', tampered["proposal_id"]),
+        )
+    with pytest.raises(GovernanceError) as invalid:
+        service.approve_proposal(tampered["proposal_id"], remember_project=False)
+    assert invalid.value.code == "ROUTING_PROPOSAL_INVALID"
+
+    changed_after_approval = service.create_data_consent_proposal(
+        project_id="p1",
+        run_id="run-changed-after-approval",
+        requested_model="nvidia::chat",
+        selected_model="nvidia::chat",
+        provider_id="nvidia",
+    )
+    service.approve_proposal(
+        changed_after_approval["proposal_id"], remember_project=False
+    )
+    policy = service.get_routing_policy("p1")
+    service.put_routing_policy(
+        "p1",
+        revision=policy["revision"],
+        mode="ask",
+        allowed_providers=[],
+        data_consent={},
+        preferred_models=[],
+    )
+    assert service.consume_proposal(
+        changed_after_approval["proposal_id"],
+        project_id="p1",
+        requested_model="nvidia::chat",
+        run_id="run-changed-after-approval",
+    ) is None
 
 
 def test_initialize_invalidates_unfinished_ephemeral_authority(service):

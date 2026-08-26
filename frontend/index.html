@@ -17,7 +17,7 @@
     <link rel="stylesheet" href="katex.min.css">
     <script src="katex.min.js"></script>
     <script src="auto-render.min.js"></script>
-    <link rel="stylesheet" href="style.css?v=0.9.0-model-catalog-beta.5">
+    <link rel="stylesheet" href="style.css?v=0.9.0-model-catalog-beta.7">
 </head>
 <body class="basic-chat-mode">
     <div class="app-container workbench-shell">
@@ -44,7 +44,7 @@
                 </button>
                 <button class="status-chip chip-clickable" id="chip-docs" title="知識庫規模，點擊開啟知識庫" aria-label="知識庫文件數">
                     <i data-lucide="files" aria-hidden="true"></i>
-                    <span id="chip-docs-text">0 docs</span>
+                    <span id="chip-docs-text">0 份文件</span>
                 </button>
                 <button class="status-chip chip-clickable" id="chip-speed" title="生成速度，點擊開啟模型指標" aria-label="生成速度">
                     <i data-lucide="gauge" aria-hidden="true"></i>
@@ -83,7 +83,8 @@
                     <i data-lucide="workflow"></i><span class="rail-label">流程</span>
                     <span class="rail-notification-badge" id="workflow-rail-badge" aria-hidden="true" hidden>0</span>
                 </button>
-                <button class="rail-btn" id="rail-knowledge" title="知識庫" aria-label="知識庫管理">
+                <button class="rail-btn" id="rail-knowledge" title="知識庫" aria-label="知識庫管理"
+                    aria-controls="knowledge-workspace" aria-current="false">
                     <i data-lucide="book-open"></i><span class="rail-label">知識庫</span>
                 </button>
                 <button class="rail-btn" id="rail-runs" title="執行紀錄" aria-label="Agent 執行紀錄">
@@ -1132,28 +1133,45 @@
         </div>
     </div>
 
-    <!-- ================= 📚 知識庫管理 Modal（Knowledge Center） ================= -->
-    <div class="modal-overlay" id="kb-manager-modal" role="dialog" aria-modal="true" aria-label="知識庫管理">
-        <div class="modal kb-modal">
-            <div class="modal-header">
-                <h3>📚 Knowledge Center</h3>
-                <button class="modal-close" id="kb-modal-close" aria-label="關閉知識庫管理"><i data-lucide="x"></i></button>
-            </div>
+    <!-- ================= 專案知識庫工作區 ================= -->
+    <main class="knowledge-workspace" id="knowledge-workspace" aria-labelledby="knowledge-workspace-title" hidden>
+        <div class="management-workspace-shell knowledge-workspace-shell">
+            <header class="workspace-header knowledge-workspace-header">
+                <div>
+                    <span class="knowledge-eyebrow">專案知識檢索</span>
+                    <h1 id="knowledge-workspace-title" tabindex="-1"><i data-lucide="book-open"></i>知識庫</h1>
+                    <p>匯入目前專案的文件，建立本機索引，並在送進對話前測試實際召回的內容。</p>
+                </div>
+                <button type="button" class="workspace-close" id="knowledge-workspace-close" aria-label="返回聊天"><i data-lucide="x"></i></button>
+            </header>
+            <section class="knowledge-project-required" id="kb-project-required" aria-live="polite" hidden>
+                <i data-lucide="folder-plus" aria-hidden="true"></i>
+                <div>
+                    <h2>請先選擇專案</h2>
+                    <p>知識庫必須歸屬於明確專案，獨立對話不會讀取或寫入任何專案文件。</p>
+                </div>
+                <button type="button" class="btn btn-primary" id="kb-choose-project">返回聊天並選擇專案</button>
+            </section>
             <div class="mm-tabs kb-tabs" role="tablist">
-                <button class="mm-tab active" data-kbtab="documents" role="tab">Documents</button>
-                <button class="mm-tab" data-kbtab="retrieval" role="tab">Retrieval Test</button>
-                <button class="mm-tab" data-kbtab="index" role="tab">Index Settings</button>
+                <button class="mm-tab active" id="kb-tab-documents" data-kbtab="documents" role="tab"
+                    aria-controls="kb-pane-documents" aria-selected="true">文件</button>
+                <button class="mm-tab" id="kb-tab-retrieval" data-kbtab="retrieval" role="tab"
+                    aria-controls="kb-pane-retrieval" aria-selected="false" tabindex="-1">檢索測試</button>
+                <button class="mm-tab" id="kb-tab-index" data-kbtab="index" role="tab"
+                    aria-controls="kb-pane-index" aria-selected="false" tabindex="-1">索引狀態</button>
             </div>
-            <div class="modal-body">
-                <!-- Documents Tab -->
-                <div class="kb-pane active" id="kb-pane-documents">
+            <div class="knowledge-workspace-body" id="kb-workspace-content">
+                <!-- 文件分頁 -->
+                <section class="kb-pane active" id="kb-pane-documents" role="tabpanel" aria-labelledby="kb-tab-documents">
                     <div class="kb-upload-section">
-                        <h4>上傳新文檔進行本地向量化</h4>
-                        <div class="upload-dropzone" id="upload-zone">
+                        <h2>匯入文件並建立本機索引</h2>
+                        <p class="mm-note">每次最多 10 份、每份最多 8 MiB；PDF 最多 200 頁。資料只會加入目前專案，不會供其他專案使用。</p>
+                        <div class="upload-dropzone" id="upload-zone" role="button" tabindex="0"
+                            aria-controls="file-input" aria-label="選擇要匯入目前專案知識庫的文件">
                             <i data-lucide="upload-cloud"></i>
-                            <p>拖曳檔案至此或<span>瀏覽檔案</span></p>
-                            <span class="file-hint">支援 PDF, TXT, MD, PY, JS, HTML, CSS, JSON</span>
-                            <input type="file" id="file-input" multiple accept=".pdf,.txt,.md,.py,.js,.html,.css,.json" style="display: none;">
+                            <p>拖曳檔案至此，或<span>選擇檔案</span></p>
+                            <span class="file-hint">支援 PDF、TXT、Markdown、Python、JavaScript、HTML、CSS、JSON、CSV</span>
+                            <input type="file" id="file-input" multiple accept=".pdf,.txt,.md,.py,.js,.html,.css,.json,.csv" style="display: none;">
                         </div>
                         <div class="upload-progress-container" id="progress-container" style="display: none;">
                             <div class="progress-info">
@@ -1167,49 +1185,56 @@
                     </div>
                     <div class="kb-files-section">
                         <h4>已匯入的知識庫文件</h4>
-                        <div class="kb-file-list" id="kb-file-list"></div>
+                        <div class="kb-file-list" id="kb-file-list" aria-live="polite"></div>
                     </div>
                     <div class="kb-chunks-preview-section" id="chunks-preview-section" style="display: none;">
                         <div class="chunks-preview-header">
-                            <h4 id="chunks-preview-title">📄 文件 Chunks 預覽</h4>
+                            <h4 id="chunks-preview-title">文件片段預覽</h4>
                             <button class="btn btn-secondary btn-xs" id="close-chunks-btn" style="width: auto; padding: 4px 10px; font-size: 12px;">關閉預覽</button>
                         </div>
                         <div class="chunks-list" id="chunks-list"></div>
                     </div>
-                </div>
-                <!-- Retrieval Test Tab -->
-                <div class="kb-pane" id="kb-pane-retrieval">
+                </section>
+                <!-- 檢索測試分頁 -->
+                <section class="kb-pane" id="kb-pane-retrieval" role="tabpanel" aria-labelledby="kb-tab-retrieval" hidden>
                     <h4>檢索測試</h4>
-                    <p class="mm-note">輸入測試問題，檢查知識庫會召回哪些片段（不觸發生成）。</p>
+                    <p class="mm-note">輸入測試問題，查看目前專案會召回哪些片段；這項測試不會呼叫對話模型。</p>
                     <div style="display:flex; gap:8px; margin: 10px 0;">
                         <input type="text" id="kb-test-query" class="settings-input" placeholder="例如：這份文件如何說明 RNN？" style="flex:1;" aria-label="檢索測試問題">
                         <button class="btn btn-primary" id="kb-test-run" style="width:auto;">測試檢索</button>
                     </div>
-                    <div id="kb-test-results" class="mm-list"></div>
-                </div>
-                <!-- Index Settings Tab -->
-                <div class="kb-pane" id="kb-pane-index">
-                    <h4>目前索引設定</h4>
-                    <div class="mm-list" id="kb-index-settings">載入中...</div>
-                    <div class="mm-note">如需修改 chunk size / overlap / top K / 重排閾值，請至「設定中心 → RAG 檢索」。</div>
-                </div>
+                    <div id="kb-test-results" class="mm-list" aria-live="polite"></div>
+                </section>
+                <!-- 索引狀態分頁 -->
+                <section class="kb-pane" id="kb-pane-index" role="tabpanel" aria-labelledby="kb-tab-index" hidden>
+                    <h4>目前專案索引狀態</h4>
+                    <div class="mm-list" id="kb-index-settings" aria-live="polite">正在載入...</div>
+                    <div class="mm-note">預設使用可重現的本機嵌入方式；日後連接其他嵌入或重排模型時，仍沿用相同的專案隔離與引用規則。調整片段設定只影響後續匯入；既有文件需重新匯入才會重新切塊。</div>
+                </section>
             </div>
-            <div class="modal-footer">
-                <button class="btn btn-danger" id="clear-all-kb-btn" style="width: auto;">清空整個知識庫</button>
-                <button class="btn btn-secondary" id="kb-modal-close-btn" style="width: auto;">關閉</button>
-            </div>
+            <footer class="workspace-footer knowledge-workspace-footer">
+                <span id="kb-workspace-status" aria-live="polite">尚未載入專案知識庫。</span>
+                <div>
+                    <label class="knowledge-runtime-toggle" for="kb-chat-retrieval-toggle">
+                        <input type="checkbox" id="kb-chat-retrieval-toggle" checked>
+                        <span>對話自動使用專案知識</span>
+                    </label>
+                    <button class="btn btn-danger" id="clear-all-kb-btn" style="width: auto;">清空目前專案知識庫</button>
+                    <button class="btn btn-secondary" id="knowledge-workspace-close-btn" style="width: auto;">回到聊天</button>
+                </div>
+            </footer>
         </div>
-    </div>
+    </main>
 
     <!-- 彈出確認 Modal (清空整個知識庫時使用) -->
     <div class="modal-overlay" id="confirm-modal" role="dialog" aria-modal="true">
         <div class="modal">
             <div class="modal-header">
-                <h3>確認清空整個知識庫？</h3>
+                <h3>確認清空目前專案知識庫？</h3>
                 <button class="modal-close" id="modal-close" aria-label="關閉"><i data-lucide="x"></i></button>
             </div>
             <div class="modal-body">
-                <p>此動作將永久清除 Chroma 向量資料庫中的所有索引數據，並刪除上傳的本地暫存檔案。此動作無法還原。</p>
+                <p>此動作只會永久刪除目前專案的文件索引與片段，不會影響其他專案；刪除後無法復原。</p>
             </div>
             <div class="modal-footer">
                 <button class="btn btn-secondary" id="modal-cancel">取消</button>
@@ -1304,29 +1329,68 @@
                     <div class="settings-pane" id="tab-settings-rag">
                         <div class="settings-group">
                             <div style="display: flex; justify-content: space-between;">
-                                <label class="settings-label">混合檢索召回數量 (rag_k)</label>
+                                <label class="settings-label">每次檢索召回片段數量</label>
                                 <span id="val-rag-k" class="settings-slider-value">4</span>
                             </div>
                             <input type="range" id="setting-rag-k" class="settings-slider" min="1" max="15" step="1" value="4">
-                            <span class="settings-tip">每次 RAG 檢索時，送給大模型參考的 Context 片段數量。</span>
+                            <span class="settings-tip">每次從目前專案索引召回、並供對話模型參考的片段數量。</span>
                         </div>
                         <div class="settings-group">
                             <div style="display: flex; justify-content: space-between;">
-                                <label class="settings-label">重排過濾閾值（Rerank Threshold）</label>
+                                <label class="settings-label">相關度過濾門檻</label>
                                 <span id="val-rag-threshold" class="settings-slider-value">0.2</span>
                             </div>
                             <input type="range" id="setting-rag-threshold" class="settings-slider" min="0.0" max="1.0" step="0.05" value="0.2">
-                            <span class="settings-tip">CrossEncoder 重排相似度低於此閾值的片段將被過濾，防止幻覺。</span>
+                            <span class="settings-tip">本機相似度或已設定重排器的分數低於此門檻時，不會把該片段送入對話。</span>
+                        </div>
+                        <div class="settings-group">
+                            <label class="settings-label" for="setting-rag-embedding-backend">文件語意索引方式</label>
+                            <select id="setting-rag-embedding-backend" class="settings-input">
+                                <option value="baseline">本機保守基線（不需下載模型）</option>
+                                <option value="local">使用既有本機 Embedding 模型</option>
+                            </select>
+                            <span class="settings-tip" id="setting-rag-embedding-status">預設只在本機建立基本索引，不會把文件送到雲端。</span>
+                            <label id="setting-rag-embedding-local-wrap" hidden>
+                                <span class="settings-label">本機 Embedding 模型絕對路徑</span>
+                                <input type="text" id="setting-rag-embedding-local-path" class="settings-input"
+                                       placeholder="例如 D:\models\embedding-model" autocomplete="off" spellcheck="false">
+                                <span class="settings-tip">只使用已存在的 Sentence Transformers 模型資料夾；Workbench 不會自動下載模型。</span>
+                            </label>
+                        </div>
+                        <div class="settings-group">
+                            <label class="settings-label" for="setting-rag-reranker-backend">候選片段重新排序方式</label>
+                            <select id="setting-rag-reranker-backend" class="settings-input">
+                                <option value="baseline">本機保守基線（不需下載模型）</option>
+                                <option value="local">使用既有本機 Reranker 模型</option>
+                            </select>
+                            <span class="settings-tip" id="setting-rag-reranker-status">預設使用本機規則排序，不會新增外部資料傳送。</span>
+                            <label id="setting-rag-reranker-local-wrap" hidden>
+                                <span class="settings-label">本機 Reranker 模型絕對路徑</span>
+                                <input type="text" id="setting-rag-reranker-local-path" class="settings-input"
+                                       placeholder="例如 D:\models\reranker-model" autocomplete="off" spellcheck="false">
+                                <span class="settings-tip">只使用已存在的 Cross-Encoder 模型資料夾；Workbench 不會自動下載模型。</span>
+                            </label>
                         </div>
                         <div class="settings-group" style="display: flex; gap: 20px;">
                             <div style="flex: 1;">
                                 <label class="settings-label" for="setting-chunk-size">片段大小（Chunk Size）</label>
-                                <input type="number" id="setting-chunk-size" class="settings-input" min="100" max="3000" step="50" value="600">
+                                <input type="number" id="setting-chunk-size" class="settings-input" min="128" max="3000" step="16" value="600">
                             </div>
                             <div style="flex: 1;">
                                 <label class="settings-label" for="setting-chunk-overlap">重疊長度（Overlap）</label>
-                                <input type="number" id="setting-chunk-overlap" class="settings-input" min="10" max="1000" step="10" value="120">
+                                <input type="number" id="setting-chunk-overlap" class="settings-input" min="0" max="1000" step="10" value="120">
                             </div>
+                        </div>
+                        <div class="settings-group">
+                            <label class="settings-label" for="setting-answer-verification-mode">最終回答事實驗證</label>
+                            <select id="setting-answer-verification-mode" class="settings-input">
+                                <option value="warn" selected>提醒（建議）</option>
+                                <option value="strict">嚴格</option>
+                                <option value="off">關閉</option>
+                            </select>
+                            <span class="settings-tip">
+                                「提醒」會顯示證據不足或引用不一致，但仍保留回答；「嚴格」會阻止 Agent 把未通過驗證的內容宣告為完成；「關閉」只停用額外的回答事實核對，固定安全政策與工具結果驗證仍然有效。
+                            </span>
                         </div>
                     </div>
 
@@ -1353,18 +1417,19 @@
                         </div>
                         <div class="settings-group" style="display:flex; gap:20px; margin-top:16px;">
                             <div style="flex:1;">
-                                <label class="settings-label" for="setting-agent-max-tool-calls">單次最多工具次數</label>
+                                <label class="settings-label" for="setting-agent-max-tool-calls">每個規劃步驟最多工具次數</label>
                                 <input type="number" id="setting-agent-max-tool-calls" class="settings-input" min="1" max="20" value="8">
+                                <span class="settings-tip">多步驟任務分別計算；整輪仍受時間、成本與安全上限保護。</span>
                             </div>
                             <div style="flex:1;">
-                                <label class="settings-label" for="setting-agent-max-repair-rounds">最多自動修正輪數</label>
-                                <input type="number" id="setting-agent-max-repair-rounds" class="settings-input" min="0" max="3" value="3">
+                                <label class="settings-label" for="setting-agent-max-repair-rounds">每步驟最多自動修正輪數</label>
+                                <input type="number" id="setting-agent-max-repair-rounds" class="settings-input" min="0" max="3" value="2">
                             </div>
                         </div>
                         <div class="settings-group toggle-group" style="display:flex; justify-content:space-between; align-items:center; margin-top:16px;">
                             <div>
-                                <label class="settings-label">完成前自動驗證</label>
-                                <span class="settings-tip">正式回覆前檢查回答、工具結果與專案來源；失敗時依上限自動修正。</span>
+                                <label class="settings-label">驗證失敗時自動修正</label>
+                                <span class="settings-tip">必要的 Host 結果驗證無法關閉；這個開關只控制驗證失敗後，是否在同一步驟內依上限自動修正。</span>
                             </div>
                             <div class="switch">
                                 <input type="checkbox" id="setting-agent-auto-validate" checked>
@@ -2014,6 +2079,42 @@
         </div>
     </div>
 
+    <dialog id="model-data-consent-dialog" class="model-data-consent-dialog"
+        aria-labelledby="model-data-consent-title" aria-describedby="model-data-consent-description">
+        <form method="dialog" class="model-data-consent-card">
+            <header class="model-data-consent-head">
+                <span class="model-data-consent-icon" aria-hidden="true"><i data-lucide="cloud-upload"></i></span>
+                <div>
+                    <span class="model-data-consent-eyebrow">資料上雲權限</span>
+                    <h2 id="model-data-consent-title">是否允許傳送圖片或文件？</h2>
+                </div>
+            </header>
+            <p id="model-data-consent-description" class="model-data-consent-description">
+                Agent 尚未傳送資料。請先確認接收端、資料範圍、風險與可能後果。
+            </p>
+            <dl class="model-data-consent-facts">
+                <div><dt>接收供應商</dt><dd id="model-data-consent-provider">—</dd></div>
+                <div><dt>使用模型</dt><dd id="model-data-consent-model">—</dd></div>
+                <div><dt>資料類型</dt><dd id="model-data-consent-data-type">圖片或文件內容</dd></div>
+                <div><dt>批准效力</dt><dd>10 分鐘內有效，且本次批准只能使用一次</dd></div>
+            </dl>
+            <section class="model-data-consent-warning" aria-labelledby="model-data-consent-risk-title">
+                <h3 id="model-data-consent-risk-title"><i data-lucide="triangle-alert"></i>主要風險</h3>
+                <p id="model-data-consent-risk"></p>
+                <h3>可能後果</h3>
+                <ul id="model-data-consent-consequences"></ul>
+            </section>
+            <p class="model-data-consent-note">
+                「僅本次」不會修改專案政策；「記住此專案」會允許日後在既定政策內自動傳送同類資料，你仍可隨時到「雲端 LLM → 預算與選模」撤銷。獨立對話只能選擇「僅本次」。
+            </p>
+            <footer class="model-data-consent-actions">
+                <button type="button" class="btn btn-secondary" id="model-data-consent-cancel">取消</button>
+                <button type="button" class="btn btn-secondary" id="model-data-consent-once">僅本次傳送</button>
+                <button type="button" class="btn btn-primary" id="model-data-consent-remember">記住此專案</button>
+            </footer>
+        </form>
+    </dialog>
+
     <main class="cloud-llm-workspace" id="cloud-llm-workspace"
         aria-labelledby="cloud-llm-title" hidden>
         <div class="management-workspace-shell cloud-llm-workspace-shell">
@@ -2157,6 +2258,6 @@
     <script src="n8n-agent-governance.js?v=0.9.1-personal-scope"></script>
     <script src="hermes-settings.js?v=1.1.3-tooltip-layer"></script>
     <script src="mlops-workspace.js?v=1.0.1"></script>
-    <script src="app.js?v=0.9.0-model-catalog-beta.5"></script>
+    <script src="app.js?v=0.9.0-model-catalog-beta.7"></script>
 </body>
 </html>

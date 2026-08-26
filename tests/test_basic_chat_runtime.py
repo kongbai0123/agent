@@ -17,6 +17,7 @@ sys.path.insert(0, str(BACKEND))
 from chat import runtime as chat_runtime
 from basic_chat_services import DisabledRAGEngine, build_rag_service
 from chat_cancellation import ChatRunControl
+from factual_verifier import EvidenceBundle, EvidenceRecord
 from host_tools import HostToolRuntime
 from tool_runtime import (
     ToolAccess,
@@ -94,6 +95,7 @@ class FakeDatabase:
         self.runs.append({
             "run_id": args[0],
             "status": args[5],
+            "tasks": kwargs.get("tasks"),
             "metrics": kwargs.get("metrics") or {},
             "events": kwargs.get("events"),
             "sources": kwargs.get("sources"),
@@ -150,6 +152,43 @@ def parse_sse(items):
 
 async def collect_stream(**kwargs):
     return [item async for item in chat_runtime.stream_basic_chat(**kwargs)]
+
+
+def project_knowledge_fixture(content="法國的首都是巴黎。"):
+    context = (
+        "[evidence:knowledge:chunk-one]\n"
+        f"[知識來源 1：專案指南]\n{content}"
+    )
+    sources = [
+        {
+            "kind": "project_knowledge",
+            "project_id": "project-one",
+            "source": "專案指南",
+            "document_id": "document-one",
+            "chunk_id": "chunk-one",
+            "snippet_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+            "citation": {
+                "project_id": "project-one",
+                "source_id": "guide.md",
+                "title": "專案指南",
+                "document_id": "document-one",
+                "chunk_id": "chunk-one",
+                "chunk_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+            },
+        }
+    ]
+    evidence = EvidenceBundle(
+        (
+            EvidenceRecord(
+                "knowledge:chunk-one",
+                content,
+                project_id="project-one",
+                citation=sources[0]["citation"],
+            ),
+        ),
+        project_id="project-one",
+    )
+    return context, sources, evidence
 
 
 def test_basic_prompt_uses_only_complete_history_and_one_current_user():
@@ -302,6 +341,239 @@ def test_basic_stream_has_no_agent_events_or_tool_payload(monkeypatch):
     assert all("artifacts" not in item["provided"] for item in fake_db.runs)
     assert fake_db.runs[0]["sources"] == assistant["sources"]
     assert fake_db.runs[-1]["sources"] == assistant["sources"]
+
+
+def run_project_knowledge_answer(
+    monkeypatch,
+    *,
+    answer,
+    mode=None,
+    include_evidence_bundle=True,
+    host_tool_runtime=None,
+):
+    fake_db = FakeDatabase()
+    monkeypatch.setattr(chat_runtime, "database", fake_db)
+    context, sources, evidence = project_knowledge_fixture()
+    response = FakeResponse(
+        [
+            encoded_chunk(answer),
+            encoded_chunk(done=True, prompt_eval_count=8, eval_count=4),
+        ]
+    )
+    captured = {}
+
+    def fake_post_chat(settings, payload, **kwargs):
+        captured["payload"] = payload
+        return response
+
+    settings = {
+        "ollama_url": "http://127.0.0.1:11434",
+        "model_provider": "ollama",
+    }
+    if mode is not None:
+        settings["answer_verification_mode"] = mode
+    control = ChatRunControl(
+        f"run_knowledge_{mode or 'default'}",
+        "sess_basic",
+        "turn_current",
+        "model-a",
+        "chat",
+    )
+    control.start_deadline(60)
+    items = asyncio.run(
+        collect_stream(
+            request=SimpleNamespace(messages=[]),
+            settings=settings,
+            model="model-a",
+            session_id="sess_basic",
+            turn_id="turn_current",
+            run_id=f"run_knowledge_{mode or 'default'}",
+            prompt_sha256="digest",
+            user_message_id=3,
+            user_query="法國首都是哪裡？",
+            temporary_context="",
+            images=[],
+            run_control=control,
+            project_id="project-one",
+            knowledge_context=context,
+            knowledge_sources=sources,
+            evidence_bundle=evidence if include_evidence_bundle else None,
+            post_chat=fake_post_chat,
+            host_tool_runtime=host_tool_runtime,
+        )
+    )
+    return fake_db, captured.get("payload"), parse_sse(items)
+
+
+def test_project_knowledge_answer_warns_before_first_visible_token_by_default(
+    monkeypatch,
+):
+    answer = "法國的首都是里昂。[evidence:knowledge:chunk-one]"
+    fake_db, payload, events = run_project_knowledge_answer(
+        monkeypatch, answer=answer
+    )
+
+    names = [name for name, _payload in events]
+    assert names == [
+        "meta",
+        "sources",
+        "validation",
+        "token",
+        "token",
+        "metrics",
+        "done",
+    ]
+    validation = next(payload for name, payload in events if name == "validation")
+    assert validation["kind"] == "answer_factual_verification"
+    assert validation["mode"] == "warn"
+    assert validation["passed"] is False
+    assert validation["status"] == "failed"
+    assert validation["name"] == "answer_factuality"
+    assert validation["validation_id"].endswith(":answer_factuality")
+    assert validation["failed"] == 1
+    assert validation["skipped"] == 0
+    assert validation["duration_ms"] >= 0
+    assert validation["summary"] == "回答的事實驗證未通過。"
+    assert set(validation["claim_counts"]) == {"unsupported"}
+    serialized = json.dumps(validation, ensure_ascii=False)
+    assert "里昂" not in serialized
+    assert "法國的首都是巴黎" not in serialized
+    visible = "".join(payload["content"] for name, payload in events if name == "token")
+    assert visible.startswith(chat_runtime.ANSWER_VERIFICATION_WARNING)
+    assert visible.endswith(answer)
+    assert fake_db.messages[-1]["content"] == visible
+    assert "事實引用規則" in payload["messages"][0]["content"]
+    persisted_validation = [
+        event_payload
+        for _run_id, event, event_payload in fake_db.public_events
+        if event == "validation"
+    ]
+    assert persisted_validation == [validation]
+
+
+def test_project_knowledge_answer_strict_mode_blocks_output_and_persistence(
+    monkeypatch,
+):
+    answer = "法國的首都是里昂。[evidence:knowledge:chunk-one]"
+    fake_db, _payload, events = run_project_knowledge_answer(
+        monkeypatch, answer=answer, mode="strict"
+    )
+
+    assert [name for name, _payload in events] == [
+        "meta",
+        "sources",
+        "validation",
+        "error",
+    ]
+    assert not any(name == "token" for name, _payload in events)
+    error = events[-1][1]
+    assert error["code"] == "ANSWER_FACT_VERIFICATION_FAILED"
+    assert "未顯示或保存" in error["message"]
+    assert [item["role"] for item in fake_db.messages].count("assistant") == 1
+    assert fake_db.messages[-1]["content"] == "current question"
+    assert fake_db.runs[-1]["status"] == "failed"
+    assert answer not in json.dumps(fake_db.public_events, ensure_ascii=False)
+
+
+def test_verified_project_knowledge_answer_is_emitted_without_warning(monkeypatch):
+    answer = "法國的首都是巴黎。[evidence:knowledge:chunk-one]"
+    fake_db, _payload, events = run_project_knowledge_answer(
+        monkeypatch, answer=answer, mode="strict"
+    )
+
+    assert [name for name, _payload in events] == [
+        "meta",
+        "sources",
+        "validation",
+        "token",
+        "metrics",
+        "done",
+    ]
+    validation = next(payload for name, payload in events if name == "validation")
+    assert validation["passed"] is True
+    assert validation["status"] == "passed"
+    assert validation["verification_status"] == "verified"
+    visible = "".join(payload["content"] for name, payload in events if name == "token")
+    assert visible == answer
+    assert chat_runtime.ANSWER_VERIFICATION_WARNING not in visible
+    assert fake_db.messages[-1]["content"] == answer
+
+
+def test_project_knowledge_answer_verification_can_be_explicitly_disabled(
+    monkeypatch,
+):
+    answer = "未引用專案知識的回答。"
+    fake_db, payload, events = run_project_knowledge_answer(
+        monkeypatch, answer=answer, mode="off"
+    )
+
+    assert [name for name, _payload in events] == [
+        "meta",
+        "sources",
+        "token",
+        "metrics",
+        "done",
+    ]
+    assert "事實引用規則" not in payload["messages"][0]["content"]
+    assert fake_db.messages[-1]["content"] == answer
+
+
+def test_knowledge_metadata_without_typed_evidence_does_not_enable_gate(
+    monkeypatch,
+):
+    answer = "舊呼叫端的一般回答。"
+    fake_db, payload, events = run_project_knowledge_answer(
+        monkeypatch,
+        answer=answer,
+        mode="strict",
+        include_evidence_bundle=False,
+    )
+
+    assert [name for name, _payload in events] == [
+        "meta",
+        "sources",
+        "token",
+        "metrics",
+        "done",
+    ]
+    assert "事實引用規則" not in payload["messages"][0]["content"]
+    assert fake_db.messages[-1]["content"] == answer
+
+
+def test_project_knowledge_tool_loop_buffers_its_final_answer_for_gate(monkeypatch):
+    observed = {}
+
+    async def fake_tool_loop(**kwargs):
+        observed["emit_tokens"] = kwargs["emit_tokens"]
+        observed["payload"] = kwargs["payload"]
+        kwargs["state"].answer_parts = [
+            "法國的首都是巴黎。[evidence:knowledge:chunk-one]"
+        ]
+        kwargs["state"].metrics = {"done_reason": "stop"}
+        if False:  # pragma: no cover - keeps this an async generator
+            yield ""
+
+    monkeypatch.setattr(chat_runtime, "_stream_model_tool_loop", fake_tool_loop)
+    fake_db, _payload, events = run_project_knowledge_answer(
+        monkeypatch,
+        answer="unused provider response",
+        mode="strict",
+        host_tool_runtime=object(),
+    )
+
+    assert observed["emit_tokens"] is False
+    assert "事實引用規則" in observed["payload"]["messages"][0]["content"]
+    names = [name for name, _payload in events]
+    assert names == [
+        "meta",
+        "sources",
+        "validation",
+        "token",
+        "metrics",
+        "done",
+    ]
+    assert names.index("validation") < names.index("token")
+    assert fake_db.messages[-1]["content"].startswith("法國的首都是巴黎")
 
 
 def test_basic_stream_runs_project_scoped_read_tool_before_final_answer(monkeypatch):
@@ -798,6 +1070,633 @@ def test_basic_stream_never_retries_an_indeterminate_external_write(monkeypatch)
     assert fake_db.runs[-1]["metrics"]["model_eval"]["execution_unknown"] is True
 
 
+def _planned_read_runtime(definitions):
+    registry = ToolRegistry(definitions)
+    dispatcher = ToolDispatcher(
+        registry,
+        scope_resolver=lambda definition, _call: ToolScopeState(
+            installed=True,
+            trusted=True,
+            enabled=True,
+            healthy=True,
+            resource_allowed=True,
+            manifest_sha256=definition.manifest_sha256,
+        ),
+    )
+
+    class ReadOnlyApprovals:
+        def event_queue(self, _run_id):
+            return asyncio.Queue()
+
+        async def approval_callback(self, _request):
+            raise AssertionError("read tools must not request approval")
+
+        def mark_consumed(self, _approval_id):
+            return None
+
+        def close_run(self, _run_id):
+            return None
+
+    return HostToolRuntime(
+        registry=registry,
+        dispatcher=dispatcher,
+        approval_broker=ReadOnlyApprovals(),
+    )
+
+
+def _native_tool_response(call_id, name, arguments):
+    return FakeResponse([
+        json.dumps({
+            "message": {
+                "content": "",
+                "tool_calls": [{
+                    "id": call_id,
+                    "function": {"name": name, "arguments": arguments},
+                }],
+            },
+            "done": True,
+            "done_reason": "tool_calls",
+        }).encode("utf-8")
+    ])
+
+
+def test_explicit_multistep_chat_runs_host_plan_and_emits_plan_events(monkeypatch):
+    fake_db = FakeDatabase()
+    monkeypatch.setattr(chat_runtime, "database", fake_db)
+    digest = hashlib.sha256(b"planned-tools").hexdigest()
+    executions = []
+
+    def definition(name, description):
+        return ToolDefinition(
+            name=name,
+            description=description,
+            input_schema={
+                "type": "object",
+                "properties": {"value": {"type": "string"}},
+                "required": ["value"],
+                "additionalProperties": False,
+            },
+            access=ToolAccess.READ,
+            handler=lambda call: executions.append((call.tool_name, call.arguments["value"])) or {"ok": True},
+            extension_id="test.planner",
+            manifest_sha256=digest,
+        )
+
+    definitions = (
+        definition("web.search", "Search records"),
+        definition("data.compare", "Compare results"),
+        definition("docs.write", "Write summary"),
+    )
+    runtime = _planned_read_runtime(definitions)
+    responses = iter([
+        _native_tool_response("search-1", "web.search", {"value": "market"}),
+        FakeResponse([encoded_chunk("Search evidence ready."), encoded_chunk(done=True)]),
+        _native_tool_response("compare-1", "data.compare", {"value": "candidates"}),
+        FakeResponse([encoded_chunk("Comparison ready."), encoded_chunk(done=True)]),
+        _native_tool_response("write-1", "docs.write", {"value": "report"}),
+        FakeResponse([encoded_chunk("Draft ready."), encoded_chunk(done=True)]),
+        FakeResponse([encoded_chunk("Final verified report."), encoded_chunk(done=True)]),
+    ])
+    payloads = []
+
+    def fake_post_chat(_settings, payload, **_kwargs):
+        payloads.append(payload)
+        return next(responses)
+
+    control = ChatRunControl("run_plan", "sess_basic", "turn_current", "model-a", "chat")
+    control.start_deadline(60)
+    events = parse_sse(asyncio.run(collect_stream(
+        request=SimpleNamespace(messages=[]),
+        settings={
+            "ollama_url": "http://127.0.0.1:11434",
+            "model_provider": "ollama",
+            "agent_max_tool_calls": 2,
+            "agent_max_repair_rounds": 1,
+            "agent_auto_validate": True,
+        },
+        model="model-a",
+        session_id="sess_basic",
+        turn_id="turn_current",
+        run_id="run_plan",
+        prompt_sha256="digest",
+        user_message_id=3,
+        user_query="First search records; second compare results; finally write summary",
+        temporary_context="",
+        images=[],
+        run_control=control,
+        project_id="project-one",
+        post_chat=fake_post_chat,
+        host_tool_runtime=runtime,
+    )))
+
+    names = [name for name, _payload in events]
+    assert names[0:3] == ["meta", "plan", "task_update"]
+    plan_event = next(payload for name, payload in events if name == "plan")
+    assert [task["kind"] for task in plan_event["tasks"]] == [
+        "tool", "tool", "tool", "verify", "synthesize",
+    ]
+    assert [task["tool_budget"] for task in plan_event["tasks"][:3]] == [2, 2, 2]
+    assert 1 <= plan_event["limits"]["wall_seconds"] <= 60
+    assert executions == [
+        ("web.search", "market"),
+        ("data.compare", "candidates"),
+        ("docs.write", "report"),
+    ]
+    assert [payload["tools"][0]["function"]["name"] for payload in payloads[::2][:-1]] == [
+        "web.search", "data.compare", "docs.write",
+    ]
+    assert sum(name == "validation" for name, _payload in events) == 5
+    assert [payload["content"] for name, payload in events if name == "token"] == [
+        "Final verified report."
+    ]
+    assert fake_db.runs[-1]["metrics"]["model_eval"]["host_plan"] is True
+    assert fake_db.runs[-1]["metrics"]["model_eval"]["plan_status"] == "succeeded"
+    assert [task["status"] for task in fake_db.runs[-1]["tasks"]] == [
+        "completed",
+        "completed",
+        "completed",
+        "completed",
+        "completed",
+    ]
+    assert [task["label"] for task in fake_db.runs[-1]["tasks"]] == [
+        "執行需求 1",
+        "執行需求 2",
+        "執行需求 3",
+        "驗證執行結果",
+        "整理最終回覆",
+    ]
+    assert all(set(task) == {"id", "label", "status"} for task in fake_db.runs[-1]["tasks"])
+
+
+def test_planned_step_budget_uses_setting_and_blocks_second_execution(monkeypatch):
+    fake_db = FakeDatabase()
+    monkeypatch.setattr(chat_runtime, "database", fake_db)
+    digest = hashlib.sha256(b"planned-budget").hexdigest()
+    executions = []
+    definition = ToolDefinition(
+        name="web.search",
+        description="Search records",
+        input_schema={
+            "type": "object",
+            "properties": {"value": {"type": "string"}},
+            "required": ["value"],
+            "additionalProperties": False,
+        },
+        access=ToolAccess.READ,
+        handler=lambda call: executions.append(call.arguments["value"]) or {"ok": True},
+        extension_id="test.planner",
+        manifest_sha256=digest,
+    )
+    runtime = _planned_read_runtime((definition,))
+    first = FakeResponse([
+        json.dumps({
+            "message": {
+                "content": "",
+                "tool_calls": [
+                    {"id": "one", "function": {"name": "web.search", "arguments": {"value": "one"}}},
+                    {"id": "two", "function": {"name": "web.search", "arguments": {"value": "two"}}},
+                ],
+            },
+            "done": True,
+            "done_reason": "tool_calls",
+        }).encode("utf-8")
+    ])
+    responses = iter([
+        first,
+        FakeResponse([encoded_chunk("Step summary"), encoded_chunk(done=True)]),
+    ])
+
+    control = ChatRunControl("run_plan_budget", "sess_basic", "turn_current", "model-a", "chat")
+    control.start_deadline(60)
+    events = parse_sse(asyncio.run(collect_stream(
+        request=SimpleNamespace(messages=[]),
+        settings={
+            "ollama_url": "http://127.0.0.1:11434",
+            "model_provider": "ollama",
+            "agent_max_tool_calls": 1,
+            "agent_max_repair_rounds": 0,
+            "agent_auto_validate": False,
+        },
+        model="model-a",
+        session_id="sess_basic",
+        turn_id="turn_current",
+        run_id="run_plan_budget",
+        prompt_sha256="digest",
+        user_message_id=3,
+        user_query="First search records; second analyze result; finally summarize answer",
+        temporary_context="",
+        images=[],
+        run_control=control,
+        project_id="project-one",
+        post_chat=lambda *_args, **_kwargs: next(responses),
+        host_tool_runtime=runtime,
+    )))
+
+    assert executions == ["one"]
+    assert any(
+        name == "tool_end" and payload.get("result") == "TOOL_CALL_LIMIT_REACHED"
+        for name, payload in events
+    )
+    assert events[-1][0] == "error"
+    assert events[-1][1]["code"] == "TASK_STEP_VERIFICATION_FAILED"
+
+
+def test_planned_run_deadline_uses_dedicated_failure_and_stops(monkeypatch):
+    fake_db = FakeDatabase()
+    monkeypatch.setattr(chat_runtime, "database", fake_db)
+    calls = []
+    control = ChatRunControl(
+        "run_plan_deadline", "sess_basic", "turn_current", "model-a", "chat"
+    )
+    control.start_deadline(60)
+
+    def expire_during_first_round(*_args, **_kwargs):
+        calls.append(True)
+        control._deadline_at = 0.0
+        return FakeResponse([encoded_chunk("too late"), encoded_chunk(done=True)])
+
+    events = parse_sse(asyncio.run(collect_stream(
+        request=SimpleNamespace(messages=[]),
+        settings={"ollama_url": "http://127.0.0.1:11434", "model_provider": "ollama"},
+        model="model-a",
+        session_id="sess_basic",
+        turn_id="turn_current",
+        run_id="run_plan_deadline",
+        prompt_sha256="digest",
+        user_message_id=3,
+        user_query="First outline A; second assess B; finally combine C",
+        temporary_context="",
+        images=[],
+        run_control=control,
+        project_id="project-one",
+        post_chat=expire_during_first_round,
+        host_tool_runtime=None,
+    )))
+
+    assert calls == [True]
+    assert not any(name == "token" for name, _payload in events)
+    assert events[-1][0] == "error"
+    assert events[-1][1]["code"] == "TASK_PLAN_DEADLINE_EXCEEDED"
+    assert fake_db.runs[-1]["status"] == "failed"
+    assert fake_db.runs[-1]["tasks"][0]["status"] == "failed"
+    assert all(task["status"] != "in_progress" for task in fake_db.runs[-1]["tasks"])
+
+
+def test_planned_total_tool_cap_stops_a_stubborn_model(monkeypatch):
+    fake_db = FakeDatabase()
+    monkeypatch.setattr(chat_runtime, "database", fake_db)
+    monkeypatch.setattr(chat_runtime, "MAX_PLANNED_TOOL_CALLS", 2)
+    digest = hashlib.sha256(b"planned-total-cap").hexdigest()
+    executions = []
+    definition = ToolDefinition(
+        name="web.search",
+        description="Search records",
+        input_schema={
+            "type": "object",
+            "properties": {"value": {"type": "string"}},
+            "required": ["value"],
+            "additionalProperties": False,
+        },
+        access=ToolAccess.READ,
+        handler=lambda call: executions.append(call.arguments["value"]) or {"ok": True},
+        extension_id="test.planner",
+        manifest_sha256=digest,
+    )
+    responses = iter([
+        _native_tool_response("one", "web.search", {"value": "one"}),
+        _native_tool_response("two", "web.search", {"value": "two"}),
+        _native_tool_response("three", "web.search", {"value": "three"}),
+    ])
+    calls = []
+
+    def fake_post_chat(*_args, **_kwargs):
+        calls.append(True)
+        return next(responses)
+
+    control = ChatRunControl(
+        "run_plan_total_cap", "sess_basic", "turn_current", "model-a", "chat"
+    )
+    control.start_deadline(60)
+    events = parse_sse(asyncio.run(collect_stream(
+        request=SimpleNamespace(messages=[]),
+        settings={
+            "ollama_url": "http://127.0.0.1:11434",
+            "model_provider": "ollama",
+            "agent_max_tool_calls": 1,
+            "agent_max_repair_rounds": 3,
+            "agent_auto_validate": True,
+        },
+        model="model-a",
+        session_id="sess_basic",
+        turn_id="turn_current",
+        run_id="run_plan_total_cap",
+        prompt_sha256="digest",
+        user_message_id=3,
+        user_query="First search records; second analyze result; finally summarize answer",
+        temporary_context="",
+        images=[],
+        run_control=control,
+        project_id="project-one",
+        post_chat=fake_post_chat,
+        host_tool_runtime=_planned_read_runtime((definition,)),
+    )))
+
+    assert len(calls) == 3
+    assert executions == ["one"]
+    assert events[-1][0] == "error"
+    assert events[-1][1]["code"] == "TOOL_CALL_LIMIT_REACHED"
+    assert any(
+        name == "validation" and payload.get("status") == "failed"
+        for name, payload in events
+    )
+
+
+def test_planned_mixed_tool_batch_keeps_failure_after_later_success(monkeypatch):
+    fake_db = FakeDatabase()
+    monkeypatch.setattr(chat_runtime, "database", fake_db)
+    digest = hashlib.sha256(b"planned-mixed-batch").hexdigest()
+    executions = []
+
+    def failed_handler(call):
+        executions.append((call.tool_name, call.arguments["value"]))
+        raise RuntimeError("injected read failure")
+
+    def successful_handler(call):
+        executions.append((call.tool_name, call.arguments["value"]))
+        return {"ok": True}
+
+    definitions = (
+        ToolDefinition(
+            name="web.search",
+            description="Search records",
+            input_schema={
+                "type": "object",
+                "properties": {"value": {"type": "string"}},
+                "required": ["value"],
+                "additionalProperties": False,
+            },
+            access=ToolAccess.READ,
+            handler=failed_handler,
+            extension_id="test.planner",
+            manifest_sha256=digest,
+        ),
+        ToolDefinition(
+            name="web.lookup",
+            description="Lookup search records",
+            input_schema={
+                "type": "object",
+                "properties": {"value": {"type": "string"}},
+                "required": ["value"],
+                "additionalProperties": False,
+            },
+            access=ToolAccess.READ,
+            handler=successful_handler,
+            extension_id="test.planner",
+            manifest_sha256=digest,
+        ),
+    )
+    first = FakeResponse([
+        json.dumps({
+            "message": {
+                "content": "",
+                "tool_calls": [
+                    {"id": "failed", "function": {"name": "web.search", "arguments": {"value": "a"}}},
+                    {"id": "passed", "function": {"name": "web.lookup", "arguments": {"value": "b"}}},
+                ],
+            },
+            "done": True,
+            "done_reason": "tool_calls",
+        }).encode("utf-8")
+    ])
+    responses = iter([
+        first,
+        FakeResponse([encoded_chunk("Mixed results summary"), encoded_chunk(done=True)]),
+    ])
+    control = ChatRunControl(
+        "run_plan_mixed", "sess_basic", "turn_current", "model-a", "chat"
+    )
+    control.start_deadline(60)
+    events = parse_sse(asyncio.run(collect_stream(
+        request=SimpleNamespace(messages=[]),
+        settings={
+            "ollama_url": "http://127.0.0.1:11434",
+            "model_provider": "ollama",
+            "agent_max_tool_calls": 2,
+            "agent_max_repair_rounds": 0,
+            "agent_auto_validate": False,
+        },
+        model="model-a",
+        session_id="sess_basic",
+        turn_id="turn_current",
+        run_id="run_plan_mixed",
+        prompt_sha256="digest",
+        user_message_id=3,
+        user_query="First search and lookup records; second analyze result; finally summarize answer",
+        temporary_context="",
+        images=[],
+        run_control=control,
+        project_id="project-one",
+        post_chat=lambda *_args, **_kwargs: next(responses),
+        host_tool_runtime=_planned_read_runtime(definitions),
+    )))
+
+    assert executions == [("web.search", "a"), ("web.lookup", "b")]
+    assert events[-1][0] == "error"
+    assert events[-1][1]["code"] == "TASK_STEP_VERIFICATION_FAILED"
+
+
+def test_planned_auto_validation_uses_configured_repair_round(monkeypatch):
+    fake_db = FakeDatabase()
+    monkeypatch.setattr(chat_runtime, "database", fake_db)
+    digest = hashlib.sha256(b"planned-repair").hexdigest()
+    unrelated = ToolDefinition(
+        name="web.search",
+        description="Search remote pages",
+        input_schema={"type": "object", "properties": {}, "additionalProperties": False},
+        access=ToolAccess.READ,
+        handler=lambda _call: {"ok": True},
+        extension_id="test.planner",
+        manifest_sha256=digest,
+    )
+    runtime = _planned_read_runtime((unrelated,))
+    responses = iter([
+        FakeResponse([encoded_chunk(done=True)]),
+        FakeResponse([encoded_chunk("Outline ready."), encoded_chunk(done=True)]),
+        FakeResponse([encoded_chunk("Tradeoffs assessed."), encoded_chunk(done=True)]),
+        FakeResponse([encoded_chunk("Recommendation ready."), encoded_chunk(done=True)]),
+        FakeResponse([encoded_chunk("Final recommendation."), encoded_chunk(done=True)]),
+    ])
+    calls = []
+
+    def fake_post_chat(*_args, **_kwargs):
+        calls.append(True)
+        return next(responses)
+
+    control = ChatRunControl("run_plan_repair", "sess_basic", "turn_current", "model-a", "chat")
+    control.start_deadline(60)
+    events = parse_sse(asyncio.run(collect_stream(
+        request=SimpleNamespace(messages=[]),
+        settings={
+            "ollama_url": "http://127.0.0.1:11434",
+            "model_provider": "ollama",
+            "agent_max_repair_rounds": 1,
+            "agent_auto_validate": True,
+        },
+        model="model-a",
+        session_id="sess_basic",
+        turn_id="turn_current",
+        run_id="run_plan_repair",
+        prompt_sha256="digest",
+        user_message_id=3,
+        user_query="First outline topic; second assess tradeoffs; finally present recommendation",
+        temporary_context="",
+        images=[],
+        run_control=control,
+        project_id="project-one",
+        post_chat=fake_post_chat,
+        host_tool_runtime=runtime,
+    )))
+
+    assert len(calls) == 5
+    assert [(name, payload.get("round")) for name, payload in events if name == "repair"] == [
+        ("repair", 1)
+    ]
+    assert any(
+        name == "validation" and payload["status"] == "retrying"
+        for name, payload in events
+    )
+    assert [payload["content"] for name, payload in events if name == "token"] == [
+        "Final recommendation."
+    ]
+
+
+def test_explicit_reasoning_plan_still_runs_when_scope_has_no_tools(monkeypatch):
+    fake_db = FakeDatabase()
+    monkeypatch.setattr(chat_runtime, "database", fake_db)
+    responses = iter([
+        FakeResponse([encoded_chunk("A ready."), encoded_chunk(done=True)]),
+        FakeResponse([encoded_chunk("B ready."), encoded_chunk(done=True)]),
+        FakeResponse([encoded_chunk("C ready."), encoded_chunk(done=True)]),
+        FakeResponse([encoded_chunk("Combined answer."), encoded_chunk(done=True)]),
+    ])
+    control = ChatRunControl("run_reason_plan", "sess_basic", "turn_current", "model-a", "chat")
+    control.start_deadline(60)
+    events = parse_sse(asyncio.run(collect_stream(
+        request=SimpleNamespace(messages=[]),
+        settings={"ollama_url": "http://127.0.0.1:11434", "model_provider": "ollama"},
+        model="model-a",
+        session_id="sess_basic",
+        turn_id="turn_current",
+        run_id="run_reason_plan",
+        prompt_sha256="digest",
+        user_message_id=3,
+        user_query="First outline A; second assess B; finally combine C",
+        temporary_context="",
+        images=[],
+        run_control=control,
+        project_id="project-one",
+        post_chat=lambda *_args, **_kwargs: next(responses),
+        host_tool_runtime=None,
+    )))
+
+    plan_event = next(payload for name, payload in events if name == "plan")
+    assert all(task["kind"] != "tool" for task in plan_event["tasks"])
+    assert [payload["content"] for name, payload in events if name == "token"] == [
+        "Combined answer."
+    ]
+
+
+def test_planned_execution_unknown_stops_without_a_final_model_retry(monkeypatch):
+    fake_db = FakeDatabase()
+    monkeypatch.setattr(chat_runtime, "database", fake_db)
+    digest = hashlib.sha256(b"planned-unknown").hexdigest()
+    executions = []
+
+    def uncertain(call):
+        executions.append(call.arguments["value"])
+        raise TimeoutError("ended after dispatch")
+
+    definition = ToolDefinition(
+        name="docs.write",
+        description="Write summary",
+        input_schema={
+            "type": "object",
+            "properties": {"value": {"type": "string"}},
+            "required": ["value"],
+            "additionalProperties": False,
+        },
+        access=ToolAccess.WRITE,
+        handler=uncertain,
+        extension_id="test.planner",
+        manifest_sha256=digest,
+        risk_level="external_write",
+    )
+
+    class AutoApproveRuntime:
+        def event_queue(self, _run_id):
+            return asyncio.Queue()
+
+        async def approval_callback(self, _request):
+            return True
+
+        def mark_consumed(self, _approval_id):
+            return None
+
+        def close_run(self, _run_id):
+            return None
+
+    registry = ToolRegistry((definition,))
+    runtime = HostToolRuntime(
+        registry=registry,
+        dispatcher=ToolDispatcher(
+            registry,
+            scope_resolver=lambda item, _call: ToolScopeState(
+                installed=True, trusted=True, enabled=True, healthy=True,
+                resource_allowed=True, manifest_sha256=item.manifest_sha256,
+            ),
+        ),
+        approval_broker=AutoApproveRuntime(),
+    )
+    responses = [
+        _native_tool_response("write-unknown", "docs.write", {"value": "report"})
+    ]
+    calls = []
+
+    def fake_post_chat(*_args, **_kwargs):
+        calls.append(True)
+        return responses.pop(0)
+
+    control = ChatRunControl("run_plan_unknown", "sess_basic", "turn_current", "model-a", "chat")
+    control.start_deadline(60)
+    events = parse_sse(asyncio.run(collect_stream(
+        request=SimpleNamespace(messages=[]),
+        settings={"ollama_url": "http://127.0.0.1:11434", "model_provider": "ollama"},
+        model="model-a",
+        session_id="sess_basic",
+        turn_id="turn_current",
+        run_id="run_plan_unknown",
+        prompt_sha256="digest",
+        user_message_id=3,
+        user_query="First write summary; second verify result; finally report status",
+        temporary_context="",
+        images=[],
+        run_control=control,
+        project_id="project-one",
+        post_chat=fake_post_chat,
+        host_tool_runtime=runtime,
+    )))
+
+    assert executions == ["report"]
+    assert len(calls) == 1
+    assert not any(name == "token" for name, _payload in events)
+    assert any(
+        name == "validation" and payload["status"] == "unknown"
+        for name, payload in events
+    )
+    assert events[-1][0] == "error"
+    assert events[-1][1]["code"] == "EXECUTION_UNKNOWN"
+
+
 def test_basic_terminal_event_failure_does_not_reverse_durable_completion(
     monkeypatch,
 ):
@@ -1111,16 +2010,17 @@ def test_frontend_forces_basic_chat_and_hides_collaboration_panel():
     basic_mode = (ROOT / "frontend" / "basic-chat-mode.js").read_text(encoding="utf-8")
     index = (ROOT / "frontend" / "index.html").read_text(encoding="utf-8")
     assert "const BASIC_CHAT_MODE = true;" in basic_mode
-    assert "use_rag: BASIC_CHAT_MODE ? false : ragToggle.checked" in source
+    assert "use_rag: !!activeProjectId && ragToggle.checked" in source
     assert "!BASIC_CHAT_MODE && question.startsWith('/skill')" in source
     assert "skill_ids: explicitSkillIds" in source  # accepted for compatibility; backend ignores it
     assert "railAgents.hidden = true;" in basic_mode
-    assert "'rail-knowledge', 'rail-runs', 'rail-artifacts'" in basic_mode
+    assert "'rail-runs', 'rail-artifacts'" in basic_mode
+    assert "'rail-knowledge'" not in basic_mode
     assert "'rail-extensions'" not in basic_mode
     assert "'[data-target=\"tab-settings-agent\"]'" in basic_mode
     assert "basicPaletteActions" in source
     assert "configureBasicWizard" in source
-    assert "useBasicKnowledgeStatus" in source
+    assert "loadKnowledgeRetrievalPreference" in source
     assert "configureBasicWelcomeDashboard" in source
     assert "基本聊天模式：未使用 RAG、工具或多 Agent。" not in source
     assert "tts-btn-trigger" not in source

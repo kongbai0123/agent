@@ -29,12 +29,10 @@ function renderBasicSubagentStatus(plan) {
 function applyBasicChatSettingsUi() {
     settingAgentDetailedProgress.checked = false;
     settingSkillsEnabled.checked = false;
-    settingAgentAutoValidate.checked = false;
     settingAgentAllowWorkspaceWrite.checked = false;
     settingSubagentEnabled.checked = false;
     [
-        settingAgentDetailedProgress, settingSkillsEnabled, settingAgentMaxToolCalls,
-        settingAgentMaxRepairRounds, settingAgentAutoValidate,
+        settingAgentDetailedProgress, settingSkillsEnabled,
         settingAgentAllowWorkspaceWrite, settingAgentFinalReportDetail,
         settingSubagentEnabled,
         settingSubagentPlannerModel, settingSubagentExplorerModel,
@@ -42,47 +40,41 @@ function applyBasicChatSettingsUi() {
         settingSubagentCloudRouting, settingSubagentMaxParallel,
         ...Object.values(agentDisplayNameInputs)
     ].filter(Boolean).forEach(control => { control.disabled = true; });
+    document.querySelector('.subagent-settings-card')?.setAttribute('hidden', '');
     renderBasicSubagentStatus(subagentResourcePlan);
 }
 
 function renderBasicChatModeChip(chip, text) {
-    text.textContent = '基本聊天';
-    chip.classList.add('chip-ok');
-    chip.classList.remove('chip-warn');
+    const hasProject = !!activeProjectId;
+    const enabled = hasProject && !!ragToggle?.checked;
+    text.textContent = hasProject ? `專案知識：${enabled ? '開' : '關'}` : '專案知識：未選專案';
+    chip.classList.toggle('chip-ok', enabled);
+    chip.classList.toggle('chip-warn', !enabled);
 }
 
 function configureBasicChatComposerUi() {
-    ragToggle.checked = false;
-    userInput.placeholder = '輸入訊息，與 AI 助手聊天…';
+    loadKnowledgeRetrievalPreference(activeProjectId);
+    userInput.placeholder = '輸入訊息；需要時會使用目前專案的知識與工具…';
     [
-        'rail-knowledge', 'rail-runs', 'rail-artifacts',
+        'rail-runs', 'rail-artifacts',
         'chip-docs', 'skills-button', 'active-skills-bar',
         'task-progress-center', 'wz-kb'
     ].forEach(id => {
         const element = document.getElementById(id);
         if (element) element.hidden = true;
     });
-    document.getElementById('manage-kb-btn')?.closest('.sidebar-footer')?.setAttribute('hidden', '');
     document.querySelectorAll([
-        '[data-target="tab-settings-rag"]', '[data-target="tab-settings-agent"]',
-        '[data-target="tab-settings-integrations"]', '[data-target="tab-settings-runtime"]',
+        '[data-target="tab-settings-agent"]', '[data-target="tab-settings-integrations"]', '[data-target="tab-settings-runtime"]',
         '[data-itab="run"]', '[data-itab="artifact"]', '[data-itab="logs"]'
     ].join(', '))
         .forEach(element => { element.hidden = true; });
     document.querySelector('#inspector-pane-context .ip-section')?.setAttribute('hidden', '');
     const chip = document.getElementById('chip-rag');
-    if (chip) {
-        chip.classList.remove('chip-clickable');
-        chip.title = '基本聊天模式';
-        chip.setAttribute('aria-label', '基本聊天模式');
-        chip.style.pointerEvents = 'none';
-    }
+    if (chip) chip.style.pointerEvents = '';
 }
 
 function useBasicKnowledgeStatus() {
-    kbStatus = { enabled: false, index_status: 'disabled', document_count: 0, chunk_count: 0 };
-    renderKbStatusLine();
-    updateDocsChip();
+    return kbStatus;
 }
 
 function configureBasicWelcomeDashboard(hasModel, primary, secondary) {
@@ -104,6 +96,7 @@ function configureBasicWizard(hint, backendOk, ollamaOk, hasModel) {
 
 function basicPaletteActions(actions) {
     const allowed = new Set([
+        '上傳文件（知識庫）', '開啟知識庫工作區', '執行檢索測試',
         '切換模型', '安裝模型', '管理雲端 LLM API', '開新任務（新對話）',
         '切換淺色 / 深色主題', '開啟設定中心', '執行模型測速'
     ]);

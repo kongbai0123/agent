@@ -39,8 +39,16 @@ Local AI Workbench 採本機優先架構：
 
 ### Knowledge
 
-- 文件與檢索資料依 Project 使用。
-- 對話可結合文件內容與暫時上下文，並在 UI 顯示相關來源與使用狀態。
+- 文件、切塊、向量與檢索結果均以 Project 隔離；未指定 Project 的對話不會讀取知識庫。
+- 匯入採內容 SHA-256 與穩定切塊；相同內容不重算，修改文件時可重用未變更片段的向量。
+- 預設使用不需下載模型的本機雜湊特徵嵌入，提供私密、可重現的詞彙檢索基線；它不理解一般語意，也不等同語意基礎模型。
+- Embedding 與 Reranker 透過有界 Adapter contract 接入。使用者可指定已存在的本機 Sentence Transformers／Cross-Encoder 模型絕對路徑；載入時禁止自動下載與遠端模型程式碼。也可選擇 `model_kind` 相符的受治理 Provider；每次呼叫仍會檢查 Extension gate、Project 資料同意、Provider 健康、預算與用量紀錄。
+- 第一次由 Basic Chat 或知識庫工作區把專案文件片段送往雲端 Embedding 時，Host 會先建立綁定 Project、Run、Provider 與精確語意模型的單次同意；批准前不會發出 Provider 請求。使用者可只批准本次，或記住該 Project 的 Provider／文件政策；專用語意模型的同意不會把主要聊天模型切換成 Embedding 模型。
+- 每個 Embedding Adapter 的模型、端點與 contract 都是索引身分的一部分。切換 Embedding 後，既有向量會標示需要重建且不會與新向量混用；匯入或查詢的 Embedding 失敗會安全停止，不會靜默退回另一套向量。Reranker 是可選的排序階段，預設在失敗或回傳無效分數時保留原 Embedding 排序，並標示降級原因。
+- Basic Chat 可在每輪送出前檢索目前 Project；Hermes 可用時會取得同一份有界知識快照。兩條路徑都把片段標為不可信參考資料。公開 Run、SSE 與匯出只保存引用位置與片段 digest，不複製片段原文；私有重試快照只保留經憑證遮罩且綁定完整性 digest 的有界內容。
+- 使用雲端對話模型時，專案知識視為文件資料；未取得一次性或專案政策同意前不會傳送。一次性同意綁定專案、Run、原模型、實際模型、供應商與政策 revision，有效 10 分鐘且只能消耗一次。
+- 知識庫工作區提供文件匯入、片段預覽、刪除、檢索測試與索引狀態；原始文件不會被這個索引服務另存為附件，但抽取後的文字片段會明文保存在本機知識索引 SQLite，目前未另外加密。
+- 刪除 Project 前會先清除其知識索引；若知識資料庫不可用，刪除會安全停止，不會回報成功後留下孤兒片段。
 - 使用者資料與模型檔不會提交到 repository。
 
 ### Project Skills
@@ -51,9 +59,20 @@ Local AI Workbench 採本機優先架構：
 
 ### Agent 執行與結果
 
-- 執行面板呈現任務、工具、核准、錯誤、產物、修改與驗證結果。
+- 明確列出或排序的多步驟要求會由 Host 建立確定性、有界的 typed DAG；一般問答仍沿用直接聊天路徑。
+- 工具預算以步驟為單位計算，另受整份計畫、Run 時間、成本及安全政策限制，不再以固定八次作為所有多步驟任務的唯一上限。
+- 每一步保存狀態、工具使用量與 typed 結構驗證（工具是否成功、輸出是否非空、相依步驟及安全停止）；這不是對答案事實正確性的模型 Critic。外部寫入為 `EXECUTION_UNKNOWN` 時立即停止後續步驟且禁止自動重送。
+- 執行面板呈現計畫、任務、工具、核准、錯誤、產物、修改與驗證結果。
 - 長時間任務可顯示進度；右側面板在桌面、窄視窗與行動尺寸採不同停靠策略。
 - 非同步回應以 Project、Session、Run 與內容 owner 驗證，避免舊回應覆蓋新工作區。
+
+### 回答事實驗證
+
+- Basic Chat 使用專案知識時，Host 會把當輪取得的每個片段綁定為不可由模型自造的 `knowledge:<chunk_id>` evidence ID，並要求模型以 `[evidence:knowledge:<chunk_id>]` 標記引用。驗證器只能檢查這份同 Project、具完整性摘要的 evidence allowlist，不能擴大來源範圍。
+- 公開 Run／SSE 驗證事件只保存模式、狀態、代碼、回答與證據快照 digest、Adapter ID 及宣稱數量，不保存回答或證據本文。重試使用的私有證據快照經憑證遮罩、Project scope 與 digest 驗證。
+- `提醒` 模式在核對不足時保留回答並加上警示；`嚴格` 模式不顯示也不保存未通過的回答；`關閉` 模式略過額外事實核對，但不會停用工具、Project 或固定安全政策。
+- 預設 Claim Extractor 與 Entailment Adapter 是保守的本機確定性基線：它要求明確 evidence ID，且只有證據文字能直接支持宣稱時才通過。它不能證明一般世界知識、隱含推論或改寫後語意，因此結果應解讀為「目前專案證據是否明確支持」，不是全面真實性保證。
+- Basic Chat 與 Hermes 的最終回答都共用 Host-side 事實驗證邊界。只有存在同專案的 typed evidence bundle 且未關閉驗證時才會緩衝回答；非 RAG 與關閉模式保持原有串流行為。
 
 ## 4. 外掛程式平台
 
@@ -125,7 +144,7 @@ Workbench 可管理本機 n8n 工作流程，並提供受治理的 Gmail 草稿�
 
 ### Hermes
 
-Hermes 以獨立 loopback sidecar 漸進接入，具有健康檢查、能力驗證、回退與 rollout 控制。完整維運方式請參閱 [Hermes 部署與維運](HERMES_PRODUCTION_RUNBOOK.md)。
+Hermes 以獨立 loopback sidecar 漸進接入，具有健康檢查、能力驗證、回退與 rollout 控制。Hermes 可接收有界專案知識快照，並與 Basic Chat 共用 Host-side 最終回答事實驗證；嚴格模式失敗時不會顯示、保存或改道回退未驗證回答。完整維運方式請參閱 [Hermes 部署與維運](HERMES_PRODUCTION_RUNBOOK.md)。
 
 ## 8. 安全與資料邊界
 
@@ -144,5 +163,8 @@ Hermes 以獨立 loopback sidecar 漸進接入，具有健康檢查、能力驗�
 - [n8n Agent、治理與 Gmail 整合](N8N_AGENT_GOVERNANCE.md)
 - [依賴與供應鏈稽核](DEPENDENCY_AUDIT.md)
 - [執行安全與權限交接](handoff-execution-guards-20260728.md)
+- [Agent 能力評測與 Gate](../evals/README.md)
 
-主要驗證包含後端單元／整合測試、前端 DOM contract、JavaScript 語法檢查、公開版本樹秘密檢查及 Windows 啟動流程測試。
+主要驗證包含後端單元／整合測試、前端 DOM contract、JavaScript 語法檢查、公開版本樹秘密檢查及 Windows 啟動流程測試。Agent 能力 Gate 另涵蓋工具選擇、多步驟、安全批准、結果不確定、RAG、規劃與驗證；缺題或安全證據不足會直接失敗。
+
+正式 Basic Chat 能力證據採兩階段收集：先在執行評測前鎖定 Git 工作樹、Runtime、模型、Suite、Gate、設定、政策、Trial 與開始時間，再以唯一 Run ID 從唯讀 SQLite 快照收集終端 Run。Collector 會核對實際 prompt、模型、時窗、Project、訊息、批准 digest、知識來源與最終回答綁定，任一來源證明不一致即 fail-closed。後續 Exporter 只接受固定事件與欄位白名單，例如工具名稱、狀態、批准參數 digest、Artifact／來源 ID 與回答 digest；不匯出 prompt、回答本文、工具參數、知識片段或秘密。CI contract smoke 不是正式模型或完整聊天 Runtime 的成績，只有正式 Collector 產生的證據才能作為該模型與 Runtime 組合的評估輸入。

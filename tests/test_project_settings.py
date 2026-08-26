@@ -99,6 +99,28 @@ def test_project_pin_persists_and_updates(monkeypatch, tmp_path):
     assert database.get_project("project_one")["pinned"] is False
 
 
+def test_deleting_project_clears_its_separate_knowledge_index(monkeypatch, tmp_path):
+    configure_project_store(monkeypatch, tmp_path)
+    project_id = "project_knowledge_delete"
+    create_project(project_id, tmp_path / "knowledge-project")
+    workbench_app.knowledge_service.clear_project(project_id=project_id)
+    workbench_app.knowledge_service.import_document(
+        project_id=project_id,
+        source_id="guide.md",
+        title="Guide",
+        content="專案刪除後不應保留這份知識索引。",
+    )
+
+    response = TestClient(workbench_app.app).delete(
+        f"/api/projects/{project_id}", headers=local_headers()
+    )
+
+    assert response.status_code == 200
+    assert workbench_app.knowledge_service.status(project_id=project_id)[
+        "document_count"
+    ] == 0
+
+
 def test_pinned_projects_sort_first_without_destroying_manual_order(
     monkeypatch,
     tmp_path,

@@ -1,4 +1,5 @@
 from pathlib import Path
+import re
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -24,7 +25,10 @@ def test_project_skills_module_is_loaded_before_app_and_not_mounted_in_sidebar()
     assert "Skills" not in project_block
     assert "const matching = sessions.filter(session => session.project_id === project.id" in project_block
     assert 'project-skills-sidebar.js?v=1.2.1-add-menu-a11y' in INDEX_HTML
-    assert 'style.css?v=0.9.0-model-catalog-beta.4' in INDEX_HTML
+    backend_app = (ROOT / "backend" / "app.py").read_text(encoding="utf-8")
+    version = re.search(r'^APP_VERSION = "([^"]+)"$', backend_app, re.MULTILINE)
+    assert version
+    assert f'style.css?v={version.group(1)}' in INDEX_HTML
 
 
 def test_project_skills_use_only_project_and_session_scoped_apis():

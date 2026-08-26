@@ -56,7 +56,7 @@ def test_post_chat_route_runs_basic_stream_end_to_end(monkeypatch):
         response = client.post("/api/chat", json={
             "model": "route-test-model",
             "messages": [{"role": "user", "content": "route hello"}],
-            "use_rag": True,
+            "use_rag": False,
             "skill_ids": [],
             "skill_auto": True,
             "run_id": "run_route1234",
@@ -79,6 +79,31 @@ def test_post_chat_route_runs_basic_stream_end_to_end(monkeypatch):
     ]
     assert messages[-1]["process_events"] == []
     assert model_response.closed
+
+
+def test_project_knowledge_cannot_be_enabled_for_an_independent_chat(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        chat_runtime,
+        "provider_post_chat",
+        lambda *_args, **_kwargs: calls.append(True),
+    )
+
+    with TestClient(app_module.app) as client:
+        assert client.get("/").status_code == 200
+        response = client.post(
+            "/api/chat",
+            json={
+                "model": "route-test-model",
+                "messages": [{"role": "user", "content": "查詢專案知識"}],
+                "use_rag": True,
+                "run_id": "run_ragscope1234",
+            },
+        )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "KNOWLEDGE_PROJECT_REQUIRED"
+    assert calls == []
 
 
 def test_models_route_returns_flat_model_names(monkeypatch):

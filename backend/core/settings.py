@@ -31,8 +31,23 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "tts_auto_play": False,
     "tts_rate": 1.0,
     "ui_language": "zh-TW",
-      "settings_modal_width": 1040,
-      "settings_modal_height": 760,
+    "settings_modal_width": 1040,
+    "settings_modal_height": 760,
+    # These controls are active in Basic Chat.  Persist them in the reviewed
+    # settings boundary instead of silently discarding values submitted by the
+    # existing UI.
+    "rag_k": 4,
+    "rag_rerank_threshold": 0.2,
+    "rag_embedding_provider_id": "",
+    "rag_reranker_provider_id": "",
+    "rag_local_embedding_model_path": "",
+    "rag_local_reranker_model_path": "",
+    "chunk_size": 600,
+    "chunk_overlap": 120,
+    "agent_max_tool_calls": 8,
+    "agent_max_repair_rounds": 2,
+    "agent_auto_validate": True,
+    "answer_verification_mode": "warn",
     "chat_run_budget_seconds": 600,
     "cancel_release_grace_seconds": 4.0,
     "cancel_release_poll_seconds": 0.5,
@@ -215,6 +230,104 @@ def _mcp_local_path(value: object, *, field: str) -> str:
     if not path.is_absolute():
         raise ValueError(f"{field} must be an absolute local path.")
     return os.path.normpath(str(path))
+
+
+def _existing_local_model_path(value: object, *, field: str) -> str:
+    """Validate one explicitly selected, already-present local model directory."""
+
+    if value in (None, ""):
+        return ""
+    normalized = _mcp_local_path(value, field=field)
+    path = Path(normalized)
+    try:
+        resolved = path.resolve(strict=True)
+        attributes = int(getattr(path.stat(), "st_file_attributes", 0) or 0)
+    except (OSError, RuntimeError) as exc:
+        raise ValueError(f"{field} 必須指向已存在的本機路徑。") from exc
+    reparse_flag = int(getattr(os, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+    if path.is_symlink() or attributes & reparse_flag:
+        raise ValueError(f"{field} 不可使用符號連結或重新解析點。")
+    if not resolved.is_dir():
+        raise ValueError(
+            f"{field} 必須指向已存在的本機路徑，且該路徑必須是模型資料夾。"
+        )
+    return os.path.normpath(str(resolved))
+
+
+def _specialized_provider_id(
+    value: object,
+    providers: object,
+    *,
+    field: str,
+    model_kind: str,
+) -> str:
+    if value in (None, ""):
+        return ""
+    if not isinstance(value, str):
+        raise ValueError(f"{field} 必須是有效的模型服務 ID。")
+    provider_id = value.strip().casefold()
+    if not re.fullmatch(r"[a-z][a-z0-9_-]{0,47}", provider_id):
+        raise ValueError(f"{field} 必須是有效的模型服務 ID。")
+    matches = [
+        item
+        for item in providers or []
+        if isinstance(item, Mapping)
+        and str(item.get("id") or "").strip().casefold() == provider_id
+    ]
+    if len(matches) != 1:
+        raise ValueError(f"{field} 找不到對應的已設定模型服務。")
+    provider = matches[0]
+    if (
+        str(provider.get("model_kind") or "").strip().casefold() != model_kind
+        or not str(provider.get("selected_model") or "").strip()
+    ):
+        expected = "Embedding" if model_kind == "embedding" else "Reranker"
+        raise ValueError(f"{field} 必須選擇已設定的 {expected} 模型服務。")
+    return provider_id
+
+
+def _normalize_rag_model_settings(settings: Dict[str, Any]) -> None:
+    providers = settings.get("model_providers")
+    embedding_provider = _specialized_provider_id(
+        settings.get("rag_embedding_provider_id"),
+        providers,
+        field="rag_embedding_provider_id",
+        model_kind="embedding",
+    )
+    reranker_provider = _specialized_provider_id(
+        settings.get("rag_reranker_provider_id"),
+        providers,
+        field="rag_reranker_provider_id",
+        model_kind="rerank",
+    )
+    embedding_path = _existing_local_model_path(
+        settings.get("rag_local_embedding_model_path"),
+        field="rag_local_embedding_model_path",
+    )
+    reranker_path = _existing_local_model_path(
+        settings.get("rag_local_reranker_model_path"),
+        field="rag_local_reranker_model_path",
+    )
+    if embedding_provider and embedding_path:
+        raise ValueError(
+            "rag embedding 只能選擇一個模型服務或一個本機模型路徑。"
+        )
+    if reranker_provider and reranker_path:
+        raise ValueError(
+            "rag reranker 只能選擇一個模型服務或一個本機模型路徑。"
+        )
+    verification_mode = str(
+        settings.get("answer_verification_mode") or "warn"
+    ).strip().casefold()
+    if verification_mode not in {"warn", "strict", "off"}:
+        raise ValueError(
+            "answer_verification_mode 只接受提醒（warn）、嚴格（strict）或關閉（off）。"
+        )
+    settings["rag_embedding_provider_id"] = embedding_provider
+    settings["rag_reranker_provider_id"] = reranker_provider
+    settings["rag_local_embedding_model_path"] = embedding_path
+    settings["rag_local_reranker_model_path"] = reranker_path
+    settings["answer_verification_mode"] = verification_mode
 
 
 def _mcp_path_within(path: str, roots: list[str]) -> bool:
@@ -519,6 +632,17 @@ def load_settings() -> Dict[str, Any]:
             # Keep the rest of the user's settings available and fail closed
             # only for the optional MCP process list.
             settings["mcp_servers"] = []
+        try:
+            _normalize_rag_model_settings(settings)
+        except ValueError:
+            # A removed provider, moved local model, or tampered mode must not
+            # silently route knowledge data elsewhere.  Preserve unrelated
+            # settings and fall back to the local conservative baseline.
+            settings["rag_embedding_provider_id"] = ""
+            settings["rag_reranker_provider_id"] = ""
+            settings["rag_local_embedding_model_path"] = ""
+            settings["rag_local_reranker_model_path"] = ""
+            settings["answer_verification_mode"] = "warn"
         return settings
     except (OSError, UnicodeError, json.JSONDecodeError):
         return dict(DEFAULT_SETTINGS)
@@ -566,6 +690,7 @@ def validate_settings(data: Mapping[str, Any]) -> Dict[str, Any]:
     )[:80]
     merged["model_providers"] = normalize_provider_settings(merged.get("model_providers"))
     merged["mcp_servers"] = normalize_mcp_servers(merged.get("mcp_servers"))
+    _normalize_rag_model_settings(merged)
     merged["model_input_cost_per_million"] = max(
         0.0, min(1_000_000.0, float(merged.get("model_input_cost_per_million") or 0.0))
     )
@@ -583,6 +708,34 @@ def validate_settings(data: Mapping[str, Any]) -> Dict[str, Any]:
     merged.update(normalize_modal_size(merged))
     merged["tts_auto_play"] = bool(merged.get("tts_auto_play", False))
     merged["tts_rate"] = max(0.5, min(2.0, float(merged.get("tts_rate") or 1.0)))
+    def configured_number(key: str, default: Any) -> Any:
+        value = merged.get(key)
+        return default if value is None or value == "" else value
+
+    merged["rag_k"] = max(1, min(15, int(configured_number("rag_k", 4))))
+    merged["rag_rerank_threshold"] = max(
+        0.0,
+        min(1.0, float(configured_number("rag_rerank_threshold", 0.2))),
+    )
+    merged["chunk_size"] = max(
+        128, min(3000, int(configured_number("chunk_size", 600)))
+    )
+    merged["chunk_overlap"] = max(
+        0,
+        min(
+            min(1000, max(0, merged["chunk_size"] // 2 - 1)),
+            int(configured_number("chunk_overlap", 120)),
+        ),
+    )
+    merged["agent_max_tool_calls"] = max(
+        1, min(20, int(configured_number("agent_max_tool_calls", 8)))
+    )
+    merged["agent_max_repair_rounds"] = max(
+        0, min(3, int(configured_number("agent_max_repair_rounds", 2)))
+    )
+    merged["agent_auto_validate"] = bool(
+        merged.get("agent_auto_validate", True)
+    )
     merged["chat_run_budget_seconds"] = max(
         0, min(7200, int(merged.get("chat_run_budget_seconds") or 600))
     )
@@ -759,6 +912,7 @@ def save_settings(data: Mapping[str, Any]) -> None:
     persisted["mcp_servers"] = normalize_mcp_servers(
         persisted.get("mcp_servers")
     )
+    _normalize_rag_model_settings(persisted)
     path.write_text(
         json.dumps(persisted, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",

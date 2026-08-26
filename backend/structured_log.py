@@ -74,6 +74,21 @@ def _redact_text(text: str) -> str:
     return result
 
 
+def redact_text(value: Any, *, max_length: Optional[int] = 4000) -> str:
+    """Redact an entire text value before applying an optional output bound.
+
+    Callers that must preserve more than the display-oriented 4 KiB limit can
+    pass a larger bound.  Redaction always runs before truncation so a
+    registered literal cannot evade masking by crossing an arbitrary chunk
+    boundary.
+    """
+
+    result = _redact_text(str(value or ""))
+    if max_length is None:
+        return result
+    return result[: max(0, int(max_length))]
+
+
 def redact(value: Any, *, key: str = "", depth: int = 0) -> Any:
     """Remove secrets by key name, by value shape, and by registered literal."""
     if any(part in key.casefold() for part in SECRET_KEY_PARTS):
@@ -88,10 +103,10 @@ def redact(value: Any, *, key: str = "", depth: int = 0) -> Any:
     if isinstance(value, (list, tuple, set)):
         return [redact(item, depth=depth + 1) for item in list(value)[:60]]
     if isinstance(value, str):
-        return _redact_text(value)[:4000]
+        return redact_text(value)
     if value is None or isinstance(value, (bool, int, float)):
         return value
-    return _redact_text(repr(value))[:1000]
+    return redact_text(repr(value), max_length=1000)
 
 
 def _log_dir() -> Path:

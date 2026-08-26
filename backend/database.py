@@ -1233,6 +1233,31 @@ def get_artifact(artifact_id: str) -> Optional[Dict[str, Any]]:
         return item
 
 
+_RUN_TASK_STATUSES = frozenset(
+    {"pending", "running", "in_progress", "completed", "failed", "skipped", "cancelled"}
+)
+
+
+def _safe_run_tasks(value: Any) -> List[Dict[str, str]]:
+    """Persist only redacted task identity, display label, and progress state."""
+
+    if not isinstance(value, (list, tuple)):
+        return []
+    result: List[Dict[str, str]] = []
+    for raw in value[:64]:
+        if not isinstance(raw, Mapping):
+            continue
+        task_id = _safe_public_event_text(raw.get("id"), key="task_id", limit=128).strip()
+        label = _safe_public_event_text(
+            raw.get("label") or raw.get("title"), key="task_label", limit=200
+        ).strip()
+        status = str(raw.get("status") or "pending").strip().lower()
+        if not task_id or not label or status not in _RUN_TASK_STATUSES:
+            continue
+        result.append({"id": task_id, "label": label, "status": status})
+    return result
+
+
 def upsert_run(
     run_id: str,
     session_id: str,
@@ -1274,7 +1299,9 @@ def upsert_run(
                 return str(existing[name])
             return json.dumps(default, ensure_ascii=False)
 
-        tasks_json = encoded("tasks_json", tasks, [])
+        tasks_json = encoded(
+            "tasks_json", _safe_run_tasks(tasks) if tasks is not None else None, []
+        )
         # Public execution events are append-only once a run exists.  Runtime
         # transitions (notably Hermes -> basic-chat fallback) must not erase
         # events that were already accepted through append_run_event().
@@ -1349,7 +1376,9 @@ def get_run(run_id: str) -> Optional[Dict[str, Any]]:
             return None
         item = dict(row)
         item["run_id"] = item.pop("id")
-        item["tasks"] = _loads_json(item.pop("tasks_json", None), [])
+        item["tasks"] = _safe_run_tasks(
+            _loads_json(item.pop("tasks_json", None), [])
+        )
         item["events"] = _loads_json(item.pop("events_json", None), [])
         item["sources"] = _loads_json(item.pop("sources_json", None), [])
         item["metrics"] = _loads_json(item.pop("metrics_json", None), {})
@@ -1448,6 +1477,17 @@ _RUN_EVENT_FIELDS: Dict[str, tuple[str, ...]] = {
     "tool_end": (
         "tool", "tool_call_id", "run_id", "project_id", "success",
         "result", "details_redacted", "duration_ms",
+    ),
+    "plan": (
+        "run_id", "project_id", "plan_id", "planner", "task_count",
+        "tool_call_limit", "tool_calls_per_step", "wall_seconds", "tasks",
+    ),
+    "task_update": (
+        "run_id", "project_id", "plan_id", "task_id", "kind", "status",
+        "message", "tool_calls_used", "tool_call_limit", "plan_status",
+    ),
+    "repair": (
+        "run_id", "project_id", "plan_id", "task_id", "round", "reason",
     ),
     "approval_required": (
         "approval_id", "capability", "message", "summary", "run_id", "risk",
@@ -1564,6 +1604,11 @@ def _safe_run_event_payload(
         value = payload[key]
         if key == "relative_path":
             result[key] = _safe_relative_event_path(value)
+        elif key == "tasks" and isinstance(value, (list, tuple)):
+            result[key] = [
+                {"id": task["id"], "title": task["label"], "status": task["status"]}
+                for task in _safe_run_tasks(value)
+            ]
         elif key == "args":
             # Tool arguments are never persisted.  Only this fixed marker is
             # accepted from the already-sanitized Hermes tool bridge.

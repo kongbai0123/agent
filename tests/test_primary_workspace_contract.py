@@ -16,6 +16,7 @@ CLOUD_JS = (FRONTEND / "cloud-llm-center.js").read_text(encoding="utf-8")
 WORKSPACES = {
     "chat": ("chat", "rail-chat"),
     "workflows": ("n8n-workflow-center", "rail-workflows"),
+    "knowledge": ("knowledge-workspace", "rail-knowledge"),
     "extensions": ("extension-center-workspace", "rail-extensions"),
     "models": ("model-manager-workspace", "rail-models"),
     "cloud": ("cloud-llm-workspace", "rail-cloud-llm"),
@@ -28,8 +29,9 @@ def _slice(source: str, start: str, end: str) -> str:
     return source[start_index : source.index(end, start_index)]
 
 
-def test_models_cloud_and_extensions_are_management_workspaces_not_modals():
+def test_management_surfaces_are_workspaces_not_modals():
     for workspace_id in (
+        "knowledge-workspace",
         "extension-center-workspace",
         "model-manager-workspace",
         "cloud-llm-workspace",
@@ -47,10 +49,10 @@ def test_models_cloud_and_extensions_are_management_workspaces_not_modals():
     assert 'id="cloud-llm-modal"' not in INDEX_HTML
 
 
-def test_primary_workspace_switch_has_six_exclusive_states_and_policy_gates():
+def test_primary_workspace_switch_has_seven_exclusive_states_and_policy_gates():
     workspace = _slice(APP_JS, "function setPrimaryWorkspace", "// ---- Workbench 初始化")
-    assert "new Set(['chat', 'workflows', 'extensions', 'models', 'cloud', 'mlops'])" in workspace
-    assert "const managementMode = extensionMode || modelMode || cloudMode || mlopsMode" in workspace
+    assert "new Set(['chat', 'workflows', 'knowledge', 'extensions', 'models', 'cloud', 'mlops'])" in workspace
+    assert "const managementMode = knowledgeMode || extensionMode || modelMode || cloudMode || mlopsMode" in workspace
     assert "workbenchRunInspector?.setAvailable?.(!managementMode" in workspace
     assert "drawer.hidden = nextWorkspace !== 'chat'" in workspace
     assert "['workflows', railWorkflows]" in workspace
@@ -58,10 +60,10 @@ def test_primary_workspace_switch_has_six_exclusive_states_and_policy_gates():
     for state, (main_id, rail_id) in WORKSPACES.items():
         if state != "chat":
             assert main_id in workspace
-        assert f"['{state}', { {'chat': 'railChat', 'workflows': 'railWorkflows', 'extensions': 'railExtensions', 'models': 'railModels', 'cloud': 'railCloud', 'mlops': 'railMlops'}[state]}]" in workspace
+        assert f"['{state}', { {'chat': 'railChat', 'workflows': 'railWorkflows', 'knowledge': 'railKnowledge', 'extensions': 'railExtensions', 'models': 'railModels', 'cloud': 'railCloud', 'mlops': 'railMlops'}[state]}]" in workspace
         assert rail_id in INDEX_HTML
 
-    # Workflows deliberately remain run-inspector capable; only the three
+    # Workflows deliberately remain run-inspector capable; only dedicated
     # management workspaces are included in the unavailable gate.
     assert "workflowMode" not in workspace.split("const managementMode =", 1)[1].split(";", 1)[0]
 
@@ -99,8 +101,8 @@ def test_switching_each_primary_workspace_leaves_one_main_and_one_active_rail():
         const nodes = new Map();
         const make = id => { const node = new Node(id); nodes.set(id, node); return node; };
         const chat = make('chat');
-        const mains = ['n8n-workflow-center', 'extension-center-workspace', 'model-manager-workspace', 'cloud-llm-workspace', 'mlops-workspace'].map(make);
-        const rails = ['rail-chat', 'rail-workflows', 'rail-extensions', 'rail-models', 'rail-cloud-llm', 'rail-mlops'].map(make);
+        const mains = ['n8n-workflow-center', 'knowledge-workspace', 'extension-center-workspace', 'model-manager-workspace', 'cloud-llm-workspace', 'mlops-workspace'].map(make);
+        const rails = ['rail-chat', 'rail-workflows', 'rail-knowledge', 'rail-extensions', 'rail-models', 'rail-cloud-llm', 'rail-mlops'].map(make);
         const drawer = make('chat-drawer');
         let inspectorAvailable = null;
         let cloudDeactivations = 0;
@@ -122,20 +124,22 @@ def test_switching_each_primary_workspace_leaves_one_main_and_one_active_rail():
         global.syncChatDrawerA11y = () => {};
         global.setOutputFloatingPanelOpen = () => {};
         global.setTaskProgressCollapsed = () => {};
+        global.renderTaskProgress = () => {};
         global.closeInspectorPanel = () => {};
         global.closeAgentCollaboration = () => {};
 
         const observations = [];
         const stateToMain = {
-          chat: 'chat', workflows: 'n8n-workflow-center', extensions: 'extension-center-workspace',
+          chat: 'chat', workflows: 'n8n-workflow-center', knowledge: 'knowledge-workspace', extensions: 'extension-center-workspace',
           models: 'model-manager-workspace', cloud: 'cloud-llm-workspace', mlops: 'mlops-workspace',
         };
         const stateToRail = {
-          chat: 'rail-chat', workflows: 'rail-workflows', extensions: 'rail-extensions',
+          chat: 'rail-chat', workflows: 'rail-workflows', knowledge: 'rail-knowledge', extensions: 'rail-extensions',
           models: 'rail-models', cloud: 'rail-cloud-llm', mlops: 'rail-mlops',
         };
+        global.knowledgeViewRevision = 0;
         const fragment = source.slice(start, end) + `
-          for (const state of ['chat', 'workflows', 'extensions', 'models', 'cloud', 'mlops']) {
+          for (const state of ['chat', 'workflows', 'knowledge', 'extensions', 'models', 'cloud', 'mlops']) {
             setPrimaryWorkspace(state);
             const allMains = [chat, ...mains];
             observations.push({
@@ -178,6 +182,8 @@ def test_escape_and_cloud_deactivation_route_through_workspace_controllers():
     a11y = _slice(APP_JS, "function initA11y", "let primaryWorkspace")
     assert "primaryWorkspace === 'extensions'" in a11y
     assert "workbenchExtensions?.close?.()" in a11y
+    assert "primaryWorkspace === 'knowledge'" in a11y
+    assert "setPrimaryWorkspace('chat')" in a11y
     assert "primaryWorkspace === 'models'" in a11y
     assert "closeModelManager()" in a11y
     assert "primaryWorkspace === 'cloud'" in a11y

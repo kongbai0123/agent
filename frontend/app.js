@@ -242,18 +242,22 @@ let sidebarProjectPlacement = 'before';
 let folderBrowserCurrentPath = null;
 let folderBrowserParentPath = null;
 let folderBrowserResolver = null;
+let sessionLoadRevision = 0;
 
 // 圖片上傳/預覽 DOM 元素
 const imgUploadBtn = document.getElementById('img-upload-btn');
 const imgFileInput = document.getElementById('img-file-input');
 const imagePreviewContainer = document.getElementById('image-preview-container');
 
-// 知識庫管理 Modal DOM 元素
+// 專案知識庫工作區 DOM 元素
 const manageKbBtn = document.getElementById('manage-kb-btn');
-const kbManagerModal = document.getElementById('kb-manager-modal');
-const kbModalClose = document.getElementById('kb-modal-close');
-const kbModalCloseBtn = document.getElementById('kb-modal-close-btn');
+const knowledgeWorkspaceClose = document.getElementById('knowledge-workspace-close');
+const knowledgeWorkspaceCloseBtn = document.getElementById('knowledge-workspace-close-btn');
 const kbFileList = document.getElementById('kb-file-list');
+const kbProjectRequired = document.getElementById('kb-project-required');
+const kbWorkspaceContent = document.getElementById('kb-workspace-content');
+const kbWorkspaceStatus = document.getElementById('kb-workspace-status');
+const kbChatRetrievalToggle = document.getElementById('kb-chat-retrieval-toggle');
 const clearAllKbBtn = document.getElementById('clear-all-kb-btn');
 const uploadZone = document.getElementById('upload-zone');
 const fileInput = document.getElementById('file-input');
@@ -261,6 +265,20 @@ const progressContainer = document.getElementById('progress-container');
 const progressFilename = progressContainer.querySelector('.progress-filename');
 const progressPercent = progressContainer.querySelector('.progress-percent');
 const progressFill = document.getElementById('progress-fill');
+let knowledgeViewRevision = 0;
+let knowledgeScopeProjectId = null;
+const knowledgeRequestRevisions = {
+    status: 0,
+    index: 0,
+    retrieval: 0,
+    preview: 0
+};
+
+function invalidateKnowledgeRequests() {
+    Object.keys(knowledgeRequestRevisions).forEach(key => {
+        knowledgeRequestRevisions[key] += 1;
+    });
+}
 
 // Chunks 預覽區域
 const chunksPreviewSection = document.getElementById('chunks-preview-section');
@@ -450,6 +468,14 @@ const settingRagThreshold = document.getElementById('setting-rag-threshold');
 const valRagThreshold = document.getElementById('val-rag-threshold');
 const settingChunkSize = document.getElementById('setting-chunk-size');
 const settingChunkOverlap = document.getElementById('setting-chunk-overlap');
+const settingRagEmbeddingBackend = document.getElementById('setting-rag-embedding-backend');
+const settingRagEmbeddingLocalPath = document.getElementById('setting-rag-embedding-local-path');
+const settingRagEmbeddingLocalWrap = document.getElementById('setting-rag-embedding-local-wrap');
+const settingRagEmbeddingStatus = document.getElementById('setting-rag-embedding-status');
+const settingRagRerankerBackend = document.getElementById('setting-rag-reranker-backend');
+const settingRagRerankerLocalPath = document.getElementById('setting-rag-reranker-local-path');
+const settingRagRerankerLocalWrap = document.getElementById('setting-rag-reranker-local-wrap');
+const settingRagRerankerStatus = document.getElementById('setting-rag-reranker-status');
 const settingBrowserHeadful = document.getElementById('setting-browser-headful');
 const settingNetworkProxy = document.getElementById('setting-network-proxy');
 const settingAgentDetailedProgress = document.getElementById('setting-agent-detailed-progress');
@@ -457,6 +483,7 @@ const settingSkillsEnabled = document.getElementById('setting-skills-enabled');
 const settingAgentMaxToolCalls = document.getElementById('setting-agent-max-tool-calls');
 const settingAgentMaxRepairRounds = document.getElementById('setting-agent-max-repair-rounds');
 const settingAgentAutoValidate = document.getElementById('setting-agent-auto-validate');
+const settingAnswerVerificationMode = document.getElementById('setting-answer-verification-mode');
 const settingAgentAllowWorkspaceWrite = document.getElementById('setting-agent-allow-workspace-write');
 const settingAgentFinalReportDetail = document.getElementById('setting-agent-final-report-detail');
 const settingSubagentEnabled = document.getElementById('setting-subagent-enabled');
@@ -522,7 +549,9 @@ function renderTaskProgress() {
     taskProgressList.replaceChildren();
     const items = [...taskProgressItems.values()].sort((a, b) => b.updatedAt - a.updatedAt);
     taskProgressCount.textContent = String(items.length);
-    taskProgressCenter.hidden = items.length === 0;
+    const managementWorkspaceOpen = ['workflows', 'knowledge', 'extensions', 'models', 'cloud', 'mlops'].includes(primaryWorkspace);
+    // 管理工作區已有內嵌狀態；不再疊加會遮住頁尾主操作的浮動進度。
+    taskProgressCenter.hidden = items.length === 0 || managementWorkspaceOpen;
     if (
         items.length > 0
         && window.matchMedia('(max-width: 1180px)').matches
@@ -1334,37 +1363,53 @@ function initAgentCollaboration() {
 }
 
 async function loadRagStatus() {
-    if (BASIC_CHAT_MODE) return useBasicKnowledgeStatus();
+    const projectId = activeProjectId;
+    const requestRevision = ++knowledgeRequestRevisions.status;
     try {
-        // 優先使用正式狀態 API（後端尚未提供時自動走 fallback）
-        const res = await removedBasicFeature('Knowledge retrieval');
+        if (!projectId) {
+            kbStatus = { enabled: true, index_status: 'project_required', document_count: 0, chunk_count: 0 };
+            renderKbStatusLine();
+            return;
+        }
+        if (kbStatus.project_id !== projectId) {
+            // 專案切換後先清除前一個專案的數量，避免慢速回應期間短暫
+            // 顯示不屬於目前專案的摘要。
+            kbStatus = { enabled: true, project_id: projectId, index_status: 'loading', document_count: 0, chunk_count: 0 };
+            renderKbStatusLine();
+        }
+        const res = await apiFetch(`${API_BASE}/api/knowledge/status?project_id=${encodeURIComponent(projectId)}`);
         if (res.ok) {
             const data = await res.json();
+            if (activeProjectId !== projectId || requestRevision !== knowledgeRequestRevisions.status) return;
             kbStatus = { ...kbStatus, ...data };
             renderKbStatusLine();
             return;
         }
     } catch (e) { /* fallthrough */ }
-    try {
-        // Fallback：由 /api/documents 推導文件數與 chunk 數
-        const res = await removedBasicFeature('Knowledge documents');
-        const data = await res.json();
-        const docs = data.documents || [];
-        kbStatus.document_count = docs.length;
-        kbStatus.chunk_count = docs.reduce((sum, d) => sum + (d.chunk_count || 0), 0);
-        kbStatus.index_status = docs.length > 0 ? 'ready' : 'empty';
-        renderKbStatusLine();
-    } catch (e) {
-        console.warn('[KB] 無法取得知識庫狀態:', e);
-    }
+    if (activeProjectId !== projectId || requestRevision !== knowledgeRequestRevisions.status) return;
+    kbStatus = { enabled: false, index_status: 'unavailable', document_count: 0, chunk_count: 0 };
+    renderKbStatusLine();
 }
 
 function renderKbStatusLine() {
     const el = document.getElementById('kb-status-line');
     if (el) {
-        el.textContent = kbStatus.index_status === 'ready'
-            ? `${kbStatus.document_count} 文件 · ${kbStatus.chunk_count} chunks · 索引就緒`
-            : '尚未匯入文件';
+        if (kbStatus.index_status === 'project_required') el.textContent = '請先選擇專案';
+        else if (kbStatus.reindex_required) el.textContent = `${kbStatus.document_count} 份文件 · Embedding 已變更，需重新匯入／重建索引`;
+        else if (kbStatus.index_status === 'ready') el.textContent = `${kbStatus.document_count} 份文件 · ${kbStatus.chunk_count} 個片段 · ${kbStatus.limit_status === 'reached' ? '已達容量上限' : '索引就緒'}`;
+        else if (kbStatus.index_status === 'degraded') el.textContent = '索引容量超過安全上限，請先移除文件';
+        else if (kbStatus.index_status === 'loading') el.textContent = '正在載入目前專案知識庫';
+        else if (kbStatus.index_status === 'unavailable') el.textContent = '知識庫服務目前無法使用';
+        else el.textContent = '目前專案尚未匯入文件';
+    }
+    if (kbWorkspaceStatus) {
+        if (kbStatus.index_status === 'project_required') kbWorkspaceStatus.textContent = '請先選擇專案。';
+        else if (kbStatus.reindex_required) kbWorkspaceStatus.textContent = `Embedding 已變更；目前只有 ${Number(kbStatus.current_adapter_chunk_count) || 0} 個片段可供新模型使用，請重新匯入文件以重建索引。`;
+        else if (kbStatus.index_status === 'ready') kbWorkspaceStatus.textContent = `目前專案：${kbStatus.document_count} 份文件、${kbStatus.chunk_count} 個片段${kbStatus.limit_status === 'reached' ? '，已達容量上限。' : '。'}`;
+        else if (kbStatus.index_status === 'degraded') kbWorkspaceStatus.textContent = '索引容量超過安全上限；請先移除文件再檢索。';
+        else if (kbStatus.index_status === 'loading') kbWorkspaceStatus.textContent = '正在載入目前專案的知識庫狀態。';
+        else if (kbStatus.index_status === 'unavailable') kbWorkspaceStatus.textContent = '無法讀取知識庫狀態，請確認後端服務。';
+        else kbWorkspaceStatus.textContent = '目前專案的知識庫是空的。';
     }
     // Workbench：同步 Top Bar chip 與 Start Dashboard
     updateDocsChip();
@@ -1601,21 +1646,28 @@ function setupEventListeners() {
     // 剪貼簿 paste 貼上圖片監聽
     userInput.addEventListener('paste', handleImagePaste);
 
-    // 知識庫管理 Modal 切換控制
-    manageKbBtn.addEventListener('click', () => {
-        kbManagerModal.classList.add('active');
-        loadKBFiles();
-    });
+    // 專案知識庫工作區切換控制
+    manageKbBtn.addEventListener('click', () => openKnowledgeCenter('documents'));
     
-    const closeKBModal = () => {
-        kbManagerModal.classList.remove('active');
+    const closeKnowledgeWorkspace = () => {
         chunksPreviewSection.style.display = 'none';
+        setPrimaryWorkspace('chat');
+        document.getElementById('rail-chat')?.focus();
     };
-    kbModalClose.addEventListener('click', closeKBModal);
-    kbModalCloseBtn.addEventListener('click', closeKBModal);
+    knowledgeWorkspaceClose.addEventListener('click', closeKnowledgeWorkspace);
+    knowledgeWorkspaceCloseBtn.addEventListener('click', closeKnowledgeWorkspace);
+    document.getElementById('kb-choose-project')?.addEventListener('click', () => {
+        closeKnowledgeWorkspace();
+        projectSwitcherBtn.click();
+    });
 
     // 知識庫拖曳上傳
     uploadZone.addEventListener('click', () => fileInput.click());
+    uploadZone.addEventListener('keydown', (event) => {
+        if (event.key !== 'Enter' && event.key !== ' ') return;
+        event.preventDefault();
+        if (uploadZone.getAttribute('aria-disabled') !== 'true') fileInput.click();
+    });
     fileInput.addEventListener('change', (e) => handleFilesSelect(e.target.files));
 
     ['dragenter', 'dragover'].forEach(eventName => {
@@ -1984,6 +2036,7 @@ function setOutputFloatingPanelOpen(open, { restoreFocus = false } = {}) {
 }
 
 async function loadSessions(searchVal = '') {
+    const requestRevision = ++sessionLoadRevision;
     try {
         sidebarSearch = searchVal.toLocaleLowerCase();
         const [sessionsRes, projectsRes] = await Promise.all([
@@ -1991,10 +2044,15 @@ async function loadSessions(searchVal = '') {
             apiFetch(`${API_BASE}/api/projects`)
         ]);
         if (!sessionsRes.ok || !projectsRes.ok) throw new Error('Sidebar data request failed');
-        sidebarSessions = (await sessionsRes.json()).sessions || [];
-        sidebarProjects = (await projectsRes.json()).projects || [];
+        const sessionsPayload = await sessionsRes.json();
+        const projectsPayload = await projectsRes.json();
+        if (requestRevision !== sessionLoadRevision) return;
+        sidebarSessions = sessionsPayload.sessions || [];
+        sidebarProjects = projectsPayload.projects || [];
         const currentSession = sidebarSessions.find(session => session.id === currentSessionId);
-        if (currentSession) activeProjectId = currentSession.project_id || null;
+        // 專案範圍只來自實際存在的目前對話；找不到對話時立即退回
+        // 無專案，不能沿用上一個專案的知識或工具範圍。
+        activeProjectId = currentSession?.project_id || null;
         window.workbenchProjectSkills?.setSessionContext({
             sessionId: currentSessionId,
             projectId: currentSession?.project_id || null
@@ -2006,8 +2064,22 @@ async function loadSessions(searchVal = '') {
         window.workbenchN8nWorkflows?.refreshProjects?.();
         window.workbenchN8nGovernance?.refreshProjects?.();
         safeCreateIcons();
+        loadKnowledgeRetrievalPreference(activeProjectId);
+        void loadRagStatus();
+        if (primaryWorkspace === 'knowledge') {
+            setKnowledgeProjectAvailability(activeProjectId);
+            chunksPreviewSection.style.display = 'none';
+            void loadKBFiles();
+            if (document.getElementById('kb-pane-index')?.classList.contains('active')) {
+                void renderKbIndexSettings();
+            }
+        }
     } catch (e) {
+        if (requestRevision !== sessionLoadRevision) return;
         console.error('Failed to load sessions:', e);
+        activeProjectId = null;
+        loadKnowledgeRetrievalPreference(null);
+        setKnowledgeProjectAvailability(null);
         sessionList.innerHTML = `<div class="empty-sessions">無法載入工作區</div>`;
         outputPanelProject.textContent = '載入失敗';
         renderOutputSkillsState('無法載入目前專案的 Skills。');
@@ -2879,13 +2951,120 @@ function addImagePreview(base64Data) {
 }
 
 // ==========================================================================
-// 3. 知識庫與 Chunks 預覽管理 (Modal)
+// 3. 專案知識庫與片段預覽管理
 // ==========================================================================
 
+function setKnowledgeProjectAvailability(projectId = activeProjectId) {
+    const available = !!projectId;
+    const normalizedProjectId = projectId || null;
+    if (knowledgeScopeProjectId !== normalizedProjectId) {
+        knowledgeScopeProjectId = normalizedProjectId;
+        knowledgeViewRevision += 1;
+        invalidateKnowledgeRequests();
+        const retrievalButton = document.getElementById('kb-test-run');
+        if (retrievalButton) retrievalButton.disabled = false;
+        chunksPreviewSection.style.display = 'none';
+        chunksList.innerHTML = '';
+        const retrievalResults = document.getElementById('kb-test-results');
+        if (retrievalResults) retrievalResults.innerHTML = '';
+    }
+    if (kbProjectRequired) kbProjectRequired.hidden = available;
+    if (kbWorkspaceContent) kbWorkspaceContent.hidden = !available;
+    document.querySelector('.knowledge-workspace .kb-tabs')?.toggleAttribute('hidden', !available);
+    clearAllKbBtn.disabled = !available;
+    if (kbChatRetrievalToggle) kbChatRetrievalToggle.disabled = !available;
+    uploadZone.setAttribute('aria-disabled', String(!available));
+    if (!available) {
+        chunksPreviewSection.style.display = 'none';
+        kbFileList.innerHTML = '<div class="empty-files">請先選擇專案，才能建立及檢索專案知識庫。</div>';
+        kbStatus = { enabled: true, index_status: 'project_required', document_count: 0, chunk_count: 0 };
+        renderKbStatusLine();
+    }
+    return available;
+}
+
+function knowledgeRetrievalPreferenceKey(projectId) {
+    return `workbench-project-knowledge:${String(projectId || '')}`;
+}
+
+function loadKnowledgeRetrievalPreference(projectId = activeProjectId) {
+    let enabled = !!projectId;
+    if (projectId) {
+        try { enabled = localStorage.getItem(knowledgeRetrievalPreferenceKey(projectId)) !== 'off'; } catch (error) {}
+    }
+    ragToggle.checked = enabled;
+    if (kbChatRetrievalToggle) {
+        kbChatRetrievalToggle.checked = enabled;
+        kbChatRetrievalToggle.disabled = !projectId;
+    }
+    updateRagChip();
+    return enabled;
+}
+
+function saveKnowledgeRetrievalPreference(enabled, projectId = activeProjectId) {
+    if (!projectId) return;
+    try { localStorage.setItem(knowledgeRetrievalPreferenceKey(projectId), enabled ? 'on' : 'off'); } catch (error) {}
+}
+
+async function knowledgeResponse(response, fallbackMessage) {
+    let data = {};
+    try { data = await response.json(); } catch (error) { /* 使用備用訊息 */ }
+    if (!response.ok) {
+        const message = data.detail?.message || data.message || fallbackMessage || `知識庫作業失敗（HTTP ${response.status}）`;
+        const error = new Error(String(message));
+        error.code = String(data.detail?.code || data.code || 'KNOWLEDGE_REQUEST_FAILED');
+        error.detail = data.detail?.detail || data.detail || {};
+        error.status = response.status;
+        throw error;
+    }
+    return data;
+}
+
+async function approveKnowledgeDataConsent(error) {
+    if (error?.code !== 'MODEL_DATA_CONSENT_REQUIRED' || !error?.detail?.proposal_id) {
+        throw error;
+    }
+    const choice = await requestModelDataConsent(error.detail);
+    if (choice === 'cancel') {
+        const cancelled = new Error('你已取消資料上雲；本次未將任何專案文件片段送往雲端。');
+        cancelled.code = 'MODEL_DATA_CONSENT_CANCELLED';
+        throw cancelled;
+    }
+    const approval = await apiFetch(
+        `${API_BASE}/api/model-routing/proposals/${encodeURIComponent(error.detail.proposal_id)}/approve`,
+        {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ remember_project: choice === 'remember' })
+        }
+    );
+    if (!approval.ok) {
+        throw new Error('資料傳送同意已逾時、政策已變更或無法送達；尚未傳送文件。');
+    }
+    return String(error.detail.proposal_id);
+}
+
+function formatKnowledgeBytes(value) {
+    const bytes = Math.max(0, Number(value) || 0);
+    if (bytes < 1024) return `${bytes} 位元組`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
+    return `${(bytes / 1024 / 1024).toFixed(1)} MiB`;
+}
+
+function formatKnowledgeTime(value) {
+    const parsed = new Date(value || '');
+    return Number.isNaN(parsed.getTime()) ? '時間未知' : parsed.toLocaleString('zh-TW', { hour12: false });
+}
+
 async function loadKBFiles() {
+    const projectId = activeProjectId;
+    if (!setKnowledgeProjectAvailability(projectId)) return;
+    const revision = ++knowledgeViewRevision;
+    kbFileList.innerHTML = '<div class="empty-files">正在載入目前專案的文件…</div>';
     try {
-        const res = await removedBasicFeature('Knowledge documents');
-        const data = await res.json();
+        const res = await apiFetch(`${API_BASE}/api/knowledge/documents?project_id=${encodeURIComponent(projectId)}`);
+        const data = await knowledgeResponse(res, '無法載入知識庫文件。');
+        if (activeProjectId !== projectId || revision !== knowledgeViewRevision) return;
         
         kbFileList.innerHTML = '';
         if (data.documents && data.documents.length > 0) {
@@ -2894,107 +3073,136 @@ async function loadKBFiles() {
                 item.className = 'kb-file-item';
                 item.innerHTML = `
                     <div class="kb-file-info">
-                        <span class="kb-file-name" title="${escapeHtml(doc.filename)}">${escapeHtml(doc.filename)}</span>
-                        <span class="kb-file-meta">路徑: ${escapeHtml(doc.filepath)} | 共 ${doc.chunk_count} 個 Chunks</span>
+                        <span class="kb-file-name" title="${escapeHtml(doc.title || doc.source_id || '')}">${escapeHtml(doc.title || doc.source_id || '未命名文件')}</span>
+                        <span class="kb-file-meta">來源：${escapeHtml(doc.source_id || '未知')} · ${Number(doc.chunk_count) || 0} 個片段 · ${formatKnowledgeBytes(doc.content_bytes)} · 更新於 ${escapeHtml(formatKnowledgeTime(doc.updated_at))}</span>
                     </div>
                     <div class="kb-file-actions">
-                        <button class="btn btn-secondary btn-xs btn-preview-chunks" data-path="${escapeHtml(doc.filepath)}" data-name="${escapeHtml(doc.filename)}">
-                            <i data-lucide="eye" style="width: 12px; height: 12px; margin-right: 4px;"></i>預覽 Chunks
+                        <button class="btn btn-secondary btn-xs btn-preview-chunks" data-document-id="${escapeHtml(doc.document_id)}" data-name="${escapeHtml(doc.title || doc.source_id || '未命名文件')}">
+                            <i data-lucide="eye" style="width: 12px; height: 12px; margin-right: 4px;"></i>預覽片段
                         </button>
-                        <button class="btn btn-danger btn-xs btn-delete-doc" data-path="${escapeHtml(doc.filepath)}" style="padding: 6px;">
+                        <button class="btn btn-danger btn-xs btn-delete-doc" data-document-id="${escapeHtml(doc.document_id)}" data-name="${escapeHtml(doc.title || doc.source_id || '未命名文件')}" style="padding: 6px;" aria-label="刪除 ${escapeHtml(doc.title || doc.source_id || '文件')}">
                             <i data-lucide="trash-2" style="width: 12px; height: 12px;"></i>
                         </button>
                     </div>
                 `;
                 
-                // 預覽 Chunks 綁定
+                // 預覽片段綁定
                 item.querySelector('.btn-preview-chunks').addEventListener('click', (e) => {
-                    const filepath = e.currentTarget.getAttribute('data-path');
+                    const documentId = e.currentTarget.getAttribute('data-document-id');
                     const filename = e.currentTarget.getAttribute('data-name');
-                    previewDocChunks(filepath, filename);
+                    previewDocChunks(documentId, filename);
                 });
                 
                 // 單獨刪除文件綁定
                 item.querySelector('.btn-delete-doc').addEventListener('click', (e) => {
-                    const filepath = e.currentTarget.getAttribute('data-path');
-                    if (confirm('確認從向量庫與本機徹底刪除此文件？')) {
-                        deleteKBDocument(filepath);
+                    const documentId = e.currentTarget.getAttribute('data-document-id');
+                    const filename = e.currentTarget.getAttribute('data-name');
+                    if (confirm(`確認刪除目前專案中的「${filename}」索引？此動作不會影響其他專案。`)) {
+                        deleteKBDocument(documentId);
                     }
                 });
 
                 kbFileList.appendChild(item);
             });
         } else {
-            kbFileList.innerHTML = `<div class="empty-files" style="padding: 20px 0;"><span style="color: var(--text-muted);">知識庫為空，請上傳檔案</span></div>`;
+            kbFileList.innerHTML = '<div class="empty-files">目前專案的知識庫是空的，請匯入文件。</div>';
         }
         safeCreateIcons();
     } catch (e) {
         console.error('Failed to load KB files:', e);
+        if (activeProjectId === projectId && revision === knowledgeViewRevision) {
+            kbFileList.innerHTML = `<div class="empty-files error">無法載入文件：${escapeHtml(e.message || '知識庫服務未連線')}</div>`;
+        }
     }
 }
 
-async function deleteKBDocument(filepath) {
+async function deleteKBDocument(documentId) {
+    const projectId = activeProjectId;
+    if (!projectId || !documentId) {
+        showToast('請先選擇專案與文件。', 'info');
+        return;
+    }
     try {
-        const res = await removedBasicFeature('Knowledge documents', {
-            method: 'DELETE',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ file_path: filepath })
-        });
-        const data = await res.json();
-        if (data.success) {
-            await loadKBFiles();
-            loadRagStatus(); // P1-2
-            chunksPreviewSection.style.display = 'none';
-        } else {
-            showToast('刪除失敗');
-        }
+        const res = await apiFetch(`${API_BASE}/api/knowledge/documents/${encodeURIComponent(documentId)}?project_id=${encodeURIComponent(projectId)}`, { method: 'DELETE' });
+        await knowledgeResponse(res, '刪除文件失敗。');
+        if (activeProjectId !== projectId) return;
+        chunksPreviewSection.style.display = 'none';
+        await Promise.all([loadKBFiles(), loadRagStatus()]);
+        showToast('已刪除目前專案的文件索引。', 'success');
     } catch (e) {
         console.error('Delete doc failed:', e);
+        showToast(`刪除文件失敗：${e.message}`, 'error');
     }
 }
 
-async function previewDocChunks(filepath, filename) {
+async function previewDocChunks(documentId, filename) {
+    const projectId = activeProjectId;
+    const revision = knowledgeViewRevision;
+    const requestRevision = ++knowledgeRequestRevisions.preview;
+    if (!projectId || !documentId) {
+        showToast('請先選擇專案與文件。', 'info');
+        return;
+    }
     try {
         chunksPreviewSection.style.display = 'block';
-        chunksPreviewTitle.innerHTML = `<i data-lucide="file-text" style="width: 14px; height: 14px; margin-right: 6px;"></i> 📄 ${escapeHtml(filename)} Chunks 預覽`;
-        chunksList.innerHTML = `<div style="text-align:center; padding:20px; color:var(--text-muted);">載入中...</div>`;
+        chunksPreviewTitle.innerHTML = `<i data-lucide="file-text" style="width: 14px; height: 14px; margin-right: 6px;"></i>${escapeHtml(filename)}：片段預覽`;
+        chunksList.innerHTML = '<div class="empty-files">正在載入文件片段…</div>';
         safeCreateIcons();
         
-        const res = await removedBasicFeature('Knowledge chunks');
-        const data = await res.json();
+        const res = await apiFetch(`${API_BASE}/api/knowledge/documents/${encodeURIComponent(documentId)}/chunks?project_id=${encodeURIComponent(projectId)}`);
+        const data = await knowledgeResponse(res, '無法載入文件片段。');
+        if (activeProjectId !== projectId || revision !== knowledgeViewRevision || requestRevision !== knowledgeRequestRevisions.preview) return;
         
         chunksList.innerHTML = '';
         if (data.chunks && data.chunks.length > 0) {
             data.chunks.forEach((chunk, index) => {
                 const card = document.createElement('div');
                 card.className = 'chunk-card';
-                card.innerHTML = `<strong style="color: var(--primary-color);">[Chunk ${index + 1}]</strong>\n${escapeHtml(chunk)}`;
+                card.innerHTML = `<strong style="color: var(--primary-color);">片段 ${Number(chunk.ordinal) + 1 || index + 1}</strong><span class="chunk-offset">字元 ${Number(chunk.start_offset) || 0}–${Number(chunk.end_offset) || 0}</span>\n${escapeHtml(chunk.text || '')}`;
                 chunksList.appendChild(card);
             });
+            if (data.truncated) {
+                const notice = document.createElement('div');
+                notice.className = 'mm-note';
+                notice.textContent = `目前顯示前 ${data.chunks.length} 個片段；此文件共有 ${Number(data.total_chunks) || data.chunks.length} 個片段。`;
+                chunksList.appendChild(notice);
+            }
         } else {
-            chunksList.innerHTML = `<div style="text-align:center; padding:20px; color:var(--text-muted);">無可用片段</div>`;
+            chunksList.innerHTML = '<div class="empty-files">這份文件沒有可預覽的片段。</div>';
         }
         // 滾動定位到預覽區域
         chunksPreviewSection.scrollIntoView({ behavior: 'smooth' });
     } catch (e) {
         console.error('Preview chunks failed:', e);
+        if (activeProjectId === projectId && revision === knowledgeViewRevision && requestRevision === knowledgeRequestRevisions.preview) {
+            chunksList.innerHTML = `<div class="empty-files error">無法載入片段：${escapeHtml(e.message)}</div>`;
+        }
     }
 }
 
 // 檔案選擇與上傳
 async function handleFilesSelect(files) {
     if (!files || files.length === 0) return;
+    const projectId = activeProjectId;
+    if (!projectId) {
+        setKnowledgeProjectAvailability(null);
+        showToast('請先選擇專案，再匯入知識庫文件。', 'info');
+        fileInput.value = '';
+        return;
+    }
+    if (files.length > 10) {
+        showToast('一次最多只能匯入 10 份文件。', 'error');
+        fileInput.value = '';
+        return;
+    }
     const progressId = `document-upload-${Date.now()}`;
     
     progressContainer.style.display = 'block';
     progressContainer.classList.remove('is-indeterminate');
     progressFill.style.width = '0%';
     
-    const formData = new FormData();
-    for (let i = 0; i < files.length; i++) {
-        formData.append('files', files[i]);
-    }
-    if (currentSessionId) formData.append('session_id', currentSessionId);
+    const knowledgeRunId = createClientRunId();
+    let consentProposalId = '';
     
     progressFilename.textContent = files.length === 1 ? `正在匯入: ${files[0].name}` : `正在匯入 ${files.length} 個檔案...`;
     progressPercent.textContent = '10%';
@@ -3007,83 +3215,83 @@ async function handleFilesSelect(files) {
     });
 
     try {
-        const xhr = new XMLHttpRequest();
-        throw new Error('Knowledge upload is not available in Basic Chat mode.');
-        
-        xhr.upload.onprogress = (e) => {
-            if (e.lengthComputable) {
-                const percent = Math.round((e.loaded / e.total) * 80) + 10;
-                progressPercent.textContent = `${percent}%`;
-                progressFill.style.width = `${percent}%`;
-                updateTaskProgress(progressId, { detail: '正在上傳檔案', mode: 'determinate', value: percent });
+        progressContainer.classList.add('is-indeterminate');
+        progressPercent.textContent = '建立索引';
+        updateTaskProgress(progressId, { detail: '正在解析文件並建立索引', mode: 'indeterminate', value: null });
+        let data;
+        while (true) {
+            const formData = new FormData();
+            for (let i = 0; i < files.length; i++) formData.append('files', files[i]);
+            formData.append('project_id', projectId);
+            formData.append('run_id', knowledgeRunId);
+            formData.append('requested_model', 'knowledge-workspace');
+            if (consentProposalId) formData.append('consent_proposal_id', consentProposalId);
+            const response = await apiFetch(`${API_BASE}/api/knowledge/documents`, {
+                method: 'POST',
+                body: formData
+            });
+            try {
+                data = await knowledgeResponse(response, '文件匯入失敗。');
+                break;
+            } catch (error) {
+                consentProposalId = await approveKnowledgeDataConsent(error);
             }
-        };
-
-        xhr.upload.onload = () => {
-            progressContainer.classList.add('is-indeterminate');
-            progressPercent.textContent = '建立索引';
-            updateTaskProgress(progressId, { detail: '上傳完成，正在解析並建立索引', mode: 'indeterminate', value: null });
-        };
-
-        xhr.onload = async () => {
-            if (xhr.status === 200) {
-                progressContainer.classList.remove('is-indeterminate');
-                progressPercent.textContent = '100%';
-                progressFill.style.width = '100%';
-                finishTaskProgress(progressId, 'completed', '文件已完成索引');
-                
-                setTimeout(() => {
-                    progressContainer.style.display = 'none';
-                }, 1000);
-
-                await loadKBFiles();
-                loadRagStatus(); // P1-2
-            } else {
-                showToast('檔案上傳失敗：' + xhr.statusText);
-                progressContainer.classList.remove('is-indeterminate');
-                progressContainer.style.display = 'none';
-                finishTaskProgress(progressId, 'failed', `文件匯入失敗：HTTP ${xhr.status}`);
-            }
-        };
-
-        xhr.onerror = () => {
-            showToast('連線失敗，無法上傳檔案。');
-            progressContainer.classList.remove('is-indeterminate');
+        }
+        progressContainer.classList.remove('is-indeterminate');
+        progressPercent.textContent = '100%';
+        progressFill.style.width = '100%';
+        const importedCount = Array.isArray(data.documents) ? data.documents.length : files.length;
+        finishTaskProgress(progressId, 'completed', `已完成 ${importedCount} 份文件的索引`);
+        if (activeProjectId !== projectId) {
             progressContainer.style.display = 'none';
-            finishTaskProgress(progressId, 'failed', '無法連接後端服務');
-        };
-
-        xhr.send(formData);
+            showToast('文件已匯入原先選擇的專案；目前畫面已切換至其他專案。', 'success');
+            return;
+        }
+        showToast(`已將 ${importedCount} 份文件匯入目前專案。`, 'success');
+        await Promise.all([loadKBFiles(), loadRagStatus()]);
+        if (document.getElementById('kb-pane-index')?.classList.contains('active')) await renderKbIndexSettings();
+        setTimeout(() => { progressContainer.style.display = 'none'; }, 800);
     } catch (e) {
         console.error('Upload failed:', e);
         progressContainer.classList.remove('is-indeterminate');
         progressContainer.style.display = 'none';
         finishTaskProgress(progressId, 'failed', e.message || '文件匯入失敗');
+        showToast(`文件匯入失敗：${e.message}`, 'error');
+        if (activeProjectId === projectId) await Promise.all([loadKBFiles(), loadRagStatus()]);
+    } finally {
+        fileInput.value = '';
     }
 }
 
-// P1-9：清空知識庫唯一入口（全前端統一呼叫此函式；語意 = 清空索引與已上傳暫存檔）
+// 清空目前專案知識庫的唯一入口；後端仍以 project_id 執行隔離。
 async function clearRagIndex() {
-    const res = await removedBasicFeature('Knowledge index reset');
-    const data = await res.json();
-    if (!data.success) throw new Error(data.detail || '清空失敗');
-    await loadKBFiles();
-    await loadRagStatus();
+    const projectId = activeProjectId;
+    if (!projectId) throw new Error('請先選擇專案。');
+    const res = await apiFetch(`${API_BASE}/api/knowledge?project_id=${encodeURIComponent(projectId)}`, { method: 'DELETE' });
+    const data = await knowledgeResponse(res, '清空知識庫失敗。');
+    if (activeProjectId === projectId) await Promise.all([loadKBFiles(), loadRagStatus()]);
+    return { ...(data.removed || { document_count: 0, chunk_count: 0 }), project_id: projectId };
 }
 
-// 清空整個知識庫
+// 清空目前專案知識庫
 async function handleClearDatabase() {
     confirmModal.classList.remove('active');
     const progressId = `rag-clear-${Date.now()}`;
-    updateTaskProgress(progressId, { label: '清除知識庫索引', detail: '正在移除向量索引與暫存文件', mode: 'indeterminate', value: null });
+    updateTaskProgress(progressId, { label: '清除目前專案知識庫', detail: '正在移除文件索引與片段', mode: 'indeterminate', value: null });
     try {
-        await clearRagIndex(); // P1-9：統一入口
-        chunksPreviewSection.style.display = 'none';
-        showToast('知識庫已全部清空！');
-        finishTaskProgress(progressId, 'completed', '知識庫索引已清除');
+        const removed = await clearRagIndex();
+        if (activeProjectId === removed.project_id) {
+            chunksPreviewSection.style.display = 'none';
+            document.getElementById('kb-test-results').innerHTML = '';
+            showToast(`已清空目前專案知識庫（${Number(removed.document_count) || 0} 份文件）。`, 'success');
+        } else {
+            showToast(`已清空原先選擇專案的知識庫（${Number(removed.document_count) || 0} 份文件）。`, 'success');
+        }
+        finishTaskProgress(progressId, 'completed', '指定專案的知識庫索引已清除');
     } catch (e) {
         console.error('Clear db failed:', e);
         finishTaskProgress(progressId, 'failed', e.message || '清除知識庫失敗');
+        showToast(`清空失敗：${e.message}`, 'error');
     }
 }
 
@@ -3181,6 +3389,78 @@ async function retryRunFromInspector(runId, run = {}) {
         preventDefault() {},
         retryOfRunId: runId,
         retryModel: run.model || null,
+    });
+}
+
+let activeModelDataConsentFinish = null;
+
+function requestModelDataConsent(detail = {}) {
+    const dialog = document.getElementById('model-data-consent-dialog');
+    if (!dialog || typeof dialog.showModal !== 'function') {
+        return Promise.resolve('cancel');
+    }
+    if (activeModelDataConsentFinish) activeModelDataConsentFinish('cancel');
+
+    const provider = String(detail.provider || '未識別的雲端供應商');
+    const model = String(detail.model || detail.selected_model || '未識別模型');
+    const risk = String(detail.risk || '文件片段將離開本機，傳送至雲端供應商處理。');
+    const consequences = Array.isArray(detail.consequences) && detail.consequences.length
+        ? detail.consequences.map(item => String(item))
+        : ['文件內容將受該供應商的服務條款、留存與稽核政策約束。'];
+    document.getElementById('model-data-consent-provider').textContent = provider;
+    document.getElementById('model-data-consent-model').textContent = model;
+    document.getElementById('model-data-consent-data-type').textContent = String(detail.data_type_label || '圖片或文件內容');
+    document.getElementById('model-data-consent-risk').textContent = risk;
+    const list = document.getElementById('model-data-consent-consequences');
+    list.replaceChildren(...consequences.map(item => {
+        const li = document.createElement('li');
+        li.textContent = item;
+        return li;
+    }));
+
+    return new Promise(resolve => {
+        let settled = false;
+        const cancelButton = document.getElementById('model-data-consent-cancel');
+        const onceButton = document.getElementById('model-data-consent-once');
+        const rememberButton = document.getElementById('model-data-consent-remember');
+        const canRememberProject = Boolean(detail.project_id);
+        const onCancel = event => {
+            event.preventDefault();
+            finish('cancel');
+        };
+        const onClose = () => finish(dialog.returnValue || 'cancel', false);
+        const finish = (choice, closeDialog = true) => {
+            if (settled) return;
+            settled = true;
+            cancelButton.removeEventListener('click', onCancelClick);
+            onceButton.removeEventListener('click', onOnce);
+            rememberButton.removeEventListener('click', onRemember);
+            dialog.removeEventListener('cancel', onCancel);
+            dialog.removeEventListener('close', onClose);
+            if (activeModelDataConsentFinish === finish) activeModelDataConsentFinish = null;
+            if (closeDialog && dialog.open) dialog.close(choice);
+            resolve(choice);
+        };
+        const onCancelClick = () => finish('cancel');
+        const onOnce = () => finish('once');
+        const onRemember = () => finish('remember');
+        activeModelDataConsentFinish = finish;
+        rememberButton.disabled = !canRememberProject;
+        rememberButton.title = canRememberProject ? '' : '請先將對話指派到專案，才能記住資料上雲政策。';
+        cancelButton.addEventListener('click', onCancelClick);
+        onceButton.addEventListener('click', onOnce);
+        rememberButton.addEventListener('click', onRemember);
+        dialog.addEventListener('cancel', onCancel);
+        dialog.addEventListener('close', onClose);
+        dialog.returnValue = '';
+        try {
+            dialog.showModal();
+        } catch (_) {
+            finish('cancel', false);
+            return;
+        }
+        safeCreateIcons();
+        setTimeout(() => onceButton.focus(), 0);
     });
 }
 
@@ -3310,7 +3590,9 @@ async function handleChatSubmit(e) {
         const payload = {
             model: retryModel || modelSelect.value,
             messages: getLLMMessages(),
-            use_rag: BASIC_CHAT_MODE ? false : ragToggle.checked,
+            // 獨立對話沒有專案索引；即使相容控制項被外部程式改值，
+            // 也絕不送出無範圍的知識檢索要求。
+            use_rag: !!activeProjectId && ragToggle.checked,
             session_id: currentSessionId,
             images: imagesToSend,
             temporary_context: temporaryContextText || "",
@@ -3335,29 +3617,50 @@ async function handleChatSubmit(e) {
             let conflict = {};
             try { conflict = await response.json(); } catch (_) { break; }
             const detail = conflict.detail || {};
-            if (detail.code !== 'MODEL_ROUTE_APPROVAL_REQUIRED' || !detail.detail?.proposal_id) {
-                const failure = new Error(detail.message || `HTTP error! status: ${response.status}`);
-                failure.code = detail.code;
-                failure.detail = detail.detail;
-                throw failure;
+            if (!detail.detail?.proposal_id) {
+                throw chatResponseError(response, detail);
             }
             const proposal = detail.detail;
-            const approved = window.confirm(
-                `目前模型不適合這項工作。\n\n建議改用：${proposal.selected_model}\n原因：${proposal.reason || '能力需求'}\n\n按「確定」只批准本次切換。`
-            );
-            if (!approved) throw new Error('使用者取消模型切換。');
+            let rememberProject = false;
+            if (detail.code === 'MODEL_ROUTE_APPROVAL_REQUIRED') {
+                const approved = window.confirm(
+                    `目前模型不適合這項工作。\n\n建議改用：${proposal.selected_model}\n原因：${proposal.reason || '能力需求'}\n\n按「確定」只批准本次切換。`
+                );
+                if (!approved) {
+                    const cancelled = new Error('已保留原模型，尚未送出新的模型請求。');
+                    cancelled.code = 'MODEL_ROUTE_CANCELLED';
+                    cancelled.actions = [{ id: 'choose_model', label: '選擇其他模型' }];
+                    throw cancelled;
+                }
+            } else if (detail.code === 'MODEL_DATA_CONSENT_REQUIRED') {
+                const consentChoice = await requestModelDataConsent(proposal);
+                if (consentChoice === 'cancel') {
+                    const cancelled = new Error('你已取消資料上雲；本次未將任何圖片或文件內容送往雲端。');
+                    cancelled.code = 'MODEL_DATA_CONSENT_CANCELLED';
+                    cancelled.actions = [
+                        { id: 'model_data_policy', label: '檢視預算與選模政策' },
+                        { id: 'choose_model', label: '改用其他模型' }
+                    ];
+                    throw cancelled;
+                }
+                rememberProject = consentChoice === 'remember';
+            } else {
+                throw chatResponseError(response, detail);
+            }
             const approvalResponse = await apiFetch(`${API_BASE}/api/model-routing/proposals/${encodeURIComponent(proposal.proposal_id)}/approve`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ remember_project: false }),
+                body: JSON.stringify({ remember_project: rememberProject }),
                 signal: chatAbort.signal
             });
-            if (!approvalResponse.ok) throw new Error('模型切換批准已逾時或無法送達。');
+            if (!approvalResponse.ok) throw new Error('批准已逾時、政策已變更或無法送達；尚未傳送資料。');
             payload.routing_proposal_id = proposal.proposal_id;
         }
         
         if (!response.ok) {
-            throw new Error(`HTTP error! status: ${response.status}`);
+            let payload = {};
+            try { payload = await response.json(); } catch (_) { /* 使用狀態碼產生安全錯誤 */ }
+            throw chatResponseError(response, payload.detail || payload);
         }
         
         const reader = response.body.getReader();
@@ -3993,6 +4296,7 @@ async function handleChatSubmit(e) {
                                 const action = button.dataset.providerErrorAction;
                                 if (action === 'update_key' || action === 'provider_settings') window.workbenchCloudLlm?.openTab?.('connections');
                                 else if (action === 'view_usage') window.workbenchCloudLlm?.openTab?.('health');
+                                else if (action === 'model_data_policy') window.workbenchCloudLlm?.openTab?.('budgets');
                                 else if (action === 'choose_model') openModelManager('routing');
                             }));
                         }
@@ -4021,6 +4325,22 @@ async function handleChatSubmit(e) {
             setAssistantResponsePhase(assistantMsgEl, 'clear');
             thoughtChainVisualizer.classList.remove('active');
             bubbleEl.insertAdjacentHTML('beforeend', '<div class="answer-ragnote">已停止生成（本輪回覆未完整）。</div>');
+        } else if (['MODEL_ROUTE_CANCELLED', 'MODEL_DATA_CONSENT_CANCELLED'].includes(error?.code)) {
+            chatProgressStatus = 'cancelled';
+            window.workbenchRunInspector?.handleEvent('cancelled', {
+                run_id: currentChatRunId,
+                message: error.message,
+            }, streamIdentity || {});
+            agentCollaborationState.running = false;
+            if (thinkingEl) thinkingEl.remove();
+            setAssistantResponsePhase(assistantMsgEl, 'clear');
+            if (
+                userMessageAddedToConversation
+                && conversationState.length > 0
+                && conversationState[conversationState.length - 1].role === 'user'
+            ) conversationState.pop();
+            bubbleEl.innerHTML = renderConnectionErrorCard(error, retryModel || modelSelect.value);
+            bindChatRecoveryActions(bubbleEl);
         } else {
             chatProgressStatus = 'failed';
             window.workbenchRunInspector?.markError(error, { retryAllowed: false });
@@ -4038,11 +4358,8 @@ async function handleChatSubmit(e) {
             ) {
                 conversationState.pop();
             }
-            bubbleEl.innerHTML = renderConnectionErrorCard();
-            bubbleEl.querySelector('[data-recovery-action="reload"]')
-                ?.addEventListener('click', () => location.reload());
-            bubbleEl.querySelector('[data-recovery-action="settings"]')
-                ?.addEventListener('click', () => document.getElementById('btn-settings-trigger')?.click());
+            bubbleEl.innerHTML = renderConnectionErrorCard(error, retryModel || modelSelect.value);
+            bindChatRecoveryActions(bubbleEl);
         }
     } finally {
         finishTaskProgress(
@@ -4298,6 +4615,12 @@ function renderSources(messageEl, sources) {
     sources.forEach((source, index) => {
         const scoreLabel = formatSourceScore(source);
         const pageText = source.page ? ` (第 ${source.page} 頁)` : '';
+        const citation = source.citation || {};
+        const ordinal = Number.isFinite(Number(citation.ordinal)) ? `片段 ${Number(citation.ordinal) + 1}` : '知識片段';
+        const hasOffsets = Number.isFinite(Number(citation.start_offset)) && Number.isFinite(Number(citation.end_offset));
+        const location = hasOffsets
+            ? `${ordinal} · 字元 ${Number(citation.start_offset)}–${Number(citation.end_offset)}`
+            : ordinal;
         sourcesListHtml += `
             <div class="source-item">
                 <div class="source-item-header">
@@ -4305,7 +4628,7 @@ function renderSources(messageEl, sources) {
                     <span class="source-name" title="${escapeHtml(source.source)}">${escapeHtml(source.source)}${pageText}</span>
                     <span class="source-score">${scoreLabel}</span>
                 </div>
-                <div class="source-item-content">${escapeHtml(source.content)}</div>
+                <div class="source-item-content">${escapeHtml(location)}。片段原文不會複製到對話紀錄或匯出檔。</div>
             </div>
         `;
     });
@@ -5202,6 +5525,143 @@ async function runRuntimeRebuild(apply) {
     }
 }
 
+function ragProviderCandidates(providers, modelKind) {
+    return (Array.isArray(providers) ? providers : []).filter(provider => (
+        provider
+        && String(provider.id || '').trim()
+        && String(provider.selected_model || '').trim()
+        && String(provider.model_kind || '').trim().toLowerCase() === modelKind
+    ));
+}
+
+function replaceRagBackendOptions(select, providers, modelKind, desiredValue) {
+    if (!select) return;
+    select.replaceChildren();
+    const baseline = document.createElement('option');
+    baseline.value = 'baseline';
+    baseline.textContent = '本機保守基線（不需下載模型）';
+    const local = document.createElement('option');
+    local.value = 'local';
+    local.textContent = modelKind === 'embedding'
+        ? '使用既有本機 Embedding 模型'
+        : '使用既有本機 Reranker 模型';
+    select.append(baseline, local);
+    ragProviderCandidates(providers, modelKind).forEach(provider => {
+        const option = document.createElement('option');
+        option.value = `provider:${String(provider.id).trim().toLowerCase()}`;
+        const connectionState = provider.enabled === true ? '' : '（連線目前停用）';
+        option.textContent = `${provider.label || provider.id} — ${provider.selected_model}${connectionState}`;
+        select.appendChild(option);
+    });
+    select.value = [...select.options].some(option => option.value === desiredValue)
+        ? desiredValue
+        : 'baseline';
+}
+
+function syncRagBackendExplanation(select, localWrap, localPath, status, modelKind) {
+    if (!select) return;
+    const choice = String(select.value || 'baseline');
+    const usesLocalModel = choice === 'local';
+    if (localWrap) localWrap.hidden = !usesLocalModel;
+    if (localPath) localPath.disabled = !usesLocalModel;
+    if (!status) return;
+    if (usesLocalModel) {
+        status.textContent = '只使用你指定且已存在的本機模型；Workbench 不會自動下載或安裝。';
+    } else if (choice.startsWith('provider:')) {
+        status.textContent = modelKind === 'embedding'
+            ? '文件與查詢可能送往所選模型服務；第一次把專案文件送到雲端前仍須取得專案同意。'
+            : '候選片段可能送往所選模型服務；第一次把專案內容送到雲端前仍須取得專案同意。';
+    } else {
+        status.textContent = modelKind === 'embedding'
+            ? '預設只在本機建立基本索引，不會把文件送到雲端。'
+            : '預設使用本機規則排序，不會新增外部資料傳送。';
+    }
+}
+
+function refreshRagModelBackendOptions(providers, savedSettings = null) {
+    const embeddingDesired = savedSettings
+        ? (savedSettings.rag_local_embedding_model_path
+            ? 'local'
+            : savedSettings.rag_embedding_provider_id
+                ? `provider:${String(savedSettings.rag_embedding_provider_id).toLowerCase()}`
+                : 'baseline')
+        : (settingRagEmbeddingBackend?.value || 'baseline');
+    const rerankerDesired = savedSettings
+        ? (savedSettings.rag_local_reranker_model_path
+            ? 'local'
+            : savedSettings.rag_reranker_provider_id
+                ? `provider:${String(savedSettings.rag_reranker_provider_id).toLowerCase()}`
+                : 'baseline')
+        : (settingRagRerankerBackend?.value || 'baseline');
+    replaceRagBackendOptions(
+        settingRagEmbeddingBackend,
+        providers,
+        'embedding',
+        embeddingDesired
+    );
+    replaceRagBackendOptions(
+        settingRagRerankerBackend,
+        providers,
+        'rerank',
+        rerankerDesired
+    );
+    if (savedSettings) {
+        if (settingRagEmbeddingLocalPath) {
+            settingRagEmbeddingLocalPath.value = savedSettings.rag_local_embedding_model_path || '';
+        }
+        if (settingRagRerankerLocalPath) {
+            settingRagRerankerLocalPath.value = savedSettings.rag_local_reranker_model_path || '';
+        }
+    }
+    syncRagBackendExplanation(
+        settingRagEmbeddingBackend,
+        settingRagEmbeddingLocalWrap,
+        settingRagEmbeddingLocalPath,
+        settingRagEmbeddingStatus,
+        'embedding'
+    );
+    syncRagBackendExplanation(
+        settingRagRerankerBackend,
+        settingRagRerankerLocalWrap,
+        settingRagRerankerLocalPath,
+        settingRagRerankerStatus,
+        'rerank'
+    );
+}
+
+function collectRagModelBackendSettings() {
+    const collectOne = (select, pathInput, providerField, pathField, label) => {
+        const choice = String(select?.value || 'baseline');
+        const result = { [providerField]: '', [pathField]: '' };
+        if (choice === 'local') {
+            const path = String(pathInput?.value || '').trim();
+            if (!path || !(/^[A-Za-z]:[\\/]/.test(path) || path.startsWith('/'))) {
+                throw new Error(`${label}請輸入已存在的本機模型絕對路徑。`);
+            }
+            result[pathField] = path;
+        } else if (choice.startsWith('provider:')) {
+            result[providerField] = choice.slice('provider:'.length);
+        }
+        return result;
+    };
+    return {
+        ...collectOne(
+            settingRagEmbeddingBackend,
+            settingRagEmbeddingLocalPath,
+            'rag_embedding_provider_id',
+            'rag_local_embedding_model_path',
+            '文件語意索引：'
+        ),
+        ...collectOne(
+            settingRagRerankerBackend,
+            settingRagRerankerLocalPath,
+            'rag_reranker_provider_id',
+            'rag_local_reranker_model_path',
+            '候選片段重新排序：'
+        )
+    };
+}
+
 function initSettingsControls() {
     const sizeStorageKey = 'settings-modal-size';
     const defaultSize = { width: 1040, height: 760 };
@@ -5412,6 +5872,24 @@ function initSettingsControls() {
     settingRagThreshold.addEventListener('input', () => {
         valRagThreshold.textContent = parseFloat(settingRagThreshold.value).toFixed(2);
     });
+    settingRagEmbeddingBackend?.addEventListener('change', () => {
+        syncRagBackendExplanation(
+            settingRagEmbeddingBackend,
+            settingRagEmbeddingLocalWrap,
+            settingRagEmbeddingLocalPath,
+            settingRagEmbeddingStatus,
+            'embedding'
+        );
+    });
+    settingRagRerankerBackend?.addEventListener('change', () => {
+        syncRagBackendExplanation(
+            settingRagRerankerBackend,
+            settingRagRerankerLocalWrap,
+            settingRagRerankerLocalPath,
+            settingRagRerankerStatus,
+            'rerank'
+        );
+    });
     settingSubagentEnabled?.addEventListener('change', syncSubagentSettingsEnabled);
     settingSubagentEnabled?.addEventListener('change', () => updateSubagentResourcePlan());
     [settingSubagentPlannerModel, settingSubagentExplorerModel, settingSubagentImplementerModel, settingSubagentCriticModel, settingSubagentCloudRouting, settingSubagentMaxParallel]
@@ -5477,6 +5955,14 @@ function initSettingsControls() {
             invalidateProviderToolAttestation(card);
         }
     });
+    modelProviderList?.addEventListener('change', () => {
+        refreshRagModelBackendOptions(collectModelProviders());
+    });
+    modelProviderList?.addEventListener('click', event => {
+        if (event.target.closest('[data-remove-provider]')) {
+            queueMicrotask(() => refreshRagModelBackendOptions(collectModelProviders()));
+        }
+    });
     // 4. 儲存設定邏輯
     btnSettingsSave.addEventListener('click', async () => {
         await updateSubagentResourcePlan(true);
@@ -5487,6 +5973,13 @@ function initSettingsControls() {
             mcpServers = collectMcpServerSettings(editedMcpServers);
         } catch (error) {
             showToast(`MCP JSON 格式錯誤：${error.message}`, 'error');
+            return;
+        }
+        let ragModelBackends = {};
+        try {
+            ragModelBackends = collectRagModelBackendSettings();
+        } catch (error) {
+            showToast(error.message, 'error');
             return;
         }
         const payload = {
@@ -5502,6 +5995,7 @@ function initSettingsControls() {
             default_vision_model: settingVisionModel.value.trim() || 'gemma4-hermes:latest',
             rag_k: parseInt(settingRagK.value),
             rag_rerank_threshold: parseFloat(settingRagThreshold.value),
+            ...ragModelBackends,
             chunk_size: parseInt(settingChunkSize.value) || 600,
             chunk_overlap: parseInt(settingChunkOverlap.value) || 120,
             browser_headless: !settingBrowserHeadful.checked,
@@ -5511,8 +6005,11 @@ function initSettingsControls() {
             agent_detailed_progress: BASIC_CHAT_MODE ? false : settingAgentDetailedProgress.checked,
             skills_enabled: BASIC_CHAT_MODE ? false : settingSkillsEnabled.checked,
             agent_max_tool_calls: parseInt(settingAgentMaxToolCalls.value) || 8,
-            agent_max_repair_rounds: BASIC_CHAT_MODE ? 0 : (Number.isFinite(parseInt(settingAgentMaxRepairRounds.value)) ? parseInt(settingAgentMaxRepairRounds.value) : 3),
-            agent_auto_validate: BASIC_CHAT_MODE ? false : settingAgentAutoValidate.checked,
+            agent_max_repair_rounds: Number.isFinite(parseInt(settingAgentMaxRepairRounds.value)) ? parseInt(settingAgentMaxRepairRounds.value) : 2,
+            agent_auto_validate: settingAgentAutoValidate.checked,
+            answer_verification_mode: ['warn', 'strict', 'off'].includes(settingAnswerVerificationMode?.value)
+                ? settingAnswerVerificationMode.value
+                : 'warn',
             agent_allow_workspace_write: BASIC_CHAT_MODE ? false : settingAgentAllowWorkspaceWrite.checked,
             agent_final_report_detail: settingAgentFinalReportDetail.value || 'standard',
             settings_modal_width: currentSettingsSize.width,
@@ -5614,6 +6111,7 @@ async function loadSettingsFromServer() {
 
         settingOllamaUrl.value = data.ollama_url || '';
         await loadModelProviderSettings(data.model_providers || []);
+        refreshRagModelBackendOptions(data.model_providers || [], data);
         settingModelInputCost.value = data.model_input_cost_per_million ?? 0;
         settingModelOutputCost.value = data.model_output_cost_per_million ?? 0;
         settingModelCostCurrency.value = data.model_cost_currency || 'USD';
@@ -5642,8 +6140,11 @@ async function loadSettingsFromServer() {
         settingAgentDetailedProgress.checked = data.agent_detailed_progress !== false;
         settingSkillsEnabled.checked = data.skills_enabled !== false;
         settingAgentMaxToolCalls.value = data.agent_max_tool_calls ?? 8;
-        settingAgentMaxRepairRounds.value = data.agent_max_repair_rounds ?? 3;
+        settingAgentMaxRepairRounds.value = data.agent_max_repair_rounds ?? 2;
         settingAgentAutoValidate.checked = data.agent_auto_validate !== false;
+        settingAnswerVerificationMode.value = ['warn', 'strict', 'off'].includes(data.answer_verification_mode)
+            ? data.answer_verification_mode
+            : 'warn';
         settingAgentAllowWorkspaceWrite.checked = data.agent_allow_workspace_write !== false;
         settingAgentFinalReportDetail.value = data.agent_final_report_detail || 'standard';
         settingSubagentEnabled.checked = data.subagent_enabled !== false; settingSubagentCloudRouting.checked = !!data.subagent_allow_planner_cloud_routing;
@@ -5669,7 +6170,7 @@ async function loadSettingsFromServer() {
 /* ==========================================================================
    WORKBENCH SHELL 模組（Fable5 UX 執行文件）
    Top Bar chips / Icon Rail / Drawer / Inspector / Wizard / Model Manager /
-   Knowledge Center / Command Palette / Toast / Metrics
+   知識庫工作區／指令面板／通知／指標
    ========================================================================== */
 
 // ---- 全域狀態 ----
@@ -5705,16 +6206,89 @@ function showToast(message, type = 'info', actions = null) {
 }
 
 // 連線失敗 Recovery Card（P13：錯誤必須包含下一步）
-function renderConnectionErrorCard() {
+function chatResponseError(response, detail = {}) {
+    const safeDetail = detail && typeof detail === 'object' ? detail : {};
+    const failure = new Error(safeDetail.message || `模型請求失敗（HTTP ${response.status}）。`);
+    failure.code = safeDetail.code || `HTTP_${response.status}`;
+    failure.detail = safeDetail.detail;
+    failure.status = response.status;
+    const detailActions = safeDetail.detail?.actions;
+    failure.actions = Array.isArray(safeDetail.actions)
+        ? safeDetail.actions
+        : Array.isArray(detailActions) ? detailActions : [];
+    return failure;
+}
+
+function chatRecoveryProfile(error, model = '') {
+    const code = String(error?.code || '');
+    const normalizedModel = String(model || '').trim();
+    const providerId = normalizedModel.includes('::') ? normalizedModel.split('::', 1)[0] : '';
+    const isOllamaModel = !!normalizedModel && !normalizedModel.includes('::');
+    if (code === 'MODEL_ROUTE_CANCELLED') {
+        return {
+            title: '已取消模型切換',
+            message: error.message,
+            actions: error.actions || [{ id: 'choose_model', label: '選擇其他模型' }]
+        };
+    }
+    if (code === 'MODEL_DATA_CONSENT_CANCELLED') {
+        return {
+            title: '已取消資料上雲',
+            message: error.message,
+            actions: error.actions || [
+                { id: 'model_data_policy', label: '檢視預算與選模政策' },
+                { id: 'choose_model', label: '改用其他模型' }
+            ]
+        };
+    }
+    if ((code.startsWith('PROVIDER_') || code.startsWith('MODEL_PROVIDER_') || providerId) && !isOllamaModel) {
+        const providerName = providerId ? providerId.toUpperCase() : '雲端模型';
+        return {
+            title: `${providerName} 目前無法完成請求`,
+            message: error?.message || '請檢查模型健康、API 額度與模型權限。',
+            actions: error?.actions?.length ? error.actions : [
+                { id: 'provider_health', label: '查看用量與健康' },
+                { id: 'provider_settings', label: '檢查 API 連線' },
+                { id: 'choose_model', label: '改用其他模型' }
+            ]
+        };
+    }
+    if (code.startsWith('OLLAMA_') || isOllamaModel) {
+        return {
+            title: '無法連線至本機 Ollama 模型服務',
+            message: error?.message || '請確認 Ollama 已啟動，並重新檢查模型狀態。',
+            actions: [{ id: 'reload', label: '重新檢查' }, { id: 'settings', label: '開啟設定' }]
+        };
+    }
+    return {
+        title: '無法連線至 Workbench 後端服務',
+        message: error?.message || '請確認 Workbench 後端仍在執行。',
+        actions: [{ id: 'reload', label: '重新檢查' }, { id: 'settings', label: '開啟設定' }]
+    };
+}
+
+function renderConnectionErrorCard(error = null, model = '') {
+    const profile = chatRecoveryProfile(error, model);
     return `
-        <div>
-            <div style="font-weight:600; color: var(--danger-color); margin-bottom:6px;">無法連線至本地 LLM 後端服務</div>
-            <div style="font-size:12.5px; color: var(--text-light); line-height:1.7;">可能原因：FastAPI 後端或 Ollama 尚未啟動。</div>
+        <div class="provider-error-card">
+            <div style="font-weight:600; color: var(--danger-color); margin-bottom:6px;">${escapeHtml(profile.title)}</div>
+            <div style="font-size:12.5px; color: var(--text-light); line-height:1.7;">${escapeHtml(profile.message)}</div>
             <div class="toast-actions" style="margin-top:10px; display:flex; gap:8px;">
-                <button data-recovery-action="reload" style="border:1px solid var(--panel-border); background:var(--ink-03); color:var(--text-primary); font-family:inherit; font-size:12px; padding:5px 10px; border-radius:7px; cursor:pointer;">重新檢查</button>
-                <button data-recovery-action="settings" style="border:1px solid var(--panel-border); background:var(--ink-03); color:var(--text-primary); font-family:inherit; font-size:12px; padding:5px 10px; border-radius:7px; cursor:pointer;">開啟設定</button>
+                ${profile.actions.map(action => `<button data-recovery-action="${escapeHtml(action.id)}" style="border:1px solid var(--panel-border); background:var(--ink-03); color:var(--text-primary); font-family:inherit; font-size:12px; padding:5px 10px; border-radius:7px; cursor:pointer;">${escapeHtml(action.label)}</button>`).join('')}
             </div>
         </div>`;
+}
+
+function bindChatRecoveryActions(container) {
+    container?.querySelectorAll('[data-recovery-action]').forEach(button => button.addEventListener('click', () => {
+        const action = button.dataset.recoveryAction;
+        if (action === 'reload') location.reload();
+        else if (action === 'settings') document.getElementById('btn-settings-trigger')?.click();
+        else if (action === 'provider_settings' || action === 'update_key') window.workbenchCloudLlm?.openTab?.('connections');
+        else if (action === 'provider_health' || action === 'view_usage') window.workbenchCloudLlm?.openTab?.('health');
+        else if (action === 'model_data_policy') window.workbenchCloudLlm?.openTab?.('budgets');
+        else if (action === 'choose_model') openModelManager('routing');
+    }));
 }
 
 // ---- 生成狀態 UI（送出鈕 ↔ 停止鈕、genstate 列）----
@@ -5811,13 +6385,18 @@ function updateRagChip() {
 }
 function updateDocsChip() {
     const el = document.getElementById('chip-docs-text');
-    if (el) el.textContent = kbStatus.index_status === 'ready'
-        ? `${kbStatus.document_count} docs · ${kbStatus.chunk_count} chunks`
-        : '0 docs';
+    if (el) {
+        if (kbStatus.index_status === 'project_required') el.textContent = '尚未選擇專案';
+        else if (kbStatus.reindex_required) el.textContent = `${kbStatus.document_count} 份文件 · 索引需重建`;
+        else if (kbStatus.index_status === 'ready') el.textContent = `${kbStatus.document_count} 份文件 · ${kbStatus.chunk_count} 個片段`;
+        else el.textContent = '0 份文件';
+    }
     const dsKb = document.getElementById('ds-kb');
-    if (dsKb) dsKb.textContent = kbStatus.index_status === 'ready'
-        ? `${kbStatus.document_count} 文件 · ${kbStatus.chunk_count} chunks`
-        : '空白（尚未匯入文件）';
+    if (dsKb) dsKb.textContent = kbStatus.reindex_required
+        ? `${kbStatus.document_count} 份文件 · 索引需重建`
+        : kbStatus.index_status === 'ready'
+            ? `${kbStatus.document_count} 份文件 · ${kbStatus.chunk_count} 個片段`
+            : '空白（尚未匯入文件）';
 }
 
 // ---- Start Dashboard（P6）----
@@ -5856,6 +6435,8 @@ function updateWelcomeDashboard() {
         ctaPrimary.textContent = '開始詢問知識庫';
         ctaPrimary.onclick = () => {
             ragToggle.checked = true;
+            saveKnowledgeRetrievalPreference(true, activeProjectId);
+            if (kbChatRetrievalToggle) kbChatRetrievalToggle.checked = true;
             updateRagChip();
             userInput.focus();
         };
@@ -6687,51 +7268,134 @@ async function applyModelSwitch(setDefault) {
     }
 }
 
-// ---- Knowledge Center（P11）----
-function openKnowledgeCenter(tab = 'documents') {
-    kbManagerModal.classList.add('active');
-    document.querySelectorAll('.mm-tab[data-kbtab]').forEach(t => t.classList.toggle('active', t.dataset.kbtab === tab));
-    document.querySelectorAll('.kb-pane').forEach(p => p.classList.remove('active'));
-    const pane = document.getElementById(`kb-pane-${tab}`);
-    if (pane) pane.classList.add('active');
-    if (tab === 'index') renderKbIndexSettings();
-    loadKBFiles();
-    loadRagStatus();
+// ---- 專案知識庫工作區 ----
+function switchKnowledgeTab(tab = 'documents') {
+    const selected = ['documents', 'retrieval', 'index'].includes(tab) ? tab : 'documents';
+    document.querySelectorAll('.mm-tab[data-kbtab]').forEach(button => {
+        const active = button.dataset.kbtab === selected;
+        button.classList.toggle('active', active);
+        button.setAttribute('aria-selected', String(active));
+        button.tabIndex = active ? 0 : -1;
+    });
+    document.querySelectorAll('.kb-pane').forEach(pane => {
+        const active = pane.id === `kb-pane-${selected}`;
+        pane.classList.toggle('active', active);
+        pane.hidden = !active;
+    });
+    if (selected === 'index') void renderKbIndexSettings();
 }
+
+function openKnowledgeCenter(tab = 'documents') {
+    setPrimaryWorkspace('knowledge');
+    switchKnowledgeTab(tab);
+    setKnowledgeProjectAvailability(activeProjectId);
+    void Promise.all([loadKBFiles(), loadRagStatus()]).then(() => {
+        if (tab === 'index') return renderKbIndexSettings();
+        return null;
+    });
+    document.getElementById('knowledge-workspace-title')?.focus();
+}
+
 async function renderKbIndexSettings() {
     const el = document.getElementById('kb-index-settings');
     if (!el) return;
+    const projectId = activeProjectId;
+    const requestRevision = ++knowledgeRequestRevisions.index;
+    if (!projectId) {
+        el.innerHTML = '<div class="mm-note">請先選擇專案。</div>';
+        return;
+    }
+    el.innerHTML = '<div class="mm-note">正在讀取目前專案的索引狀態…</div>';
     try {
-        const res = await apiFetch(`${API_BASE}/api/settings`);
-        const d = await res.json();
+        const res = await apiFetch(`${API_BASE}/api/knowledge/status?project_id=${encodeURIComponent(projectId)}`);
+        const d = await knowledgeResponse(res, '無法載入索引狀態。');
+        if (activeProjectId !== projectId || requestRevision !== knowledgeRequestRevisions.index) return;
+        const limitText = Number.isFinite(Number(d.max_chunk_count))
+            ? `${Number(d.chunk_count) || 0} / ${Number(d.max_chunk_count) || 0}`
+            : '未提供';
+        const currentAdapterChunks = Number(d.current_adapter_chunk_count) || 0;
+        const statusText = d.reindex_required
+            ? '需重新建立索引'
+            : d.index_status === 'degraded'
+            ? '需清理'
+            : d.index_status === 'ready'
+                ? (d.limit_status === 'reached' ? '可檢索，已達上限' : '可檢索')
+                : '尚無內容';
+        const reindexNotice = d.reindex_required
+            ? `<div class="mm-note knowledge-reindex-warning"><strong>Embedding 已變更，需重新匯入／重建索引。</strong><br>現有 ${Number(d.chunk_count) || 0} 個片段中，只有 ${currentAdapterChunks} 個使用目前的 Embedding。重新匯入原文件後，Workbench 會以目前設定安全重建向量。</div>`
+            : '';
+        const rerankerPolicy = d.reranker_failure_mode === 'fail_closed'
+            ? '重排失敗時會停止本次檢索，不會使用未重排結果。'
+            : '重排失敗時會自動改用 Embedding 相似度排序，並標記為降級結果。';
         el.innerHTML = `
-            <div class="mm-card"><div class="mm-card-info"><div class="mm-card-meta" style="font-size:12.5px; line-height:2;">
-                Embedding model：本地 HuggingFace（後端設定）<br>
-                Chunk size：${d.chunk_size ?? 600}<br>
-                Overlap：${d.chunk_overlap ?? 120}<br>
-                Top K（rag_k）：${d.rag_k ?? 4}<br>
-                Rerank threshold：${d.rag_rerank_threshold ?? 0.2}
-            </div></div></div>`;
+            ${reindexNotice}
+            <div class="knowledge-status-grid">
+                <article><span>索引狀態</span><strong>${statusText}</strong></article>
+                <article><span>文件數</span><strong>${Number(d.document_count) || 0}</strong></article>
+                <article><span>片段數</span><strong>${Number(d.chunk_count) || 0}</strong></article>
+                <article><span>目前 Embedding 可用片段</span><strong>${currentAdapterChunks}</strong></article>
+                <article><span>容量</span><strong>${limitText}</strong></article>
+            </div>
+            <div class="mm-card"><div class="mm-card-info">
+                <div class="mm-card-name">嵌入方式</div>
+                <div class="mm-card-meta">${escapeHtml(d.embedding_adapter || '目前無法取得')}</div>
+            </div></div>
+            <div class="mm-card"><div class="mm-card-info">
+                <div class="mm-card-name">結果重排</div>
+                <div class="mm-card-meta">${d.reranker ? escapeHtml(d.reranker) : '未啟用；目前依 Embedding 相似度排序'}<br>${rerankerPolicy}</div>
+            </div></div>`;
     } catch (e) {
-        el.innerHTML = '<div class="mm-note">無法載入設定（後端未連線）。</div>';
+        if (activeProjectId === projectId && requestRevision === knowledgeRequestRevisions.index) el.innerHTML = `<div class="mm-note">無法載入索引狀態：${escapeHtml(e.message)}</div>`;
     }
 }
+
 async function runRetrievalTest() {
     const q = document.getElementById('kb-test-query').value.trim();
     const out = document.getElementById('kb-test-results');
+    const button = document.getElementById('kb-test-run');
+    const projectId = activeProjectId;
+    if (button.disabled) return;
+    const requestRevision = ++knowledgeRequestRevisions.retrieval;
+    if (!projectId) {
+        setKnowledgeProjectAvailability(null);
+        showToast('請先選擇專案，再測試知識檢索。', 'info');
+        return;
+    }
     if (!q) { showToast('請先輸入測試問題', 'info'); return; }
     const progressId = `retrieval-test-${Date.now()}`;
-    out.innerHTML = '<div class="mm-note">檢索中...</div>';
-    updateTaskProgress(progressId, { label: '測試知識庫檢索', detail: '正在向量化問題並搜尋索引', mode: 'indeterminate', value: null });
+    const knowledgeRunId = createClientRunId();
+    let consentProposalId = '';
+    out.innerHTML = '<div class="mm-note">正在比對目前專案的知識片段…</div>';
+    button.disabled = true;
+    updateTaskProgress(progressId, { label: '測試知識庫檢索', detail: '正在建立問題向量並搜尋目前專案索引', mode: 'indeterminate', value: null });
     try {
-        const res = await removedBasicFeature('Knowledge retrieval test', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ query: q, top_k: 5, rerank: true })
-        });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const data = await res.json();
-        const results = data.results || data.sources || [];
+        let data;
+        while (true) {
+            const res = await apiFetch(`${API_BASE}/api/knowledge/retrieve`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    project_id: projectId,
+                    query: q,
+                    top_k: 5,
+                    candidate_limit: 40,
+                    run_id: knowledgeRunId,
+                    requested_model: 'knowledge-workspace',
+                    consent_proposal_id: consentProposalId
+                })
+            });
+            try {
+                data = await knowledgeResponse(res, '檢索測試失敗。');
+                break;
+            } catch (error) {
+                consentProposalId = await approveKnowledgeDataConsent(error);
+            }
+        }
+        if (activeProjectId !== projectId || requestRevision !== knowledgeRequestRevisions.retrieval) {
+            finishTaskProgress(progressId, 'completed', '原專案檢索已完成；因專案已切換，不顯示舊結果');
+            return;
+        }
+        const results = Array.isArray(data.results) ? data.results : [];
         if (!results.length) {
             out.innerHTML = '<div class="mm-note">沒有檢索到相關片段。</div>';
             finishTaskProgress(progressId, 'completed', '檢索完成，沒有相符片段');
@@ -6739,13 +7403,16 @@ async function runRetrievalTest() {
         }
         out.innerHTML = results.map((r, i) => `
             <div class="kb-source-hit">
-                <div class="hit-head"><span>${i + 1}. ${escapeHtml(r.source || '')}${r.page ? ` p.${r.page}` : ''}</span><span class="hit-score">${formatSourceScore(r, '')}</span></div>
-                <div class="hit-text">${escapeHtml((r.content || '').slice(0, 200))}...</div>
+                <div class="hit-head"><span>${i + 1}. ${escapeHtml(r.source || '未命名文件')} · 片段 ${Number(r.citation?.ordinal) + 1 || 1}</span><span class="hit-score">相似度 ${Number(r.score || 0).toFixed(3)}</span></div>
+                <div class="hit-text">${escapeHtml((r.content || '').slice(0, 600))}</div>
+                <div class="hit-citation">來源識別：${escapeHtml(r.citation?.source_id || '')} · 字元 ${Number(r.citation?.start_offset) || 0}–${Number(r.citation?.end_offset) || 0}</div>
             </div>`).join('');
         finishTaskProgress(progressId, 'completed', `檢索完成，共 ${results.length} 個結果`);
     } catch (e) {
-        out.textContent = `檢索測試不可用：${e.message || 'Basic Chat mode'}`;
+        if (activeProjectId === projectId && requestRevision === knowledgeRequestRevisions.retrieval) out.textContent = `檢索測試失敗：${e.message || '知識庫服務未連線'}`;
         finishTaskProgress(progressId, 'failed', e.message || '檢索測試失敗');
+    } finally {
+        if (requestRevision === knowledgeRequestRevisions.retrieval) button.disabled = false;
     }
 }
 
@@ -6818,7 +7485,7 @@ const PALETTE_ACTIONS = [
     { label: '切換模型', icon: 'box', run: () => openModelManager('installed') },
     { label: '安裝模型', icon: 'download', run: () => openModelManager('recommended') },
     { label: '管理雲端 LLM API', icon: 'cloud-cog', run: () => window.workbenchCloudLlm?.open() },
-    { label: '開啟 Knowledge Center', icon: 'book-open', run: () => openKnowledgeCenter('documents') },
+    { label: '開啟知識庫工作區', icon: 'book-open', run: () => openKnowledgeCenter('documents') },
     { label: '執行檢索測試', icon: 'search', run: () => openKnowledgeCenter('retrieval') },
     { label: '開啟 Artifact 工作區', icon: 'code-xml', run: () => { activateChatForAuxiliaryPanel(); openInspector('artifact'); } },
     { label: '開新任務（新對話）', icon: 'plus', run: () => createNewSession() },
@@ -6884,6 +7551,10 @@ function initA11y() {
             } else if (primaryWorkspace === 'extensions') {
                 e.preventDefault();
                 window.workbenchExtensions?.close?.();
+            } else if (primaryWorkspace === 'knowledge') {
+                e.preventDefault();
+                setPrimaryWorkspace('chat');
+                document.getElementById('rail-knowledge')?.focus();
             } else if (primaryWorkspace === 'models') {
                 e.preventDefault();
                 closeModelManager();
@@ -6956,16 +7627,18 @@ function activateChatForAuxiliaryPanel() {
 }
 
 function setPrimaryWorkspace(workspace = 'chat') {
-    const supportedWorkspaces = new Set(['chat', 'workflows', 'extensions', 'models', 'cloud', 'mlops']);
+    const supportedWorkspaces = new Set(['chat', 'workflows', 'knowledge', 'extensions', 'models', 'cloud', 'mlops']);
     const nextWorkspace = supportedWorkspaces.has(workspace) ? workspace : 'chat';
     const workflowMode = nextWorkspace === 'workflows';
+    const knowledgeMode = nextWorkspace === 'knowledge';
     const extensionMode = nextWorkspace === 'extensions';
     const modelMode = nextWorkspace === 'models';
     const cloudMode = nextWorkspace === 'cloud';
     const mlopsMode = nextWorkspace === 'mlops';
-    const managementMode = extensionMode || modelMode || cloudMode || mlopsMode;
+    const managementMode = knowledgeMode || extensionMode || modelMode || cloudMode || mlopsMode;
     const chatWorkspace = document.querySelector('main.chat-container');
     const workflowCenter = document.getElementById('n8n-workflow-center');
+    const knowledgeCenter = document.getElementById('knowledge-workspace');
     const extensionCenter = document.getElementById('extension-center-workspace');
     const modelCenter = document.getElementById('model-manager-workspace');
     const cloudCenter = document.getElementById('cloud-llm-workspace');
@@ -6973,23 +7646,25 @@ function setPrimaryWorkspace(workspace = 'chat') {
     const drawer = document.getElementById('chat-drawer');
     const railChat = document.getElementById('rail-chat');
     const railWorkflows = document.getElementById('rail-workflows');
+    const railKnowledge = document.getElementById('rail-knowledge');
     const railExtensions = document.getElementById('rail-extensions');
     const railModels = document.getElementById('rail-models');
     const railCloud = document.getElementById('rail-cloud-llm');
     const railMlops = document.getElementById('rail-mlops');
-    if (!chatWorkspace || !workflowCenter || !extensionCenter || !modelCenter || !cloudCenter || !mlopsCenter || !drawer
-        || !railChat || !railWorkflows || !railExtensions || !railModels || !railCloud || !railMlops) return;
+    if (!chatWorkspace || !workflowCenter || !knowledgeCenter || !extensionCenter || !modelCenter || !cloudCenter || !mlopsCenter || !drawer
+        || !railChat || !railWorkflows || !railKnowledge || !railExtensions || !railModels || !railCloud || !railMlops) return;
 
     const previousWorkspace = primaryWorkspace;
-    const previousManagementMode = ['extensions', 'models', 'cloud', 'mlops'].includes(previousWorkspace);
+    const previousManagementMode = ['knowledge', 'extensions', 'models', 'cloud', 'mlops'].includes(previousWorkspace);
     if (previousWorkspace === 'cloud' && nextWorkspace !== 'cloud' && !cloudCenter.hidden) {
         void window.workbenchCloudLlm?.deactivate?.();
     }
     primaryWorkspace = nextWorkspace;
+    renderTaskProgress();
     if (managementMode && !previousManagementMode) {
         runInspectorSuspendedWorkspace = previousWorkspace;
     }
-    const activeManagementRail = extensionMode ? railExtensions : (modelMode ? railModels : (cloudMode ? railCloud : railMlops));
+    const activeManagementRail = knowledgeMode ? railKnowledge : (extensionMode ? railExtensions : (modelMode ? railModels : (cloudMode ? railCloud : railMlops)));
     window.workbenchRunInspector?.setAvailable?.(!managementMode, {
         focusTarget: managementMode ? activeManagementRail : null,
     });
@@ -7001,6 +7676,7 @@ function setPrimaryWorkspace(workspace = 'chat') {
 
     chatWorkspace.hidden = nextWorkspace !== 'chat';
     workflowCenter.hidden = !workflowMode;
+    knowledgeCenter.hidden = !knowledgeMode;
     extensionCenter.hidden = !extensionMode;
     modelCenter.hidden = !modelMode;
     cloudCenter.hidden = !cloudMode;
@@ -7010,6 +7686,7 @@ function setPrimaryWorkspace(workspace = 'chat') {
     const workspaceRails = new Map([
         ['chat', railChat],
         ['workflows', railWorkflows],
+        ['knowledge', railKnowledge],
         ['extensions', railExtensions],
         ['models', railModels],
         ['cloud', railCloud],
@@ -7035,6 +7712,8 @@ function setPrimaryWorkspace(workspace = 'chat') {
         return;
     }
 
+    knowledgeViewRevision += 1;
+
     if (
         window.matchMedia('(max-width: 900px)').matches
         && !drawer.classList.contains('collapsed')
@@ -7053,11 +7732,15 @@ function initWorkbench(status) {
     const workbenchBody = document.querySelector('.workbench-body');
     const modelWorkspace = document.getElementById('model-manager-workspace');
     const mlopsWorkspace = document.getElementById('mlops-workspace');
+    const knowledgeWorkspace = document.getElementById('knowledge-workspace');
     if (workbenchBody && modelWorkspace && modelWorkspace.parentElement !== workbenchBody) {
         workbenchBody.appendChild(modelWorkspace);
     }
     if (workbenchBody && mlopsWorkspace && mlopsWorkspace.parentElement !== workbenchBody) {
         workbenchBody.appendChild(mlopsWorkspace);
+    }
+    if (workbenchBody && knowledgeWorkspace && knowledgeWorkspace.parentElement !== workbenchBody) {
+        workbenchBody.appendChild(knowledgeWorkspace);
     }
     window.workbenchMLOps?.init({
         apiFetch, apiBase: API_BASE, showToast,
@@ -7242,13 +7925,18 @@ function initWorkbench(status) {
     document.getElementById('ms-cancel').addEventListener('click', () => { document.getElementById('model-switch-modal').classList.remove('active'); pendingSwitchModel = null; });
     document.getElementById('ms-close').addEventListener('click', () => { document.getElementById('model-switch-modal').classList.remove('active'); pendingSwitchModel = null; });
 
-    // Knowledge Center tabs
-    document.querySelectorAll('.mm-tab[data-kbtab]').forEach(t => t.addEventListener('click', () => {
-        document.querySelectorAll('.mm-tab[data-kbtab]').forEach(x => x.classList.toggle('active', x === t));
-        document.querySelectorAll('.kb-pane').forEach(p => p.classList.remove('active'));
-        document.getElementById(`kb-pane-${t.dataset.kbtab}`).classList.add('active');
-        if (t.dataset.kbtab === 'index') renderKbIndexSettings();
-    }));
+    // 專案知識庫分頁
+    const knowledgeTabs = Array.from(document.querySelectorAll('.mm-tab[data-kbtab]'));
+    knowledgeTabs.forEach((tab, index) => {
+        tab.addEventListener('click', () => switchKnowledgeTab(tab.dataset.kbtab));
+        tab.addEventListener('keydown', event => {
+            if (!['ArrowLeft', 'ArrowRight'].includes(event.key)) return;
+            event.preventDefault();
+            const next = (index + (event.key === 'ArrowRight' ? 1 : knowledgeTabs.length - 1)) % knowledgeTabs.length;
+            switchKnowledgeTab(knowledgeTabs[next].dataset.kbtab);
+            knowledgeTabs[next].focus();
+        });
+    });
     document.getElementById('kb-test-run').addEventListener('click', runRetrievalTest);
     document.getElementById('kb-test-query').addEventListener('keydown', (e) => { if (e.key === 'Enter') runRetrievalTest(); });
 
@@ -7263,8 +7951,16 @@ function initWorkbench(status) {
     document.getElementById('palette-input').addEventListener('input', (e) => renderPalette(e.target.value));
     document.getElementById('command-palette').addEventListener('click', (e) => { if (e.target.id === 'command-palette') closePalette(); });
 
-    // RAG 開關同步（隱藏 checkbox 仍是單一真相來源）
-    ragToggle.addEventListener('change', updateRagChip);
+    // 專案知識開關同步；隱藏的相容控制項仍是聊天請求的單一真相來源。
+    ragToggle.addEventListener('change', () => {
+        if (kbChatRetrievalToggle) kbChatRetrievalToggle.checked = ragToggle.checked;
+        saveKnowledgeRetrievalPreference(ragToggle.checked);
+        updateRagChip();
+    });
+    kbChatRetrievalToggle?.addEventListener('change', () => {
+        ragToggle.checked = kbChatRetrievalToggle.checked;
+        ragToggle.dispatchEvent(new Event('change'));
+    });
 
     initA11y();
     updateRagChip();

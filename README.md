@@ -12,12 +12,14 @@ Local AI Workbench 是一套以 Windows 與本機優先為核心的 AI Agent 工
 
 - **本機與多模型聊天**：支援 Ollama，以及相容 OpenAI API 的模型供應商。
 - **Project 工作空間**：依專案管理對話、Session、知識、設定與執行範圍。
-- **Skills 與 Agent 協作**：可為不同專案配置 Skills，並檢視 Agent 的規劃、執行與結果。
-- **知識與文件處理**：提供文件匯入、檢索與專案知識輔助能力。
+- **Skills 與多步驟 Agent**：可為不同專案配置 Skills；明確的多步驟要求會建立有界計畫，逐步執行，並驗證工具成功、非空輸出、相依步驟與安全停止等結構條件。
+- **專案知識檢索**：提供文件匯入、增量索引、專案隔離檢索與可追溯引用；預設採本機保守基線，也可選擇既有本機 Embedding／Reranker 模型或受治理的模型服務。
+- **回答事實核對**：Basic Chat 可依專案知識的證據標記核對最終回答，並提供提醒、嚴格與關閉三種模式；預設核對器是保守的本機基線，不等同通用事實查核服務。
 - **外掛程式中心**：集中管理安裝、信任、啟停、健康狀態、權限與 Audit。
 - **安全工具執行**：工具依目前 Project、Connection 與資源範圍動態提供；外部寫入必須經過使用者批准。
 - **本機 MCP 擴充**：支援經信任的本機 `stdio` MCP Tool，並以獨立程序隔離故障。
 - **MLOps 工作區**：以共用執行、政策、產物與健康契約管理本機資料集、實驗、訓練及模型版本。
+- **可稽核能力評估**：可把正式 Basic Chat 執行轉成已遮罩、具來源證明的評估證據，再交由版本化 Gate 判定。
 - **Windows 桌面體驗**：提供 Launcher、響應式工作區、執行檢查器與本機更新流程。
 
 ## 外掛與服務整合
@@ -94,3 +96,5 @@ docs/         各功能的詳細設計、操作與治理文件
 Get-ChildItem frontend -Filter *.js | ForEach-Object { node --check $_.FullName }
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\check_public_tree.ps1
 ```
+
+Agent 能力另有 24 題離線評測契約與 fail-closed Gate；執行方式與門檻請見 [Agent 能力評測](evals/README.md)。CI 的確定性 contract smoke 只驗證證據鏈、政策情境及部分產品核心前置條件，不代表任何正式模型或完整聊天 Runtime 已通過；正式成績仍須由候選 Runtime 的權威 Run collector／adapter 產生。

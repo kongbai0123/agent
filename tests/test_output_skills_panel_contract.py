@@ -1,4 +1,5 @@
 from pathlib import Path
+import re
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -55,7 +56,10 @@ def test_floating_output_uses_its_own_vertical_tab_toggle():
     assert "if (toggle && state.activeTab === name && state.expanded)" in RUN_INSPECTOR_JS
     for key in ("ArrowDown", "ArrowUp", "Home", "End", "Enter"):
         assert key in RUN_INSPECTOR_JS
-    assert "app.js?v=0.9.0-model-catalog-beta.4" in INDEX_HTML
+    backend_app = (ROOT / "backend" / "app.py").read_text(encoding="utf-8")
+    version = re.search(r'^APP_VERSION = "([^"]+)"$', backend_app, re.MULTILINE)
+    assert version
+    assert f"app.js?v={version.group(1)}" in INDEX_HTML
     assert "run-inspector.js?v=1.0.3" in INDEX_HTML
 
 
@@ -219,7 +223,7 @@ def test_output_panel_tracks_workspace_escape_focus_and_runtime_resize():
         "function initWorkbench",
     )
     assert "workbenchRunInspector?.setAvailable?.(!managementMode" in workspace
-    assert "const managementMode = extensionMode || modelMode || cloudMode" in workspace
+    assert "const managementMode = knowledgeMode || extensionMode || modelMode || cloudMode" in workspace
     assert "runInspectorSuspendedWorkspace === primaryWorkspace" in workspace
     assert "workflowMode && !returningToSuspendedWorkspace" in workspace
     assert "syncChatDrawerA11y(drawer)" in workspace

@@ -200,7 +200,10 @@ def test_right_surface_z_index_layers_are_ordered_and_cache_is_bumped():
     assert values["z-popover"] < values["z-modal"] < values["z-toast"]
     assert "z-index: var(--z-popover)" in _rule(".slash-commands-menu {")
     assert "z-index: var(--z-modal)" in _rule(".modal-overlay {")
-    assert "style.css?v=0.9.0-model-catalog-beta.4" in INDEX_HTML
+    backend_app = (ROOT / "backend" / "app.py").read_text(encoding="utf-8")
+    version = re.search(r'^APP_VERSION = "([^"]+)"$', backend_app, re.MULTILINE)
+    assert version
+    assert f"style.css?v={version.group(1)}" in INDEX_HTML
 
 
 def test_compact_primary_navigation_scrolls_instead_of_clipping_features():

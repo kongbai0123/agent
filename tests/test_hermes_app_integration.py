@@ -16,7 +16,7 @@ if str(ROOT / "backend") not in sys.path:
 
 import app as app_module  # noqa: E402
 from chat import runtime as chat_runtime  # noqa: E402
-from hermes import HermesRunSnapshot, SSEEvent  # noqa: E402
+from hermes import HermesRunSnapshot, HermesUnavailableError, SSEEvent  # noqa: E402
 from hermes_integration import HermesIntegrationDecision  # noqa: E402
 from hermes_project_skills_bridge import HermesProjectSkillsAttachment  # noqa: E402
 
@@ -156,6 +156,33 @@ class _UnavailableCache:
         return None
 
 
+class _FallbackRagManager(_Manager):
+    def __init__(self, project_id: str) -> None:
+        super().__init__()
+        self.project_id = project_id
+        self.start_calls = []
+
+    def prepare_project_skills(
+        self, session_id, query, *, run_id, consume_turn
+    ):
+        self.prepare_calls.append((session_id, query, run_id, consume_turn))
+        return HermesProjectSkillsAttachment(
+            session_id=session_id,
+            project_id=self.project_id,
+            workbench_run_id=run_id,
+            instructions="",
+            sources=(),
+            truncated=False,
+        )
+
+    def start_run(self, **kwargs):
+        self.start_calls.append(dict(kwargs))
+        raise HermesUnavailableError("offline before submission")
+
+    def fallback_allowed(self, _run_id, _exc, *, token_emitted):
+        return not token_emitted
+
+
 class _BasicResponse:
     status_code = 200
     text = ""
@@ -276,6 +303,110 @@ def test_enabled_but_unavailable_sidecar_keeps_basic_chat_working(monkeypatch):
     assert [name for name, _ in events] == ["meta", "token", "metrics", "done"]
     assert events[0][1]["runtime"] == "chat"
     assert events[1][1]["content"] == "basic fallback answer"
+
+
+def test_hermes_presubmission_fallback_keeps_rag_context_and_safe_sources(monkeypatch):
+    real_settings = app_module.load_settings()
+    settings = {
+        **real_settings,
+        "hermes_enabled": True,
+        "hermes_rollout_mode": "all",
+        "rag_k": 4,
+        "rag_rerank_threshold": 0.0,
+    }
+    suffix = uuid.uuid4().hex[:12]
+    project_id = f"project-hermes-rag-{suffix}"
+    session_id = f"session-hermes-rag-{suffix}"
+    run_id = f"run_hermes_rag_{suffix}"
+    rag_text = "FALLBACK-RAG-CONTEXT-MUST-REACH-BASIC"
+    manager = _FallbackRagManager(project_id)
+    cache = _Cache(manager)
+    captured_payloads = []
+
+    monkeypatch.setattr(app_module, "load_settings", lambda: dict(settings))
+    monkeypatch.setattr(app_module, "hermes_manager_cache", cache)
+    monkeypatch.setattr(
+        app_module,
+        "loaded_models_snapshot",
+        lambda *_args, **_kwargs: set(),
+    )
+    monkeypatch.setattr(
+        app_module.knowledge_service,
+        "retrieve",
+        lambda **_kwargs: [
+            {
+                "text": rag_text,
+                "score": 0.95,
+                "citation": {
+                    "project_id": project_id,
+                    "document_id": "document-fallback",
+                    "chunk_id": "chunk-fallback",
+                    "title": "Fallback reference",
+                    "chunk_sha256": "c" * 64,
+                },
+            }
+        ],
+    )
+
+    def basic_post(_settings, payload, **_kwargs):
+        captured_payloads.append(payload)
+        return _BasicResponse()
+
+    monkeypatch.setattr(chat_runtime, "provider_post_chat", basic_post)
+
+    with TestClient(app_module.app) as client:
+        assert client.get("/").status_code == 200
+        app_module.database.create_project(project_id, project_id, str(ROOT))
+        app_module.database.create_session(session_id, project_id=project_id)
+        response = client.post(
+            "/api/chat",
+            json={
+                "session_id": session_id,
+                "model": "route-test-model",
+                "message": "Use project knowledge",
+                "use_rag": True,
+                "run_id": run_id,
+            },
+        )
+
+    assert response.status_code == 200
+    events = _events(response.text)
+    assert [name for name, _ in events] == [
+        "meta",
+        "sources",
+        "validation",
+        "token",
+        "token",
+        "metrics",
+        "done",
+    ]
+    assert events[0][1]["runtime"] == "chat"
+    validation = next(payload for name, payload in events if name == "validation")
+    assert validation["name"] == "answer_factuality"
+    assert validation["status"] == "failed"
+    assert validation["passed"] is False
+    assert validation["summary"] == "回答的事實驗證未通過。"
+    visible = "".join(payload["content"] for name, payload in events if name == "token")
+    assert visible.startswith(chat_runtime.ANSWER_VERIFICATION_WARNING)
+    assert visible.endswith("basic fallback answer")
+    assert rag_text in json.dumps(captured_payloads, ensure_ascii=False)
+    assert rag_text not in response.text
+    assert rag_text in manager.start_calls[0]["base_instructions"]
+    run = app_module.database.get_run(run_id)
+    assistant = app_module.database.get_messages_by_session(session_id)[-1]
+    run_knowledge = [
+        item for item in run["sources"] if item.get("kind") == "project_knowledge"
+    ]
+    message_knowledge = [
+        item for item in assistant["sources"] if item.get("kind") == "project_knowledge"
+    ]
+    assert run["status"] == "completed"
+    assert run_knowledge == message_knowledge
+    assert run_knowledge[0]["content"] == ""
+    assert rag_text not in json.dumps(
+        {"events": run["events"], "sources": run["sources"]},
+        ensure_ascii=False,
+    )
 
 
 def test_emergency_rollback_atomically_disables_rollout_and_tools(monkeypatch):

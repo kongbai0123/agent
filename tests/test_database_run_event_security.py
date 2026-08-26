@@ -199,3 +199,125 @@ def test_git_evidence_preserves_canonical_short_sha_and_success(
         "remote": "origin",
         "success": True,
     }
+
+
+def test_host_plan_evidence_keeps_only_redacted_task_titles_and_statuses(
+    isolated_database,
+) -> None:
+    run_id = _run(isolated_database)
+
+    plan = isolated_database.append_run_event(
+        run_id,
+        "plan",
+        {
+            "run_id": run_id,
+            "project_id": "project-one",
+            "plan_id": "plan_abcdef123456",
+            "planner": "deterministic_fallback_v1",
+            "task_count": 5,
+            "tool_call_limit": 16,
+            "tool_calls_per_step": 2,
+            "wall_seconds": 600,
+            "tasks": [
+                {
+                    "id": "step-01",
+                    "title": "執行需求 1",
+                    "status": "pending",
+                    "instruction": "do not persist full user task text",
+                    "arguments": {"secret": "must-not-persist"},
+                }
+            ],
+        },
+    )
+    update = isolated_database.append_run_event(
+        run_id,
+        "task_update",
+        {
+            "run_id": run_id,
+            "project_id": "project-one",
+            "plan_id": "plan_abcdef123456",
+            "task_id": "step-01",
+            "kind": "tool",
+            "status": "completed",
+            "message": "步驟已完成。",
+            "tool_calls_used": 1,
+            "tool_call_limit": 2,
+            "plan_status": "running",
+        },
+    )
+
+    assert plan["payload"]["task_count"] == 5
+    assert plan["payload"]["tasks"] == [
+        {"id": "step-01", "title": "執行需求 1", "status": "pending"}
+    ]
+    assert "instruction" not in str(plan["payload"])
+    assert "must-not-persist" not in str(plan["payload"])
+    assert update["payload"]["task_id"] == "step-01"
+    assert [item["event"] for item in isolated_database.get_run(run_id)["events"]] == [
+        "plan",
+        "task_update",
+    ]
+
+
+def test_answer_factuality_validation_persists_only_collector_contract(
+    isolated_database,
+) -> None:
+    run_id = _run(isolated_database)
+    record = isolated_database.append_run_event(
+        run_id,
+        "validation",
+        {
+            "run_id": run_id,
+            "project_id": "project-one",
+            "validation_id": f"{run_id}:answer_factuality",
+            "name": "answer_factuality",
+            "status": "failed",
+            "passed": False,
+            "failed": 1,
+            "skipped": 0,
+            "duration_ms": 12.5,
+            "summary": "回答的事實驗證未通過。",
+            "claim_counts": {"unsupported": 1},
+            "claim_text": "不得持久化的宣稱",
+            "evidence_text": "不得持久化的證據",
+        },
+    )
+
+    assert record["payload"] == {
+        "validation_id": f"{run_id}:answer_factuality",
+        "name": "answer_factuality",
+        "status": "failed",
+        "passed": False,
+        "failed": 1,
+        "skipped": 0,
+        "duration_ms": 12.5,
+        "summary": "回答的事實驗證未通過。",
+    }
+    assert "宣稱" not in str(record)
+    assert "證據" not in str(record)
+
+
+def test_run_tasks_are_redacted_on_write_and_reload(isolated_database) -> None:
+    run_id = "run_redacted_plan_12345678"
+    isolated_database.upsert_run(
+        run_id,
+        "session-one",
+        "turn-one",
+        "model-one",
+        "chat",
+        "completed",
+        project_id="project-one",
+        tasks=[
+            {
+                "id": "step-01",
+                "label": "執行需求 1",
+                "status": "completed",
+                "instruction": "private planner instruction",
+                "arguments": {"path": "D:/private"},
+            }
+        ],
+    )
+
+    assert isolated_database.get_run(run_id)["tasks"] == [
+        {"id": "step-01", "label": "執行需求 1", "status": "completed"}
+    ]

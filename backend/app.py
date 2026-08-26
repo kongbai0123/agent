@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -20,10 +21,11 @@ import stat
 import threading
 import time
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
@@ -40,6 +42,7 @@ from api.routes.connectors import (
 )
 from api.routes.extensions import build_extensions_router
 from api.routes.hermes import build_hermes_router
+from api.routes.knowledge import build_knowledge_router
 from api.routes.models import build_models_router
 from api.routes.model_governance import build_model_governance_router
 from api.routes.mlops import build_mlops_router
@@ -112,6 +115,7 @@ from model_client import (
     list_all_models as provider_model_inventory,
     model_profile_for_model,
     provider_for_model,
+    require_provider_enabled,
     uses_local_model_slot,
 )
 from model_governance import (
@@ -150,7 +154,7 @@ from hermes_project_skills_bridge import HermesProjectSkillsAttachment
 from hermes_rollout import HermesRolloutError, HermesRolloutGate
 from hermes_supervisor import HermesHealthSupervisor
 from ollama_cleanup import loaded_models_snapshot
-from paths import PROJECTS_ROOT, REPO_ROOT, RUNTIME_ROOT, ensure_runtime_dirs
+from paths import PROJECTS_ROOT, REPO_ROOT, RUNTIME_ROOT, TEMP_DIR, ensure_runtime_dirs
 from pdf_parser import extract_pdf_text
 from project_storage import (
     attachments_dir as project_attachments_dir,
@@ -162,10 +166,31 @@ from project_storage import (
 )
 from project_skill_runtime import ProjectSkillRuntime
 from project_skills import ProjectSkillError, ProjectSkillStore
+from project_knowledge import ProjectKnowledgeError, ProjectKnowledgeService
 from provider_tools import runtime_tool_definitions as provider_runtime_tool_definitions
+from factual_verifier import (
+    EvidenceBundle,
+    EvidenceRecord,
+    FactualVerificationError,
+)
+from secret_store import get_provider_secret
+from semantic_retrieval import (
+    GovernedProviderEmbeddingAdapter,
+    GovernedProviderRerankerAdapter,
+    GovernedSemanticProviderClient,
+    LocalCrossEncoderRerankerAdapter,
+    LocalSentenceTransformerEmbeddingAdapter,
+    ModelGovernanceSemanticPolicy,
+    OpenAIEmbeddingContract,
+    PassagesRerankContract,
+    SemanticProviderRoute,
+    SemanticConsentRequired,
+    SemanticRetrievalError,
+    semantic_route_from_provider,
+)
 from runtime_manager import export_session_zip
 from startup_progress import complete_startup, read_startup_status, update_startup
-from structured_log import redact
+from structured_log import degraded, redact, redact_text
 from tool_approval_broker import (
     ToolApprovalBroker,
     ToolApprovalBrokerError,
@@ -192,7 +217,7 @@ from workspace import (
 )
 
 
-APP_VERSION = "0.9.0-model-catalog-beta.5"
+APP_VERSION = "0.9.0-model-catalog-beta.7"
 SETTINGS_PATH = str(
     Path(
         os.environ.get("WORKBENCH_SETTINGS_PATH")
@@ -211,7 +236,9 @@ connector_service: Optional[ConnectorService] = None
 host_tool_runtime: Optional[HostToolRuntime] = None
 mcp_coordinator: Optional[MCPSettingsCoordinator] = None
 model_governance: Optional[ModelGovernanceService] = None
+knowledge_service_available = False
 application_event_loop: Optional[asyncio.AbstractEventLoop] = None
+_KNOWLEDGE_RETRIEVAL_SLOTS = threading.BoundedSemaphore(4)
 hook_dispatcher = configure_hook_dispatcher(
     HookDispatcher.from_builtin_plugins([DiagnosticBuiltinHookPlugin()])
 )
@@ -258,6 +285,381 @@ def error_payload(
         "recoverable": recoverable,
         "suggestions": suggestions or [],
     }
+
+
+class _UnavailableProjectKnowledgeService:
+    """Fail the optional knowledge capability without taking down the app.
+
+    The knowledge router is dependency-injected with a service object at import
+    time.  Keeping that contract lets startup degrade cleanly even when the
+    separate knowledge database cannot be opened.  Reads, writes and project
+    deletion cleanup all fail closed so metadata cannot become detached from
+    an index that the host was unable to inspect.
+    """
+
+    available = False
+    embedding_adapter_id = "unavailable"
+
+    def __init__(self, reason: str = "") -> None:
+        self.reason = str(reason or "knowledge_service_initialization_failed")[:200]
+
+    @staticmethod
+    def _raise_unavailable() -> None:
+        raise ProjectKnowledgeError(
+            "Project knowledge is temporarily unavailable.",
+            code="KNOWLEDGE_SERVICE_UNAVAILABLE",
+            status_code=503,
+        )
+
+    def configure_chunking(self, **_kwargs: Any) -> None:
+        return None
+
+    @contextmanager
+    def project_delete_guard(self, **_kwargs: Any):
+        self._raise_unavailable()
+        yield
+
+    def clear_project(self, **_kwargs: Any) -> Dict[str, int]:
+        self._raise_unavailable()
+
+    def status(self, **_kwargs: Any) -> Dict[str, Any]:
+        self._raise_unavailable()
+
+    def list_documents(self, **_kwargs: Any) -> List[Dict[str, Any]]:
+        self._raise_unavailable()
+
+    def import_document(self, **_kwargs: Any) -> Dict[str, Any]:
+        self._raise_unavailable()
+
+    def import_documents(self, **_kwargs: Any) -> List[Dict[str, Any]]:
+        self._raise_unavailable()
+
+    def document_chunks(self, **_kwargs: Any) -> List[Dict[str, Any]]:
+        self._raise_unavailable()
+
+    def document_chunk_count(self, **_kwargs: Any) -> int:
+        self._raise_unavailable()
+
+    def delete_document(self, **_kwargs: Any) -> bool:
+        self._raise_unavailable()
+
+    def retrieve(self, **_kwargs: Any) -> List[Dict[str, Any]]:
+        self._raise_unavailable()
+
+
+def _initialize_project_knowledge_service(
+    path: Path,
+    *,
+    chunk_chars: int,
+    overlap_chars: int,
+    settings: Optional[Dict[str, Any]] = None,
+) -> tuple[Any, bool]:
+    try:
+        embedding_adapter = None
+        reranker = None
+        if settings is not None:
+            embedding_adapter, reranker = _project_knowledge_adapters(settings)
+        return (
+            ProjectKnowledgeService(
+                path,
+                chunk_chars=chunk_chars,
+                overlap_chars=overlap_chars,
+                embedding_adapter=embedding_adapter,
+                reranker=reranker,
+            ),
+            True,
+        )
+    except Exception as exc:  # noqa: BLE001 - knowledge is an optional capability
+        degraded("project_knowledge", "initialize project knowledge service", exc)
+        return _UnavailableProjectKnowledgeService(str(exc)), False
+
+
+def _semantic_provider_config(
+    settings: Dict[str, Any], provider_id: str
+) -> Dict[str, Any]:
+    requested = str(provider_id or "").strip().casefold()
+    if not requested:
+        raise SemanticRetrievalError(
+            "Semantic provider ID is required.",
+            code="SEMANTIC_PROVIDER_CONFIG_INVALID",
+            status_code=422,
+        )
+    for raw in settings.get("model_providers") or []:
+        if (
+            isinstance(raw, dict)
+            and str(raw.get("id") or "").strip().casefold() == requested
+        ):
+            return dict(raw)
+    raise SemanticRetrievalError(
+        "Configured semantic provider was not found.",
+        code="SEMANTIC_PROVIDER_CONFIG_INVALID",
+        status_code=422,
+    )
+
+
+def _semantic_route(
+    provider: Dict[str, Any], *, capability: str
+) -> SemanticProviderRoute:
+    configured = dict(provider)
+    provider_type = str(configured.get("provider_type") or "").strip().casefold()
+    model_id = str(configured.get("selected_model") or "").strip()
+    if provider_type == "nvidia":
+        parts = model_id.split("/", 1)
+        short_model = parts[1] if len(parts) == 2 else parts[0]
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,199}", short_model):
+            raise SemanticRetrievalError(
+                "NVIDIA semantic model ID is invalid.",
+                code="SEMANTIC_PROVIDER_CONFIG_INVALID",
+                status_code=422,
+            )
+        prefix = f"/v1/retrieval/nvidia/{short_model}"
+        configured.update(
+            {
+                "base_url": f"https://ai.api.nvidia.com{prefix}",
+                "embedding_endpoint": f"{prefix}/embeddings",
+                "rerank_endpoint": f"{prefix}/reranking",
+                "document_input_type": "passage",
+                "query_input_type": "query",
+            }
+        )
+    return semantic_route_from_provider(configured, capability=capability)
+
+
+def _semantic_provider_access_check(
+    route: SemanticProviderRoute,
+    *,
+    capability: str,
+) -> Any:
+    """Return a per-call gate that rejects stale routes and Extension state."""
+
+    def check(provider_id: str, project_id: str) -> None:
+        current = load_settings()
+        provider = _semantic_provider_config(current, provider_id)
+        try:
+            current_route = _semantic_route(provider, capability=capability)
+        except SemanticRetrievalError as exc:
+            raise PermissionError(
+                "Semantic provider configuration changed; restart required."
+            ) from exc
+        if current_route != route:
+            raise PermissionError(
+                "Semantic provider configuration changed; restart required."
+            )
+        require_provider_enabled(current, provider_id, project_id=project_id)
+
+    return check
+
+
+def _governed_semantic_client(
+    route: SemanticProviderRoute,
+    *,
+    capability: str,
+) -> GovernedSemanticProviderClient:
+    governance = globals().get("model_governance")
+    if governance is None:
+        raise SemanticRetrievalError(
+            "Model governance is unavailable.",
+            code="SEMANTIC_GOVERNANCE_UNAVAILABLE",
+            status_code=503,
+        )
+    return GovernedSemanticProviderClient(
+        route,
+        governance=governance,
+        access_policy=ModelGovernanceSemanticPolicy(governance),
+        provider_access_check=_semantic_provider_access_check(
+            route, capability=capability
+        ),
+        secret_resolver=get_provider_secret,
+    )
+
+
+def _semantic_consent_failure(exc: BaseException) -> Optional[SemanticConsentRequired]:
+    """Find the trusted semantic-consent cause without parsing error text."""
+
+    current: Optional[BaseException] = exc
+    visited: set[int] = set()
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        if isinstance(current, SemanticConsentRequired):
+            return current
+        current = current.__cause__ or current.__context__
+    return None
+
+
+def _semantic_consent_proposal(
+    *,
+    project_id: str,
+    run_id: str,
+    requested_model: str,
+    failure: SemanticConsentRequired,
+) -> Dict[str, Any]:
+    """Create the same explicit data-disclosure contract used by chat models."""
+
+    provider_id = str(failure.provider_id or "").strip().casefold()
+    selected_model = str(failure.model_reference or "").strip()
+    if not provider_id or not selected_model:
+        raise GovernanceError(
+            "MODEL_DATA_CONSENT_UNAVAILABLE",
+            "語意模型未提供可驗證的同意範圍。",
+            status_code=503,
+        )
+    proposal = model_governance.create_data_consent_proposal(
+        project_id=project_id,
+        run_id=run_id,
+        requested_model=requested_model,
+        selected_model=selected_model,
+        provider_id=provider_id,
+        data_types=("documents",),
+    )
+    return {
+        **proposal,
+        "data_type": ["documents"],
+        "data_type_label": "專案文件內容",
+        "risk": "專案文件片段將離開本機，傳送至所列雲端語意模型處理。",
+        "consequences": [
+            "供應商會依其服務條款處理文件片段，可能受其留存與稽核政策影響。",
+            "文件若含機密、個資或未公開資訊，可能造成不適當的外部揭露。",
+            "選擇「記住此專案」後，同一專案傳送至這個供應商的文件可依政策自動處理。",
+        ],
+        "actions": [
+            {"id": "model_data_policy", "label": "檢視預算與選模政策"},
+            {"id": "knowledge_settings", "label": "改用本機 Embedding"},
+        ],
+        "consent_target": "semantic_retrieval",
+    }
+
+
+def _knowledge_semantic_consent_proposal(
+    *,
+    project_id: str,
+    run_id: str,
+    requested_model: str,
+    error: BaseException,
+) -> Optional[Dict[str, Any]]:
+    """Best-effort proposal bridge for the standalone Knowledge workspace."""
+
+    failure = _semantic_consent_failure(error)
+    if failure is None:
+        return None
+    try:
+        return _semantic_consent_proposal(
+            project_id=project_id,
+            run_id=run_id,
+            requested_model=requested_model,
+            failure=failure,
+        )
+    except (AttributeError, GovernanceError, ValueError, sqlite3.Error):
+        return None
+
+
+def _project_knowledge_adapters(
+    settings: Dict[str, Any],
+) -> tuple[Any, Any]:
+    """Resolve local-first semantic adapters without changing legacy defaults."""
+
+    local_embedding = str(settings.get("rag_local_embedding_model_path") or "").strip()
+    local_reranker = str(settings.get("rag_local_reranker_model_path") or "").strip()
+    embedding_provider = str(settings.get("rag_embedding_provider_id") or "").strip()
+    reranker_provider = str(settings.get("rag_reranker_provider_id") or "").strip()
+
+    embedding_adapter: Any = None
+    if local_embedding:
+        embedding_adapter = LocalSentenceTransformerEmbeddingAdapter(local_embedding)
+    elif embedding_provider:
+        provider = _semantic_provider_config(settings, embedding_provider)
+        route = _semantic_route(provider, capability="embedding")
+        embedding_adapter = GovernedProviderEmbeddingAdapter(
+            _governed_semantic_client(route, capability="embedding"),
+            contract=OpenAIEmbeddingContract(),
+        )
+
+    reranker: Any = None
+    if local_reranker:
+        reranker = LocalCrossEncoderRerankerAdapter(local_reranker)
+    elif reranker_provider:
+        provider = _semantic_provider_config(settings, reranker_provider)
+        route = _semantic_route(provider, capability="rerank")
+        reranker = GovernedProviderRerankerAdapter(
+            _governed_semantic_client(route, capability="rerank"),
+            contract=(
+                PassagesRerankContract()
+                if str(provider.get("provider_type") or "").casefold() == "nvidia"
+                else None
+            ),
+        )
+    return embedding_adapter, reranker
+
+
+def knowledge_error_payload(
+    code: str,
+    message: str,
+    detail: Optional[str] = None,
+    recoverable: bool = True,
+    suggestions: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Keep optional knowledge startup failures explicit and recoverable."""
+
+    if str(code) == "KNOWLEDGE_SERVICE_UNAVAILABLE":
+        message = "知識庫服務暫時無法使用；其他工作區仍可正常操作，請稍後重新啟動再試。"
+        recoverable = True
+        suggestions = suggestions or ["重新啟動 Workbench", "檢查本機知識庫儲存路徑"]
+    return error_payload(code, message, detail, recoverable, suggestions)
+
+
+def clear_project_knowledge_for_delete(project_id: str) -> Dict[str, int]:
+    """Clear project knowledge before metadata deletion, or fail closed."""
+
+    service = globals().get("knowledge_service")
+    if service is None:
+        raise ProjectKnowledgeError(
+            "Project knowledge cleanup is unavailable.",
+            code="KNOWLEDGE_SERVICE_UNAVAILABLE",
+            status_code=503,
+        )
+    try:
+        return service.clear_project(project_id=project_id)
+    except Exception as exc:  # noqa: BLE001 - optional index must not trap a project
+        degraded(
+            "project_knowledge",
+            "clear project knowledge during project deletion",
+            exc,
+            project_id=project_id,
+        )
+        raise
+
+
+def project_knowledge_delete_guard(project_id: str):
+    """Hold the Project knowledge lifecycle boundary through metadata deletion."""
+
+    service = globals().get("knowledge_service")
+    if service is None or not hasattr(service, "project_delete_guard"):
+        raise ProjectKnowledgeError(
+            "Project knowledge deletion guard is unavailable.",
+            code="KNOWLEDGE_SERVICE_UNAVAILABLE",
+            status_code=503,
+        )
+    return service.project_delete_guard(project_id=project_id)
+
+
+def _retrieve_project_knowledge(**kwargs: Any) -> List[Dict[str, Any]]:
+    """Run one bounded synchronous retrieval outside the ASGI event loop."""
+
+    if not _KNOWLEDGE_RETRIEVAL_SLOTS.acquire(timeout=5.0):
+        raise ProjectKnowledgeError(
+            "Project knowledge retrieval is busy.",
+            code="KNOWLEDGE_RETRIEVAL_BUSY",
+            status_code=503,
+        )
+    try:
+        return knowledge_service.retrieve(**kwargs)
+    finally:
+        _KNOWLEDGE_RETRIEVAL_SLOTS.release()
+
+
+async def _retrieve_project_knowledge_async(**kwargs: Any) -> List[Dict[str, Any]]:
+    """Keep synchronous SQLite/vector work away from request orchestration."""
+
+    return await asyncio.to_thread(_retrieve_project_knowledge, **kwargs)
 
 
 def require_local_workbench(request: Request) -> None:
@@ -375,8 +777,14 @@ def n8n_profile_enable_guard(profile: Dict[str, Any]) -> Dict[str, Any]:
 
 def validate_settings(data: Dict[str, Any]) -> Dict[str, Any]:
     try:
-        return validate_chat_settings(data)
-    except (TypeError, ValueError) as exc:
+        validated = validate_chat_settings(data)
+        # Stage the complete adapter graph before settings are persisted.  This
+        # prevents the UI from reporting a new semantic backend while the live
+        # knowledge service silently retains an older adapter after a config
+        # construction failure.
+        _project_knowledge_adapters(validated)
+        return validated
+    except (SemanticRetrievalError, TypeError, ValueError) as exc:
         raise HTTPException(
             status_code=400,
             detail=error_payload("INVALID_SETTINGS", str(exc)),
@@ -395,6 +803,39 @@ def normalize_settings_modal_size(data: Dict[str, Any]) -> Dict[str, int]:
 
 def apply_runtime_configuration(settings: Dict[str, Any]) -> None:
     apply_network_settings(settings)
+    service = globals().get("knowledge_service")
+    if service is not None:
+        raw_chunk_chars = settings.get("chunk_size")
+        raw_overlap_chars = settings.get("chunk_overlap")
+        chunk_chars = max(
+            128,
+            min(3000, int(600 if raw_chunk_chars is None or raw_chunk_chars == "" else raw_chunk_chars)),
+        )
+        overlap_chars = max(
+            0,
+            min(
+                min(1000, chunk_chars // 2 - 1),
+                int(120 if raw_overlap_chars is None or raw_overlap_chars == "" else raw_overlap_chars),
+            ),
+        )
+        service.configure_chunking(
+            chunk_chars=chunk_chars,
+            overlap_chars=overlap_chars,
+        )
+        configure_adapters = getattr(service, "configure_adapters", None)
+        if callable(configure_adapters):
+            try:
+                embedding_adapter, reranker = _project_knowledge_adapters(settings)
+                configure_adapters(
+                    embedding_adapter=embedding_adapter,
+                    reranker=reranker,
+                )
+            except Exception as exc:  # noqa: BLE001 - retain the last safe adapters
+                degraded(
+                    "project_knowledge",
+                    "apply semantic adapter configuration",
+                    exc,
+                )
     cache = hermes_manager_cache
     if cache is not None:
         # Hermes is optional. A missing sidecar/key/receipt is reflected by its
@@ -542,9 +983,18 @@ def ollama_models() -> List[str]:
 
 
 def disabled_service_status() -> Dict[str, Any]:
+    service = globals().get("knowledge_service")
+    if service is not None and bool(globals().get("knowledge_service_available")):
+        return {
+            "enabled": True,
+            "index_status": "project_scoped",
+            "document_count": None,
+            "chunk_count": None,
+            "embedding_model": service.embedding_adapter_id,
+        }
     return {
         "enabled": False,
-        "index_status": "disabled",
+        "index_status": "unavailable" if service is not None else "disabled",
         "document_count": 0,
         "chunk_count": 0,
         "embedding_model": None,
@@ -713,6 +1163,346 @@ def _authorized_attachment_path(
     return resolved
 
 
+_KNOWLEDGE_TEXT_LIMIT = 128 * 1024
+_KNOWLEDGE_LABEL_LIMIT = 512
+_KNOWLEDGE_SECRET_PATTERNS = (
+    re.compile(r"\bnvapi-[A-Za-z0-9_-]{8,}\b", re.IGNORECASE),
+    re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b"),
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b", re.IGNORECASE),
+    re.compile(r"\bxox[a-z]-[A-Za-z0-9-]{10,}\b", re.IGNORECASE),
+    re.compile(r"\bAIza[A-Za-z0-9_-]{20,}\b"),
+    re.compile(r"\bAKIA[A-Z0-9]{16}\b"),
+    re.compile(r"\bBearer\s+[A-Za-z0-9._~+\-/=]{8,}\b", re.IGNORECASE),
+    re.compile(r"https?://[^\s/:@]+:[^\s/@]+@", re.IGNORECASE),
+    re.compile(
+        r"-----BEGIN(?: [A-Z0-9]+)? PRIVATE KEY-----.*?"
+        r"-----END(?: [A-Z0-9]+)? PRIVATE KEY-----",
+        re.IGNORECASE | re.DOTALL,
+    ),
+)
+_KNOWLEDGE_SECRET_ASSIGNMENT = re.compile(
+    r"\b(api[_-]?key|apikey|access[_-]?token|refresh[_-]?token|password|"
+    r"secret|authorization|private[_-]?key)\b(\s*[:=]\s*)"
+    r"(?:['\"]?)[^\s,;'\"]{4,}(?:['\"]?)",
+    re.IGNORECASE,
+)
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _redact_knowledge_text(value: Any, *, limit: int = _KNOWLEDGE_TEXT_LIMIT) -> str:
+    """Redact common and registered credentials before durable RAG snapshots."""
+
+    text = str(value or "").replace("\r\n", "\n").replace("\r", "\n")
+    text = "".join(
+        character
+        for character in text
+        if character in {"\n", "\t"} or ord(character) >= 32
+    )
+    for pattern in _KNOWLEDGE_SECRET_PATTERNS:
+        text = pattern.sub("[redacted]", text)
+    text = _KNOWLEDGE_SECRET_ASSIGNMENT.sub(
+        lambda match: f"{match.group(1)}{match.group(2)}[redacted]",
+        text,
+    )
+    # Run registered-literal redaction across the complete value before the
+    # bounded result is returned. Splitting first could expose a secret that
+    # straddles a chunk boundary.
+    return redact_text(text, max_length=max(0, int(limit)))
+
+
+def _is_loopback_model_endpoint(value: Any) -> bool:
+    """Return true only for an explicit HTTP(S) loopback endpoint."""
+
+    try:
+        parsed = urlsplit(str(value or "").strip())
+        hostname = str(parsed.hostname or "").strip().casefold()
+        if parsed.scheme.casefold() not in {"http", "https"} or not hostname:
+            return False
+        if parsed.username is not None or parsed.password is not None:
+            return False
+        if hostname == "localhost":
+            return True
+        return ipaddress.ip_address(hostname).is_loopback
+    except (ValueError, TypeError):
+        return False
+
+
+def _safe_knowledge_label(value: Any, *, fallback: str = "") -> str:
+    return _redact_knowledge_text(value, limit=_KNOWLEDGE_LABEL_LIMIT).strip() or fallback
+
+
+def _safe_knowledge_citation(
+    value: Any,
+    *,
+    project_id: str,
+    document_id: str,
+    chunk_id: str,
+) -> Dict[str, Any]:
+    raw = value if isinstance(value, dict) else {}
+    citation: Dict[str, Any] = {
+        "project_id": project_id,
+        "document_id": document_id,
+        "chunk_id": chunk_id,
+    }
+    for key in ("source_id", "title"):
+        if raw.get(key):
+            citation[key] = _safe_knowledge_label(raw.get(key))
+    for key in ("ordinal", "start_offset", "end_offset"):
+        if raw.get(key) is None:
+            continue
+        try:
+            citation[key] = max(0, int(raw.get(key)))
+        except (TypeError, ValueError):
+            continue
+    for key in ("document_sha256", "chunk_sha256"):
+        digest = str(raw.get(key) or "").strip().casefold()
+        if _SHA256_RE.fullmatch(digest):
+            citation[key] = digest
+    return citation
+
+
+def _safe_knowledge_source(
+    value: Any,
+    *,
+    project_id: str,
+) -> Optional[Dict[str, Any]]:
+    if not isinstance(value, dict):
+        return None
+    if str(value.get("project_id") or "") != project_id:
+        return None
+    document_id = _safe_knowledge_label(value.get("document_id"))[:128]
+    chunk_id = _safe_knowledge_label(value.get("chunk_id"))[:128]
+    if not document_id or not chunk_id:
+        return None
+    citation = _safe_knowledge_citation(
+        value.get("citation"),
+        project_id=project_id,
+        document_id=document_id,
+        chunk_id=chunk_id,
+    )
+    title = _safe_knowledge_label(
+        value.get("source") or citation.get("title") or citation.get("source_id"),
+        fallback="知識庫文件",
+    )
+    raw_content = value.get("content")
+    if raw_content is not None:
+        snippet_digest = hashlib.sha256(
+            _redact_knowledge_text(raw_content).encode("utf-8")
+        ).hexdigest()
+    else:
+        candidate_digest = str(value.get("snippet_sha256") or "").casefold()
+        snippet_digest = (
+            candidate_digest
+            if _SHA256_RE.fullmatch(candidate_digest)
+            else hashlib.sha256(b"").hexdigest()
+        )
+    score: Optional[float]
+    try:
+        score = float(value.get("score")) if value.get("score") is not None else None
+        if score is not None and not (-1.0e308 <= score <= 1.0e308):
+            score = None
+    except (TypeError, ValueError):
+        score = None
+    return {
+        "kind": "project_knowledge",
+        "project_id": project_id,
+        "source": title,
+        "score": score,
+        "document_id": document_id,
+        "chunk_id": chunk_id,
+        "citation": citation,
+        "snippet_sha256": snippet_digest,
+    }
+
+
+def _canonical_private_knowledge_sources(
+    value: Any,
+    *,
+    project_id: Optional[str],
+) -> List[Dict[str, Any]]:
+    expected_project = str(project_id or "").strip()
+    if not expected_project or not isinstance(value, list):
+        return []
+    result: List[Dict[str, Any]] = []
+    for item in value[:20]:
+        source = _safe_knowledge_source(item, project_id=expected_project)
+        if source is not None:
+            result.append(source)
+    return result
+
+
+def _private_knowledge_evidence_snapshot(
+    bundle: Optional[EvidenceBundle],
+    *,
+    project_id: Optional[str],
+) -> List[Dict[str, Any]]:
+    """Persist only the already-redacted evidence needed for a safe retry."""
+
+    expected_project = str(project_id or "").strip()
+    if bundle is None:
+        return []
+    if not expected_project or bundle.project_id != expected_project:
+        raise FactualVerificationError(
+            "Knowledge evidence belongs to another project.",
+            code="VERIFICATION_EVIDENCE_SCOPE_MISMATCH",
+        )
+    result: List[Dict[str, Any]] = []
+    for record in bundle.records[:20]:
+        citation = dict(record.citation)
+        chunk_id = str(citation.get("chunk_id") or "").strip()
+        document_id = str(citation.get("document_id") or "").strip()
+        if (
+            record.evidence_id != f"knowledge:{chunk_id}"
+            or not chunk_id
+            or not document_id
+        ):
+            raise FactualVerificationError(
+                "Knowledge evidence identity is invalid.",
+                code="INVALID_VERIFICATION_INPUT",
+            )
+        text = _redact_knowledge_text(record.text).strip()
+        if not text:
+            continue
+        result.append(
+            {
+                "evidence_id": record.evidence_id,
+                "text": text,
+                "text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                "citation": citation,
+            }
+        )
+    return result
+
+
+def _knowledge_evidence_from_snapshot(
+    value: Any,
+    *,
+    project_id: Optional[str],
+) -> Optional[EvidenceBundle]:
+    """Rebuild typed evidence without parsing untrusted prompt prose."""
+
+    expected_project = str(project_id or "").strip()
+    if not isinstance(value, list):
+        return None
+    if not expected_project:
+        if value:
+            raise FactualVerificationError(
+                "Knowledge evidence requires a project.",
+                code="VERIFICATION_EVIDENCE_SCOPE_MISMATCH",
+            )
+        return None
+    records: List[EvidenceRecord] = []
+    for item in value[:20]:
+        if not isinstance(item, dict):
+            raise FactualVerificationError(
+                "Knowledge evidence snapshot is invalid.",
+                code="INVALID_VERIFICATION_INPUT",
+            )
+        text = str(item.get("text") or "")
+        digest = str(item.get("text_sha256") or "").casefold()
+        citation = item.get("citation")
+        if (
+            not text
+            or _redact_knowledge_text(text) != text
+            or not _SHA256_RE.fullmatch(digest)
+            or not secrets.compare_digest(
+                digest, hashlib.sha256(text.encode("utf-8")).hexdigest()
+            )
+            or not isinstance(citation, dict)
+            or str(citation.get("project_id") or "") != expected_project
+        ):
+            raise FactualVerificationError(
+                "Knowledge evidence snapshot is invalid.",
+                code="INVALID_VERIFICATION_INPUT",
+            )
+        record = EvidenceRecord(
+            evidence_id=str(item.get("evidence_id") or ""),
+            text=text,
+            kind="project_knowledge",
+            project_id=expected_project,
+            citation=citation,
+        )
+        chunk_id = str(record.citation.get("chunk_id") or "")
+        if record.evidence_id != f"knowledge:{chunk_id}":
+            raise FactualVerificationError(
+                "Knowledge evidence identity is invalid.",
+                code="INVALID_VERIFICATION_INPUT",
+            )
+        records.append(record)
+    return EvidenceBundle(tuple(records), project_id=expected_project)
+
+
+def _knowledge_snapshot_sha256(
+    context: str,
+    sources: List[Dict[str, Any]],
+    *,
+    project_id: Optional[str],
+    evidence: Optional[List[Dict[str, Any]]] = None,
+) -> str:
+    snapshot: Dict[str, Any] = {
+        "project_id": project_id,
+        "knowledge_context": context,
+        "knowledge_sources": sources,
+    }
+    # Keep old v2 manifests retry-compatible while binding all newly created
+    # manifests to their structured, masked evidence records.
+    if evidence is not None:
+        snapshot["knowledge_evidence"] = evidence
+    payload = json.dumps(
+        snapshot,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _knowledge_snapshot_is_valid(manifest: Dict[str, Any]) -> bool:
+    context = manifest.get("knowledge_context")
+    raw_sources = manifest.get("knowledge_sources")
+    if not isinstance(context, str) or not isinstance(raw_sources, list):
+        return False
+    if len(context) > _KNOWLEDGE_TEXT_LIMIT or len(raw_sources) > 20:
+        return False
+    if (context or raw_sources) and not str(manifest.get("project_id") or "").strip():
+        return False
+    if _redact_knowledge_text(context) != context:
+        return False
+    canonical_sources = _canonical_private_knowledge_sources(
+        raw_sources,
+        project_id=manifest.get("project_id"),
+    )
+    if canonical_sources != raw_sources:
+        return False
+    raw_evidence = manifest.get("knowledge_evidence")
+    canonical_evidence: Optional[List[Dict[str, Any]]] = None
+    if raw_evidence is not None:
+        try:
+            bundle = _knowledge_evidence_from_snapshot(
+                raw_evidence,
+                project_id=manifest.get("project_id"),
+            )
+            canonical_evidence = _private_knowledge_evidence_snapshot(
+                bundle,
+                project_id=manifest.get("project_id"),
+            )
+        except FactualVerificationError:
+            return False
+        if canonical_evidence != raw_evidence:
+            return False
+    stored_digest = str(manifest.get("knowledge_snapshot_sha256") or "").casefold()
+    if not _SHA256_RE.fullmatch(stored_digest):
+        return False
+    expected_digest = _knowledge_snapshot_sha256(
+        context,
+        canonical_sources,
+        project_id=manifest.get("project_id"),
+        evidence=canonical_evidence,
+    )
+    return secrets.compare_digest(stored_digest, expected_digest)
+
+
 def _hook_snapshot_payload() -> List[Dict[str, Any]]:
     return [
         dict(entry.__dict__)
@@ -767,12 +1557,21 @@ def _retry_eligibility(run: Dict[str, Any]) -> tuple[bool, Optional[str]]:
             return False, "project_unavailable"
 
     manifest = database.get_run_input_manifest(str(run.get("run_id") or ""))
+    try:
+        manifest_version = int(manifest.get("version") or 0)
+    except (AttributeError, TypeError, ValueError):
+        manifest_version = 0
     if (
         not isinstance(manifest, dict)
-        or int(manifest.get("version") or 0) != 1
+        or manifest_version not in {1, 2}
         or manifest.get("reproducible") is not True
     ):
-        return False, str(manifest.get("reason") or "input_manifest_unavailable")
+        reason = manifest.get("reason") if isinstance(manifest, dict) else None
+        return False, str(reason or "input_manifest_unavailable")
+    if manifest_version == 2 and not _knowledge_snapshot_is_valid(manifest):
+        return False, "knowledge_snapshot_invalid"
+    if manifest.get("project_id") != project_id:
+        return False, "project_scope_changed"
     if not _stored_hook_snapshot_is_compatible(manifest):
         return False, "required_hook_snapshot_incompatible"
     try:
@@ -890,6 +1689,8 @@ def _retry_request(
         temporary_context=str(manifest.get("temporary_context") or ""),
         run_id=request.run_id,
         retry_of_run_id=source_id,
+        routing_proposal_id=request.routing_proposal_id,
+        budget_override_id=request.budget_override_id,
     )
     return restored, source, manifest
 
@@ -960,12 +1761,24 @@ def _input_manifest(
     runtime_route: str,
     user_query: str,
     history_snapshot: List[Dict[str, str]],
+    knowledge_context: str = "",
+    knowledge_sources: Optional[List[Dict[str, Any]]] = None,
+    knowledge_evidence_bundle: Optional[EvidenceBundle] = None,
     hook_snapshot: Optional[List[Dict[str, Any]]] = None,
     hook_transform_steps: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     inline_image_count = len(request.images)
+    safe_knowledge_context = _redact_knowledge_text(knowledge_context)
+    safe_knowledge_sources = _canonical_private_knowledge_sources(
+        list(knowledge_sources or []),
+        project_id=project_id,
+    )
+    safe_knowledge_evidence = _private_knowledge_evidence_snapshot(
+        knowledge_evidence_bundle,
+        project_id=project_id,
+    )
     return {
-        "version": 1,
+        "version": 2,
         "reproducible": inline_image_count == 0,
         "reason": "inline_images_not_persisted" if inline_image_count else None,
         "user_message_id": int(user_message_id),
@@ -980,10 +1793,108 @@ def _input_manifest(
         "project_skill_context": project_skill_context,
         "project_skill_provenance": project_skill_provenance,
         "project_skills_truncated": bool(project_skills_truncated),
+        # Whole-run retry reuses the exact bounded retrieval snapshot.  It must
+        # not silently retrieve newer chunks under an old run identity.  The
+        # private snapshot keeps masked prompt context; public sources contain
+        # citation metadata and a snippet digest, never the raw snippet.
+        "knowledge_context": safe_knowledge_context,
+        "knowledge_sources": safe_knowledge_sources,
+        "knowledge_evidence": safe_knowledge_evidence,
+        "knowledge_snapshot_sha256": _knowledge_snapshot_sha256(
+            safe_knowledge_context,
+            safe_knowledge_sources,
+            project_id=project_id,
+            evidence=safe_knowledge_evidence,
+        ),
+        "knowledge_used": bool(
+            request.use_rag or safe_knowledge_context or safe_knowledge_sources
+        ),
         "runtime_route": runtime_route,
         "hook_snapshot": list(hook_snapshot or []),
         "hook_transform_steps": list(hook_transform_steps or []),
     }
+
+
+def _truncate_utf8_text(value: str, maximum_bytes: int) -> str:
+    encoded = value.encode("utf-8")
+    if len(encoded) <= maximum_bytes:
+        return value
+    if maximum_bytes <= 3:
+        return ""
+    prefix = encoded[: maximum_bytes - 3].decode("utf-8", errors="ignore").rstrip()
+    return f"{prefix}…" if prefix else ""
+
+
+def _knowledge_prompt_context(
+    hits: List[Dict[str, Any]],
+    *,
+    project_id: str,
+    include_evidence: bool = False,
+) -> Any:
+    """Build one 16 KiB prompt/evidence snapshot from the same masked text."""
+
+    sections: List[str] = []
+    sources: List[Dict[str, Any]] = []
+    evidence_records: List[EvidenceRecord] = []
+    used_bytes = 0
+    prompt_limit = 16 * 1024
+    for hit in hits[:20]:
+        raw_citation = dict(hit.get("citation") or {})
+        if str(raw_citation.get("project_id") or "") != str(project_id):
+            continue
+        content = _redact_knowledge_text(hit.get("text")).strip()
+        preliminary_source = _safe_knowledge_source(
+            {
+                "kind": "project_knowledge",
+                "project_id": str(project_id),
+                "source": raw_citation.get("title") or raw_citation.get("source_id"),
+                "score": hit.get("score"),
+                "document_id": str(raw_citation.get("document_id") or ""),
+                "chunk_id": str(raw_citation.get("chunk_id") or ""),
+                "citation": raw_citation,
+            },
+            project_id=str(project_id),
+        )
+        if not content or preliminary_source is None:
+            continue
+        chunk_id = str(preliminary_source["chunk_id"])
+        title = str(preliminary_source["source"])
+        index = len(sources) + 1
+        marker = f"[evidence:knowledge:{chunk_id}]"
+        header = f"{marker}\n[知識來源 {index}：{title}]\n"
+        separator_bytes = 2 if sections else 0
+        remaining = prompt_limit - used_bytes - separator_bytes - len(
+            header.encode("utf-8")
+        )
+        bounded_content = _truncate_utf8_text(content, remaining)
+        if not bounded_content:
+            break
+        section = f"{header}{bounded_content}"
+        source = _safe_knowledge_source(
+            {
+                **preliminary_source,
+                "content": bounded_content,
+            },
+            project_id=str(project_id),
+        )
+        if source is not None:
+            sections.append(section)
+            used_bytes += separator_bytes + len(section.encode("utf-8"))
+            sources.append(source)
+            evidence_records.append(
+                EvidenceRecord(
+                    evidence_id=f"knowledge:{chunk_id}",
+                    text=bounded_content,
+                    kind="project_knowledge",
+                    project_id=str(project_id),
+                    citation=dict(source["citation"]),
+                )
+            )
+        if used_bytes >= prompt_limit:
+            break
+    context = "\n\n".join(sections)
+    evidence = EvidenceBundle(tuple(evidence_records), project_id=str(project_id))
+    return (context, sources, evidence) if include_evidence else (context, sources)
 
 
 def _hydrate_execution_approvals(
@@ -1386,6 +2297,37 @@ mlops_service = MLOpsService(
     storage_root=RUNTIME_ROOT / "mlops",
 )
 mlops_service.initialize()
+knowledge_settings = load_settings()
+raw_knowledge_chunk_chars = knowledge_settings.get("chunk_size")
+raw_knowledge_overlap_chars = knowledge_settings.get("chunk_overlap")
+knowledge_chunk_chars = max(
+    128,
+    min(
+        3000,
+        int(
+            600
+            if raw_knowledge_chunk_chars is None or raw_knowledge_chunk_chars == ""
+            else raw_knowledge_chunk_chars
+        ),
+    ),
+)
+knowledge_overlap_chars = max(
+    0,
+    min(
+        min(1000, knowledge_chunk_chars // 2 - 1),
+        int(
+            120
+            if raw_knowledge_overlap_chars is None or raw_knowledge_overlap_chars == ""
+            else raw_knowledge_overlap_chars
+        ),
+    ),
+)
+knowledge_service, knowledge_service_available = _initialize_project_knowledge_service(
+    RUNTIME_ROOT / "knowledge" / "project-knowledge.sqlite3",
+    chunk_chars=knowledge_chunk_chars,
+    overlap_chars=knowledge_overlap_chars,
+    settings=knowledge_settings,
+)
 hook_audit_store = HookAuditStore(database_module=database)
 hook_dispatcher = configure_hook_dispatcher(
     HookDispatcher.from_builtin_plugins(
@@ -1863,6 +2805,17 @@ mlops_router = build_mlops_router(
     service=mlops_service,
     require_local=require_local_workbench,
     require_project=database.get_project,
+)
+
+knowledge_router = build_knowledge_router(
+    service=knowledge_service,
+    require_local=require_local_workbench,
+    require_project=database.get_project,
+    extract_pdf_text=extract_pdf_text,
+    temporary_root=TEMP_DIR,
+    error_payload=knowledge_error_payload,
+    settings_loader=load_settings,
+    semantic_consent_proposal_factory=_knowledge_semantic_consent_proposal,
 )
 
 settings_router = build_settings_router(
@@ -2444,6 +3397,8 @@ projects_router = build_projects_router(
     project_storage_dir=project_storage_dir,
     normalize_path=normalize_path,
     project_change_guard=guard_n8n_project_change,
+    project_delete_cleanup=clear_project_knowledge_for_delete,
+    project_delete_guard=project_knowledge_delete_guard,
 )
 
 n8n_gmail_router = build_n8n_gmail_router(
@@ -2600,8 +3555,185 @@ for domain_router in (
     model_governance_router,
     operations_router,
     mlops_router,
+    knowledge_router,
 ):
     app.include_router(domain_router)
+
+
+def _chat_routing_requirements(
+    request: ChatRequest,
+    *,
+    retry_manifest: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    external_data_types = _chat_external_data_types(
+        request,
+        retry_manifest=retry_manifest,
+    )
+    return {
+        "kind": "chat",
+        "tools": False,
+        "text": True,
+        "images": "images" in external_data_types,
+        "documents": "documents" in external_data_types,
+    }
+
+
+def _chat_external_data_types(
+    request: ChatRequest,
+    *,
+    retry_manifest: Optional[Dict[str, Any]] = None,
+) -> tuple[str, ...]:
+    retry_uses_documents = bool(
+        isinstance(retry_manifest, dict)
+        and (
+            retry_manifest.get("knowledge_context")
+            or retry_manifest.get("knowledge_sources")
+            or retry_manifest.get("attachment_ids")
+            or retry_manifest.get("temporary_context_id")
+            or retry_manifest.get("temporary_context")
+        )
+    )
+    result: List[str] = []
+    if request.images:
+        result.append("images")
+    attachment_documents = False
+    for attachment_id in request.attachment_ids:
+        attachment = database.get_attachment(str(attachment_id))
+        mime_type = str((attachment or {}).get("mime_type") or "").casefold()
+        if mime_type.startswith("image/"):
+            if "images" not in result:
+                result.append("images")
+        else:
+            # Unknown IDs remain fail-closed as documents here and are rejected
+            # by the later authoritative scope check before any provider call.
+            attachment_documents = True
+    if (
+        attachment_documents
+        or request.temporary_context_id
+        or str(request.temporary_context or "").strip()
+        or request.use_rag
+        or retry_uses_documents
+    ):
+        result.append("documents")
+    return tuple(result)
+
+
+def _routing_proposal_includes_data_consent(
+    proposal_id: Optional[str],
+    *,
+    data_types: tuple[str, ...],
+    project_id: Optional[str],
+    run_id: str,
+    requested_model: str,
+    selected_model: str,
+) -> bool:
+    """Accept only consumed document authority bound to this exact request."""
+
+    if not proposal_id or model_governance is None:
+        return False
+    try:
+        return bool(data_types) and all(
+            model_governance.proposal_grants_data(
+                str(proposal_id),
+                data_type=data_type,
+                project_id=project_id,
+                run_id=run_id,
+                requested_model=requested_model,
+                selected_model=selected_model,
+            )
+            for data_type in data_types
+        )
+    except (AttributeError, TypeError, ValueError, sqlite3.Error):
+        return False
+
+
+def _remote_model_data_consent(
+    settings: Dict[str, Any],
+    *,
+    project_id: Optional[str],
+    model: str,
+    data_types: tuple[str, ...],
+    approved_once: bool,
+) -> tuple[bool, Dict[str, Any]]:
+    """Require project or bound one-time consent before rich-data disclosure."""
+
+    try:
+        provider_config = provider_for_model(
+            settings,
+            model,
+            project_id=project_id,
+        )
+        provider = provider_config.provider.casefold()
+    except (AttributeError, PermissionError, ValueError):
+        return False, {
+            "project_id": project_id,
+            "model": model,
+            "required_data": list(data_types),
+            "reason": "model_provider_unavailable",
+        }
+    if provider == "ollama" and _is_loopback_model_endpoint(
+        getattr(provider_config, "base_url", "")
+    ):
+        return True, {"provider": provider, "consent_source": "local_boundary"}
+    if approved_once:
+        return True, {"provider": provider, "consent_source": "routing_proposal"}
+    if not project_id:
+        return False, {
+            "project_id": None,
+            "provider": provider,
+            "model": model,
+            "required_data": list(data_types),
+            "reason": "one_time_consent_required",
+            "policy_revision": 0,
+        }
+    try:
+        policy = model_governance.get_routing_policy(project_id)
+    except (AttributeError, sqlite3.Error):
+        return False, {
+            "project_id": project_id,
+            "provider": provider,
+            "model": model,
+            "required_data": list(data_types),
+            "reason": "routing_policy_unavailable",
+        }
+    provider_allowed = provider in {
+        str(item).casefold() for item in policy.get("allowed_providers") or []
+    }
+    consent = policy.get("data_consent") or {}
+    data_allowed = {
+        data_type: bool(consent.get(data_type)) for data_type in data_types
+    }
+    allowed = provider_allowed and all(data_allowed.values())
+    return allowed, {
+        "project_id": project_id,
+        "provider": provider,
+        "model": model,
+        "required_data": list(data_types),
+        "policy_revision": int(policy.get("revision") or 0),
+        "provider_allowed": provider_allowed,
+        "data_allowed": data_allowed,
+        "documents_allowed": data_allowed.get("documents", True),
+        "images_allowed": data_allowed.get("images", True),
+        "policy_endpoint": f"/api/projects/{project_id}/model-routing-policy",
+    }
+
+
+def _remote_knowledge_consent(
+    settings: Dict[str, Any],
+    *,
+    project_id: str,
+    model: str,
+    approved_once: bool,
+) -> tuple[bool, Dict[str, Any]]:
+    """Compatibility wrapper for the project-knowledge policy boundary."""
+
+    return _remote_model_data_consent(
+        settings,
+        project_id=project_id,
+        model=model,
+        data_types=("documents",),
+        approved_once=approved_once,
+    )
 
 
 @chat_router.post("/api/chat")
@@ -2643,6 +3775,16 @@ async def chat(request: ChatRequest):
     )
     project_id = project.get("id") if project else None
     settings = {**settings, "_extension_project_id": project_id}
+    routing_requirements = _chat_routing_requirements(
+        request,
+        retry_manifest=retry_manifest,
+    )
+    external_data_types = _chat_external_data_types(
+        request,
+        retry_manifest=retry_manifest,
+    )
+    routing_proposal_data_consent = False
+    semantic_consent_proposal_id = ""
 
     requested_model = model
     routing_decision: Dict[str, Any] = {}
@@ -2651,6 +3793,7 @@ async def chat(request: ChatRequest):
             request.routing_proposal_id,
             project_id=project_id,
             requested_model=requested_model,
+            run_id=run_id,
         )
         if not selected:
             raise HTTPException(
@@ -2661,14 +3804,50 @@ async def chat(request: ChatRequest):
                     recoverable=True,
                 ),
             )
-        model = selected
-        routing_decision = {
-            "routed": model != requested_model,
-            "requested_model": requested_model,
-            "model": model,
-            "reason": "user_approved",
-            "provider": provider_for_model(settings, model, project_id=project_id).provider,
-        }
+        selected_data_consent = _routing_proposal_includes_data_consent(
+            request.routing_proposal_id,
+            data_types=external_data_types,
+            project_id=project_id,
+            run_id=run_id,
+            requested_model=requested_model,
+            selected_model=selected,
+        )
+        try:
+            selected_profile = model_profile_for_model(
+                settings,
+                selected,
+                project_id=project_id,
+            )
+        except (ValueError, PermissionError):
+            selected_profile = None
+        if selected_profile is None or not selected_profile.eligible_for_primary:
+            if selected_data_consent and request.use_rag and project_id:
+                # A project-knowledge consent proposal is bound to its dedicated
+                # Embedding model. Consuming that authority must never replace the
+                # primary chat model with a non-chat model.
+                semantic_consent_proposal_id = request.routing_proposal_id
+                model = requested_model
+            else:
+                raise HTTPException(
+                    status_code=409,
+                    detail=error_payload(
+                        "ROUTING_PROPOSAL_INVALID",
+                        "這份同意只授權專案知識的專用模型，不能用來取代主要對話模型。",
+                        recoverable=True,
+                    ),
+                )
+        else:
+            model = selected
+            routing_proposal_data_consent = selected_data_consent
+            routing_decision = {
+                "routed": model != requested_model,
+                "requested_model": requested_model,
+                "model": model,
+                "reason": "user_approved",
+                "provider": provider_for_model(
+                    settings, model, project_id=project_id
+                ).provider,
+            }
     else:
         try:
             requested_profile = model_profile_for_model(
@@ -2700,13 +3879,7 @@ async def chat(request: ChatRequest):
                     project_id=project_id,
                     run_id=run_id,
                     requested_model=requested_model,
-                    requirements={
-                        "kind": "chat",
-                        "tools": False,
-                        "text": True,
-                        "images": bool(request.images),
-                        "documents": bool(request.attachment_ids or request.temporary_context_id),
-                    },
+                    requirements=routing_requirements,
                     candidates=model_inventory(),
                 )
             except GovernanceError as exc:
@@ -2730,6 +3903,68 @@ async def chat(request: ChatRequest):
                 "requested_model": requested_model,
                 **resolution,
             }
+    if external_data_types:
+        consented, consent_detail = _remote_model_data_consent(
+            settings,
+            project_id=str(project_id) if project_id else None,
+            model=model,
+            data_types=external_data_types,
+            approved_once=routing_proposal_data_consent,
+        )
+        if not consented:
+            try:
+                consent_proposal = model_governance.create_data_consent_proposal(
+                    project_id=str(project_id) if project_id else None,
+                    run_id=run_id,
+                    requested_model=requested_model,
+                    selected_model=model,
+                    provider_id=str(consent_detail.get("provider") or ""),
+                    data_types=external_data_types,
+                )
+            except (AttributeError, GovernanceError, ValueError, sqlite3.Error) as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail=error_payload(
+                        "MODEL_DATA_CONSENT_UNAVAILABLE",
+                        "目前無法建立安全的文件傳送同意，尚未將任何文件送往雲端。",
+                        {"reason": "proposal_creation_failed"},
+                        recoverable=True,
+                        suggestions=["稍後重試", "改用本機模型"],
+                    ),
+                ) from exc
+            data_type_label = (
+                "圖片與文件內容"
+                if set(external_data_types) == {"images", "documents"}
+                else "圖片"
+                if external_data_types == ("images",)
+                else "文件與文字內容"
+            )
+            consent_payload = {
+                **consent_detail,
+                **consent_proposal,
+                "data_type": list(external_data_types),
+                "data_type_label": data_type_label,
+                "risk": f"{data_type_label}將離開本機，傳送至所列雲端供應商處理。",
+                "consequences": [
+                    "供應商會依其服務條款處理這些資料，可能受其留存與稽核政策影響。",
+                    "資料若含機密、個資或未公開資訊，可能造成不適當的外部揭露。",
+                    "選擇「記住此專案」後，未來符合相同專案政策的同類資料可自動傳送，直到你變更政策。",
+                ],
+                "actions": [
+                    {"id": "model_data_policy", "label": "檢視預算與選模政策"},
+                    {"id": "choose_model", "label": "改用其他模型"},
+                ],
+            }
+            raise HTTPException(
+                status_code=409,
+                detail=error_payload(
+                    "MODEL_DATA_CONSENT_REQUIRED",
+                    "將圖片或文件內容傳送到雲端模型前，需要先取得明確同意。",
+                    consent_payload,
+                    recoverable=True,
+                    suggestions=["檢查供應商、風險與後果後選擇僅本次同意或記住此專案"],
+                ),
+            )
     settings["_governance_run_id"] = run_id
     settings["_governance_budget_override_id"] = request.budget_override_id or ""
 
@@ -2826,9 +4061,10 @@ async def chat(request: ChatRequest):
             ),
         )
 
-    # Hermes currently accepts text-only turns. Images and stored attachments
-    # stay on the mature basic-chat path until their boundary is explicitly
-    # reviewed. A missing/invalid optional sidecar also resolves to basic chat.
+    # Hermes accepts text plus the host-bounded Project knowledge context.
+    # Images and stored attachments stay on the mature basic-chat path until
+    # their boundary is explicitly reviewed. A missing/invalid optional sidecar
+    # also resolves to basic chat.
     hermes_manager = None
     if (
         settings.get("hermes_enabled")
@@ -2943,6 +4179,120 @@ async def chat(request: ChatRequest):
             ),
         ) from exc
 
+    knowledge_context = ""
+    knowledge_sources: List[Dict[str, Any]] = []
+    knowledge_evidence_bundle: Optional[EvidenceBundle] = None
+    if retry_manifest is not None:
+        knowledge_context = str(retry_manifest.get("knowledge_context") or "")
+        knowledge_sources = [
+            dict(item)
+            for item in retry_manifest.get("knowledge_sources") or []
+            if isinstance(item, dict)
+            and str(item.get("project_id") or "") == str(project_id or "")
+        ]
+        try:
+            knowledge_evidence_bundle = _knowledge_evidence_from_snapshot(
+                retry_manifest.get("knowledge_evidence"),
+                project_id=project_id,
+            )
+        except FactualVerificationError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail=error_payload(
+                    exc.code,
+                    "專案知識證據快照無法安全重建，請建立新的執行。",
+                    recoverable=True,
+                ),
+            ) from exc
+    elif request.use_rag and not project_id:
+        raise HTTPException(
+            status_code=409,
+            detail=error_payload(
+                "KNOWLEDGE_PROJECT_REQUIRED",
+                "使用專案知識前，請先將目前對話指派到一個專案。",
+                recoverable=True,
+            ),
+        )
+    elif request.use_rag and project_id:
+        try:
+            retrieved = await _retrieve_project_knowledge_async(
+                project_id=str(project_id),
+                query=dispatch_query,
+                top_k=int(settings.get("rag_k") or 4),
+                candidate_limit=max(20, int(settings.get("rag_k") or 4) * 5),
+                run_id=run_id,
+                consent_proposal_id=(
+                    semantic_consent_proposal_id
+                    or (
+                        request.routing_proposal_id
+                        if routing_proposal_data_consent
+                        else ""
+                    )
+                ),
+                requested_model=requested_model,
+                # A model budget override is a single-use grant and may already
+                # be consumed by the primary chat route. Semantic retrieval has
+                # its own budget decision and must not reuse that authority.
+                budget_override_id="",
+            )
+            threshold = float(settings.get("rag_rerank_threshold") or 0.0)
+            if threshold > 0:
+                retrieved = [
+                    item
+                    for item in retrieved
+                    if float(item.get("score") or 0.0) >= threshold
+                ]
+            (
+                knowledge_context,
+                knowledge_sources,
+                knowledge_evidence_bundle,
+            ) = _knowledge_prompt_context(
+                retrieved,
+                project_id=str(project_id),
+                include_evidence=True,
+            )
+        except ProjectKnowledgeError as exc:
+            consent_failure = _semantic_consent_failure(exc)
+            if consent_failure is not None:
+                try:
+                    consent_payload = _semantic_consent_proposal(
+                        project_id=str(project_id),
+                        run_id=run_id,
+                        requested_model=requested_model,
+                        failure=consent_failure,
+                    )
+                except (GovernanceError, ValueError, sqlite3.Error) as proposal_exc:
+                    raise HTTPException(
+                        status_code=503,
+                        detail=error_payload(
+                            "MODEL_DATA_CONSENT_UNAVAILABLE",
+                            "目前無法建立安全的語意模型資料傳送同意；尚未送出任何文件。",
+                            {"reason": "proposal_creation_failed"},
+                            recoverable=True,
+                            suggestions=["稍後重試", "改用本機 Embedding"],
+                        ),
+                    ) from proposal_exc
+                raise HTTPException(
+                    status_code=409,
+                    detail=error_payload(
+                        "MODEL_DATA_CONSENT_REQUIRED",
+                        "將專案文件片段傳送到雲端語意模型前，需要先取得明確同意。",
+                        consent_payload,
+                        recoverable=True,
+                        suggestions=[
+                            "檢查供應商、模型、風險與後果後，選擇僅本次同意或記住此專案"
+                        ],
+                    ),
+                ) from exc
+            raise HTTPException(
+                status_code=exc.status_code,
+                detail=error_payload(
+                    exc.code,
+                    "目前無法取得專案知識；請檢查索引後再試一次。",
+                    recoverable=True,
+                ),
+            ) from exc
+
     current_session = database.get_session(session_id)
     if not current_session or current_session.get("project_id") != project_id:
         raise HTTPException(
@@ -3042,6 +4392,9 @@ async def chat(request: ChatRequest):
         runtime_route="hermes" if hermes_manager is not None else "basic",
         user_query=dispatch_query,
         history_snapshot=history_snapshot,
+        knowledge_context=knowledge_context,
+        knowledge_sources=knowledge_sources,
+        knowledge_evidence_bundle=knowledge_evidence_bundle,
         hook_snapshot=hook_snapshot,
         hook_transform_steps=hook_transform_steps,
     )
@@ -3068,6 +4421,9 @@ async def chat(request: ChatRequest):
             project_id=project_id,
             project_skill_context=fallback_skill_context,
             project_skill_sources=project_skill_provenance,
+            knowledge_context=knowledge_context,
+            knowledge_sources=knowledge_sources,
+            evidence_bundle=knowledge_evidence_bundle,
             retry_of_run_id=request.retry_of_run_id,
             input_manifest=run_input_manifest,
             history_snapshot=history_snapshot,
@@ -3090,6 +4446,12 @@ async def chat(request: ChatRequest):
                     user_message_id=user_message_id,
                     user_query=dispatch_query,
                     temporary_context=temporary_text,
+                    knowledge_context=knowledge_context,
+                    knowledge_sources=knowledge_sources,
+                    evidence_bundle=knowledge_evidence_bundle,
+                    answer_verification_mode=str(
+                        settings.get("answer_verification_mode") or "warn"
+                    ),
                     run_control=run_control,
                     fallback_stream_factory=basic_stream,
                     attachment=hermes_skill_attachment,

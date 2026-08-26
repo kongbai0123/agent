@@ -1,5 +1,35 @@
 # Local AI Workbench 改版紀錄
 
+## 2026-08-26 — `0.9.0-model-catalog-beta.7`
+
+### Agent 規劃與能力驗證
+
+- Basic Chat 對明確的多步驟要求新增 Host-side `plan → execute → validate → repair` 閉環；單一問題保留原本快速路徑。
+- 工具預算改為每步驟限制，並另有整體工具次數、執行期限與最多 3 輪修復；`EXECUTION_UNKNOWN` 繼續立即中止且不自動重送。
+- 新增 24 項離線 Agent 能力評測、安全單項 100% 的 fail-closed gate，並納入 Windows CI 的 contract evidence → Exporter → Gate 證據鏈。CI 使用測試專用的確定性 dispatcher，並以前置檢查直接執行產品 Planner 與 Project RAG 隔離；其通過不等於正式模型或完整聊天 Runtime 已通過實際能力門檻。
+- 新增正式 Basic Chat Runtime Collector：評測前先鎖定 Git／Runtime／模型／Suite／Gate／設定／政策與 Trial，完成後再由唯一 Run ID 從唯讀 SQLite 收集。Exporter 僅接受安全事件白名單與 digest，不匯出 prompt、回答本文、工具參數、知識片段或秘密。
+
+### 專案知識庫
+
+- 新增獨立「知識庫」工作區，包含文件匯入、片段預覽、檢索測試、索引狀態及每專案對話開關；在 Basic Chat 也可由左側欄與指令面板進入。
+- 建立專案隔離的本機增量索引、可重現文字嵌入、有界召回與引用；預設使用本機雜湊基線，並可選擇既有本機 Sentence Transformers／Cross-Encoder 模型或受治理的 Embedding／Reranker Provider。
+- Embedding 身分變更後要求重建索引，Embedding 失敗時停止該次知識作業；Reranker 預設可降級回原 Embedding 排序並回報降級狀態，不會把不同向量空間靜默混用。
+- Basic Chat 與知識庫工作區在首次使用雲端 Embedding 前會顯示供應商、模型、資料範圍、風險與後果，並建立綁定 Project／Run／精確模型的同意；批准前零外送，且專用 Embedding 同意不會改變主要聊天模型。
+- 專案知識可供 Basic Chat 與可用的 Hermes 共用同一份有界快照；獨立對話無法開啟專案知識。
+- 文件第一次送往雲端模型前會顯示供應商、模型、資料類型、風險與後果；使用者可取消、僅批准本次，或記住目前專案政策。單次批准有效 10 分鐘、只能使用一次，且綁定專案、Run、模型與政策版本。
+
+### 相容與安全
+
+- 知識快照綁定完整性摘要；對話紀錄、SSE 與匯出只保留可公開的引用資訊，不複製原始片段。
+- 知識索引是可降級的非核心服務；索引無法啟動時，一般聊天與專案檢視仍可使用，知識 API 會回覆可修復狀態。為避免留下孤兒明文片段，知識清除失敗時會暫停專案刪除並要求修復後重試。
+- Basic Chat 與 Hermes 在使用專案知識時，都會進入以 `knowledge:<chunk_id>` evidence ID 綁定的回答事實驗證。`提醒` 會保留回答並提示核對不足，`嚴格` 會在任何 Token、回答保存或成果產物之前阻擋未通過回答，`關閉` 只略過額外事實核對；預設本機核對器僅能保守確認明確文字支持，不是通用事實查核器。
+
+### 驗證
+
+- 新增 Planner、知識庫、專案隔離、重試快照、同意邊界、前端工作區與 Agent 能力 gate 的離線測試；實際通過數以本版最終驗證報告為準。
+
+---
+
 ## 2026-08-19 — `0.9.0-model-catalog-beta.1`
 
 ### 模型管理

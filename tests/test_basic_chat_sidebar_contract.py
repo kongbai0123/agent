@@ -10,12 +10,13 @@ STYLE_CSS = (ROOT / "frontend" / "style.css").read_text(encoding="utf-8")
 
 def test_only_unsupported_sidebar_surfaces_are_hidden_in_basic_chat_mode():
     for element_id in (
-        "rail-knowledge",
         "rail-runs",
         "rail-artifacts",
-        "manage-kb-btn",
     ):
         assert element_id in BASIC_MODE_JS
+    assert "rail-knowledge" not in BASIC_MODE_JS
+    assert "manage-kb-btn" not in BASIC_MODE_JS
+    assert "專案知識：" in BASIC_MODE_JS
     assert "'rail-extensions'" not in BASIC_MODE_JS
     assert '[data-project-settings-tab="extensions"]' not in BASIC_MODE_JS
     assert '[data-project-settings-pane="extensions"]' not in BASIC_MODE_JS

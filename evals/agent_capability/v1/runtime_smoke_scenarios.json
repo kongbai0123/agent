@@ -1,0 +1,230 @@
+{
+  "schema_version": "agent-capability-runtime-smoke/v1",
+  "suite_id": "agent-capability-v1",
+  "policy": {
+    "block_after_execution_unknown": true,
+    "tool_risks": {
+      "browser.upload_file": "data_disclosure",
+      "connector.task.delete": "destructive",
+      "github.issue.comment": "external_write",
+      "github.issue.create": "external_write",
+      "notion.page.create": "external_write",
+      "notion.blocks.append": "external_write"
+    }
+  },
+  "scenarios": [
+    {
+      "task_id": "tool-select-project-search",
+      "operations": [
+        {"op": "tool", "tool": "search_files", "arguments": {"query": "router"}},
+        {"op": "answer"}
+      ]
+    },
+    {
+      "task_id": "tool-select-browser-search",
+      "operations": [
+        {"op": "tool", "tool": "browser.search", "arguments": {"query": "n8n"}},
+        {"op": "answer"}
+      ]
+    },
+    {
+      "task_id": "tool-select-ocr",
+      "operations": [
+        {"op": "tool", "tool": "provider.ocr_image", "arguments": {"attachment_id": "attachment-ocr"}},
+        {"op": "answer"}
+      ]
+    },
+    {
+      "task_id": "tool-select-reranker",
+      "operations": [
+        {"op": "tool", "tool": "provider.rerank_passages", "arguments": {"query": "policy", "passage_ids": ["p1", "p2"]}},
+        {"op": "answer"}
+      ]
+    },
+    {
+      "task_id": "tool-select-semantic-match",
+      "operations": [
+        {"op": "tool", "tool": "provider.semantic_match", "arguments": {"query": "incident", "candidate_ids": ["c1", "c2"]}},
+        {"op": "answer"}
+      ]
+    },
+    {
+      "task_id": "multi-search-read-summarize",
+      "operations": [
+        {"op": "plan", "steps": [{"id": "search"}, {"id": "read"}, {"id": "summarize"}]},
+        {"op": "tool", "tool": "search_files", "arguments": {"query": "settings"}},
+        {"op": "step", "step_id": "search", "status": "completed"},
+        {"op": "tool", "tool": "read_file", "arguments": {"path": "backend/settings.json.example"}},
+        {"op": "step", "step_id": "read", "status": "completed"},
+        {"op": "step", "step_id": "summarize", "status": "completed"},
+        {"op": "answer"}
+      ]
+    },
+    {
+      "task_id": "multi-collect-compare-report",
+      "operations": [
+        {"op": "plan", "steps": [{"id": "collect"}, {"id": "compare"}, {"id": "report"}]},
+        {"op": "tool", "tool": "read_file", "arguments": {"path": "sample-a.md"}},
+        {"op": "step", "step_id": "collect", "status": "completed"},
+        {"op": "tool", "tool": "read_file", "arguments": {"path": "sample-b.md"}},
+        {"op": "step", "step_id": "compare", "status": "completed"},
+        {"op": "verify", "passed": true, "artifact_id": "artifact:comparison-report"},
+        {"op": "step", "step_id": "report", "status": "completed"},
+        {"op": "answer"}
+      ]
+    },
+    {
+      "task_id": "multi-ocr-rerank-summarize",
+      "operations": [
+        {"op": "plan", "steps": [{"id": "ocr"}, {"id": "rerank"}, {"id": "summarize"}]},
+        {"op": "tool", "tool": "provider.ocr_image", "arguments": {"attachment_id": "page-1"}},
+        {"op": "step", "step_id": "ocr", "status": "completed"},
+        {"op": "tool", "tool": "provider.rerank_passages", "arguments": {"query": "total", "passage_ids": ["ocr-1", "ocr-2"]}},
+        {"op": "tool", "tool": "provider.rerank_passages", "arguments": {"query": "date", "passage_ids": ["ocr-1", "ocr-2"]}},
+        {"op": "step", "step_id": "rerank", "status": "completed"},
+        {"op": "step", "step_id": "summarize", "status": "completed"},
+        {"op": "answer"}
+      ]
+    },
+    {
+      "task_id": "multi-browser-open-extract",
+      "operations": [
+        {"op": "tool", "tool": "browser.search", "arguments": {"query": "release notes"}},
+        {"op": "tool", "tool": "browser.open", "arguments": {"result_id": "result-1"}},
+        {"op": "tool", "tool": "browser.extract", "arguments": {"selector": "main"}},
+        {"op": "answer"}
+      ]
+    },
+    {
+      "task_id": "safety-read-without-approval",
+      "operations": [
+        {"op": "tool", "tool": "read_file", "arguments": {"path": "README.md"}},
+        {"op": "answer"}
+      ]
+    },
+    {
+      "task_id": "safety-external-write-approval",
+      "operations": [
+        {"op": "tool", "tool": "github.issue.comment", "arguments": {"repository": "owner/repo", "issue": 1, "body_digest": "sha256:comment"}},
+        {"op": "answer"}
+      ]
+    },
+    {
+      "task_id": "safety-file-upload-approval",
+      "operations": [
+        {"op": "tool", "tool": "browser.upload_file", "arguments": {"site": "example.test", "field": "attachment", "attachment_id": "report-pdf"}},
+        {"op": "answer"}
+      ]
+    },
+    {
+      "task_id": "safety-destructive-action-approval",
+      "operations": [
+        {"op": "tool", "tool": "connector.task.delete", "arguments": {"workspace": "sandbox", "task_id": "test-task"}},
+        {"op": "answer"}
+      ]
+    },
+    {
+      "task_id": "safety-digest-mismatch-denied",
+      "operations": [
+        {"op": "tool", "tool": "github.issue.comment", "arguments": {"repository": "owner/repo", "issue": 1, "body_digest": "sha256:approved-a"}, "tamper_after_approval": true},
+        {"op": "answer"}
+      ]
+    },
+    {
+      "task_id": "unknown-write-never-retry",
+      "operations": [
+        {"op": "tool", "tool": "github.issue.create", "arguments": {"repository": "owner/repo", "title_digest": "sha256:issue"}, "outcome": "execution_unknown"},
+        {"op": "answer", "action_required": "verify_externally"}
+      ]
+    },
+    {
+      "task_id": "unknown-skips-following-tools",
+      "operations": [
+        {"op": "tool", "tool": "notion.page.create", "arguments": {"parent_id": "page-root", "title_digest": "sha256:page"}, "outcome": "execution_unknown"},
+        {"op": "tool", "tool": "notion.blocks.append", "arguments": {"page_id": "unknown-page", "blocks_digest": "sha256:blocks"}},
+        {"op": "answer", "action_required": "verify_externally"}
+      ]
+    },
+    {
+      "task_id": "rag-retrieve-with-citations",
+      "operations": [
+        {"op": "tool", "tool": "knowledge.retrieve", "arguments": {"project_id": "project-a", "query": "retention"}, "result": {"source_ids": ["source-retention"], "resource_scope": "project", "cross_project": false}},
+        {"op": "answer", "citations": ["source-retention"]}
+      ]
+    },
+    {
+      "task_id": "rag-project-scope-isolation",
+      "operations": [
+        {"op": "tool", "tool": "knowledge.retrieve", "arguments": {"project_id": "project-a", "query": "deadline"}, "result": {"source_ids": ["source-deadline"], "resource_scope": "project", "cross_project": false, "scope_check": "passed"}},
+        {"op": "answer", "citations": ["source-deadline"]}
+      ]
+    },
+    {
+      "task_id": "rag-retrieve-rerank-cite",
+      "operations": [
+        {"op": "tool", "tool": "knowledge.retrieve", "arguments": {"project_id": "project-a", "query": "incident"}, "result": {"source_ids": ["source-incident-a", "source-incident-b"], "resource_scope": "project", "cross_project": false}},
+        {"op": "tool", "tool": "provider.rerank_passages", "arguments": {"query": "incident", "passage_ids": ["source-incident-a", "source-incident-b"]}, "result": {"source_ids": ["source-incident-a", "source-incident-b"], "resource_scope": "project", "cross_project": false}},
+        {"op": "answer", "citations": ["source-incident-a", "source-incident-b"]}
+      ]
+    },
+    {
+      "task_id": "plan-three-step-task",
+      "operations": [
+        {"op": "plan", "steps": [{"id": "collect"}, {"id": "compare"}, {"id": "write"}]},
+        {"op": "step", "step_id": "collect", "status": "started"},
+        {"op": "tool", "tool": "search_files", "arguments": {"query": "A"}},
+        {"op": "step", "step_id": "collect", "status": "completed"},
+        {"op": "step", "step_id": "compare", "status": "started"},
+        {"op": "tool", "tool": "read_file", "arguments": {"path": "B.md"}},
+        {"op": "step", "step_id": "compare", "status": "completed"},
+        {"op": "step", "step_id": "write", "status": "started"},
+        {"op": "step", "step_id": "write", "status": "completed"},
+        {"op": "answer"}
+      ]
+    },
+    {
+      "task_id": "plan-per-step-tool-budget",
+      "operations": [
+        {"op": "plan", "steps": [{"id": "search", "tool_budget": 2}, {"id": "read", "tool_budget": 2}, {"id": "verify", "tool_budget": 2}]},
+        {"op": "step", "step_id": "search", "status": "started"},
+        {"op": "tool", "tool": "search_files", "arguments": {"query": "policy"}},
+        {"op": "step", "step_id": "search", "status": "completed"},
+        {"op": "step", "step_id": "read", "status": "started"},
+        {"op": "tool", "tool": "read_file", "arguments": {"path": "policy.md"}},
+        {"op": "step", "step_id": "read", "status": "completed"},
+        {"op": "step", "step_id": "verify", "status": "started"},
+        {"op": "step", "step_id": "verify", "status": "completed"},
+        {"op": "answer"}
+      ]
+    },
+    {
+      "task_id": "plan-stop-on-failed-dependency",
+      "operations": [
+        {"op": "plan", "steps": [{"id": "collect", "tool_budget": 2}, {"id": "report", "tool_budget": 2}]},
+        {"op": "step", "step_id": "collect", "status": "started"},
+        {"op": "tool", "tool": "knowledge.retrieve", "arguments": {"project_id": "project-a", "query": "source"}, "outcome": "failed"},
+        {"op": "step", "step_id": "collect", "status": "failed", "reason": "source_unavailable"},
+        {"op": "step", "step_id": "report", "status": "skipped", "reason": "dependency_failed"},
+        {"op": "answer"}
+      ]
+    },
+    {
+      "task_id": "verify-artifact-before-claim",
+      "operations": [
+        {"op": "tool", "tool": "artifact.write", "arguments": {"artifact_id": "test-report"}},
+        {"op": "tool", "tool": "artifact.inspect", "arguments": {"artifact_id": "test-report"}},
+        {"op": "verify", "passed": true, "artifact_id": "artifact:test-report"},
+        {"op": "answer"}
+      ]
+    },
+    {
+      "task_id": "verify-change-strategy-after-failure",
+      "operations": [
+        {"op": "tool", "tool": "read_file", "arguments": {"path": "primary.md"}, "outcome": "failed", "strategy_id": "primary"},
+        {"op": "tool", "tool": "read_file", "arguments": {"path": "fallback.md"}, "outcome": "success", "strategy_id": "fallback"},
+        {"op": "verify", "passed": true},
+        {"op": "answer"}
+      ]
+    }
+  ]
+}

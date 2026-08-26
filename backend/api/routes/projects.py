@@ -6,8 +6,9 @@ import os
 import shutil
 import subprocess
 import sys
+from contextlib import nullcontext
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, ContextManager, Dict, Optional
 
 from fastapi import APIRouter, HTTPException, Request
 
@@ -40,6 +41,8 @@ def build_projects_router(
     project_change_guard: Optional[
         Callable[[str, str, Optional[Dict[str, Any]]], None]
     ] = None,
+    project_delete_cleanup: Optional[Callable[[str], Any]] = None,
+    project_delete_guard: Optional[Callable[[str], ContextManager[Any]]] = None,
 ) -> APIRouter:
     router = APIRouter(tags=["projects"])
     @router.get("/api/projects")
@@ -303,14 +306,38 @@ def build_projects_router(
         if project_change_guard is not None:
             project_change_guard(project_id, "delete", None)
         storage = project_storage_dir(project_id, create=False)
-        if not database.delete_project(project_id):
-            raise HTTPException(
-                status_code=500,
-                detail=error_payload(
-                    "PROJECT_DELETE_FAILED",
-                    "Project metadata could not be deleted.",
-                ),
+        try:
+            delete_context = (
+                project_delete_guard(project_id)
+                if project_delete_guard is not None
+                else nullcontext()
             )
+            with delete_context:
+                if project_delete_cleanup is not None:
+                    project_delete_cleanup(project_id)
+                if not database.delete_project(project_id):
+                    raise HTTPException(
+                        status_code=500,
+                        detail=error_payload(
+                            "PROJECT_DELETE_FAILED",
+                            "Project metadata could not be deleted.",
+                        ),
+                    )
+        except HTTPException:
+            raise
+        except Exception as exc:
+            status_code = int(getattr(exc, "status_code", 500) or 500)
+            error_code = str(
+                getattr(exc, "code", "PROJECT_DELETE_CLEANUP_FAILED")
+            )
+            raise HTTPException(
+                status_code=status_code if 400 <= status_code <= 599 else 500,
+                detail=error_payload(
+                    error_code,
+                    "無法鎖定或清除專案的知識索引，因此尚未刪除專案。",
+                    recoverable=True,
+                ),
+            ) from exc
         if storage.exists():
             shutil.rmtree(storage)
         return {

@@ -98,6 +98,29 @@ jobs:
       - name: Compile Python
         run: python -m compileall -q backend scripts
 
+      - name: Validate Agent capability gate contract
+        run: python scripts\evaluate_agent_capabilities.py --validate-only
+
+      - name: Run Agent contract smoke and product-core preflight
+        env:
+          HF_HUB_OFFLINE: "1"
+          TRANSFORMERS_OFFLINE: "1"
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path artifacts -Force | Out-Null
+          python scripts\run_agent_capability_smoke.py `
+            --evidence artifacts\agent-capability-smoke-evidence.json `
+            --trial 1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts\export_agent_capability_results.py `
+            --evidence artifacts\agent-capability-smoke-evidence.json `
+            --output artifacts\agent-capability-smoke-results.json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts\evaluate_agent_capabilities.py `
+            --results artifacts\agent-capability-smoke-results.json `
+            --report artifacts\agent-capability-smoke-report.json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Check PowerShell syntax
         shell: pwsh
         run: |
@@ -138,6 +161,17 @@ jobs:
         with:
           name: windows-deterministic-test-report
           path: artifacts\windows-tests.xml
+          if-no-files-found: warn
+
+      - name: Upload Agent Runtime capability evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-runtime-capability-evidence
+          path: |
+            artifacts\agent-capability-smoke-evidence.json
+            artifacts\agent-capability-smoke-results.json
+            artifacts\agent-capability-smoke-report.json
           if-no-files-found: warn
 
       - name: Upload dependency audit inventory
