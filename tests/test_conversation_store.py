@@ -37,7 +37,6 @@ class ConversationStoreTests(unittest.TestCase):
                 CREATE TABLE sessions (id TEXT PRIMARY KEY, title TEXT, mode TEXT, model TEXT, project_id TEXT, message_count INTEGER, last_message_preview TEXT, created_at TEXT, updated_at TEXT);
                 CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, content TEXT, visible_content TEXT, llm_content TEXT, sources_json TEXT, process_events_json TEXT, artifacts_json TEXT, turn_id TEXT, parent_message_id INTEGER, created_at TEXT);
                 CREATE TABLE runs (id TEXT PRIMARY KEY, session_id TEXT, turn_id TEXT, model TEXT, mode TEXT, status TEXT, tasks_json TEXT, events_json TEXT, sources_json TEXT, metrics_json TEXT, artifacts_json TEXT, created_at TEXT, completed_at TEXT);
-                CREATE TABLE safir_analyses (run_id TEXT PRIMARY KEY, mode TEXT, analysis_json TEXT, created_at TEXT);
                 CREATE TABLE attachments (id TEXT PRIMARY KEY, session_id TEXT, filename TEXT, mime_type TEXT, storage_path TEXT, size_bytes INTEGER, width INTEGER, height INTEGER, created_at TEXT);
                 CREATE TABLE artifacts (id TEXT PRIMARY KEY, session_id TEXT, turn_id TEXT, title TEXT, type TEXT, created_at TEXT, updated_at TEXT);
                 CREATE TABLE artifact_files (id TEXT PRIMARY KEY, artifact_id TEXT, path TEXT, content TEXT, language TEXT);

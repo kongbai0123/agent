@@ -114,10 +114,26 @@ class GovernanceDecision:
 
 
 class ModelGovernanceService:
-    def __init__(self, *, database_module: Any = database, clock: Any = _now) -> None:
+    def __init__(self, *, database_module: Any = database, clock: Any = _now, operations: Any = None) -> None:
         self.database = database_module
         self.clock = clock
+        self.operations = operations
         self._lock = threading.RLock()
+
+    def _report_shared_health(self, provider_id: str, model_id: str, state: str, reason: str) -> None:
+        if self.operations is None:
+            return
+        mapped = "healthy" if state == "healthy" else "unavailable" if state in BLOCKING_STATES else "degraded"
+        try:
+            self.operations.report_health(
+                component_type="provider",
+                component_id=provider_id,
+                status=mapped,
+                reason_code=(reason or state or "unknown").casefold().replace(" ", "_")[:128],
+                detail={"model_id": model_id, "provider_state": state},
+            )
+        except Exception:
+            pass
 
     def initialize(self) -> dict[str, int]:
         with self.database.get_db_conn() as conn:
@@ -386,6 +402,7 @@ class ModelGovernanceService:
         if recovered_from not in {"", "unknown", "healthy"}:
             self.audit("provider_recovered", provider_id=key[0], model_id=key[1], detail={"prior_state": prior.get("state")})
         result = self.state(key[0], model_id=key[1], endpoint=endpoint)
+        self._report_shared_health(key[0], key[1], "healthy", "request_succeeded")
         if recovered_from not in {"", "unknown", "healthy"}:
             result["recovered_from"] = recovered_from
         return result
@@ -446,6 +463,7 @@ class ModelGovernanceService:
                 (*key, self._credential_version(provider), state, reason_code, reason, now, streak, retry_text, retry_text, now),
             )
         self.audit("provider_suspended", provider_id=provider, model_id=target_model, detail={"state": state, "reason_code": reason_code, "retry_at": retry_text})
+        self._report_shared_health(provider, target_model, state, reason_code)
         return self.state(provider, model_id=target_model, endpoint=endpoint)
 
     def operational_decision(self, provider_id: str, *, model_id: str = "", endpoint: str = "", claim_half_open: bool = True) -> GovernanceDecision:
@@ -739,12 +757,16 @@ class ModelGovernanceService:
         ))
         selected = valid[0]
         if selected["model"] == requested_model:
+            if self.operations is not None:
+                self.operations.record_policy_decision(policy_id="model.routing", subject_type="model", subject_id=requested_model.replace("::", ":"), action="allow", reason_code="requested_model_satisfies_policy", project_id=project_id, execution_id=run_id, inputs=dict(requirements))
             return {"status": "selected", "model": requested_model, "provider": selected["provider"], "reason": "requested_model_satisfies_policy"}
         provider_allowed = selected["provider"] == "ollama" or selected["provider"] in set(policy.get("allowed_providers") or [])
         data_allowed = all(bool((policy.get("data_consent") or {}).get(kind)) for kind in data_types if selected["provider"] != "ollama")
         can_auto = policy.get("mode") == "auto_within_policy" and provider_allowed and data_allowed
         if can_auto:
             self.audit("model_routed", provider_id=selected["provider"], model_id=selected["model"], project_id=project_id, run_id=run_id, detail={"from": requested_model, "reason": "project_policy"})
+            if self.operations is not None:
+                self.operations.record_policy_decision(policy_id="model.routing", subject_type="model", subject_id=selected["model"].replace("::", ":"), action="allow", reason_code="project_policy", project_id=project_id, execution_id=run_id, inputs=dict(requirements))
             return {"status": "selected", "model": selected["model"], "provider": selected["provider"], "reason": "project_policy"}
         if policy.get("mode") == "off":
             raise GovernanceError("MODEL_CAPABILITY_MISMATCH", "目前模型不適合這項工作，且自動選模已關閉。", status_code=409)
@@ -759,6 +781,8 @@ class ModelGovernanceService:
                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,NULL)""",
                 (proposal_id, project_id, run_id, requested_model, selected["model"], "required_capability", _json(dict(requirements)), digest, "pending", 0, _iso(expires), _iso(self.clock())),
             )
+        if self.operations is not None:
+            self.operations.record_policy_decision(policy_id="model.routing", subject_type="model", subject_id=selected["model"].replace("::", ":"), action="require_approval", reason_code="required_capability", project_id=project_id, execution_id=run_id, inputs=dict(requirements), detail={"proposal_id": proposal_id})
         return {"status": "approval_required", "event": "model_route_proposed", "proposal_id": proposal_id, "requested_model": requested_model, "selected_model": selected["model"], "provider": selected["provider"], "reason": "required_capability", "expires_at": _iso(expires)}
 
     def approve_proposal(self, proposal_id: str, *, remember_project: bool) -> dict[str, Any]:

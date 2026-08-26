@@ -1083,7 +1083,6 @@ def test_chat_route_is_wired_only_to_basic_stream():
     assert "stream_basic_chat" in called_names
     assert "coordinated_chat_stream" not in called_names
     assert "RunResourceMonitor" not in called_names
-    assert "resolve_safir_mode" not in called_names
 
 
 def test_basic_mode_uses_disabled_rag_without_loading_runtime(monkeypatch):
@@ -1119,7 +1118,6 @@ def test_frontend_forces_basic_chat_and_hides_collaboration_panel():
     assert "'rail-knowledge', 'rail-runs', 'rail-artifacts'" in basic_mode
     assert "'rail-extensions'" not in basic_mode
     assert "'[data-target=\"tab-settings-agent\"]'" in basic_mode
-    assert "'[data-itab=\"safir\"]'" in basic_mode
     assert "basicPaletteActions" in source
     assert "configureBasicWizard" in source
     assert "useBasicKnowledgeStatus" in source

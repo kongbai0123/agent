@@ -24,5 +24,3 @@
 *.sqlite binary
 
 # 產生的度量檔請以 LF 儲存，讓 sha256 在各平台一致。
-SAFIR/benchmark/results/*.json text eol=lf
-SAFIR/benchmark/dataset_zh.json text eol=lf

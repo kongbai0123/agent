@@ -17,7 +17,7 @@
     <link rel="stylesheet" href="katex.min.css">
     <script src="katex.min.js"></script>
     <script src="auto-render.min.js"></script>
-    <link rel="stylesheet" href="style.css?v=0.9.0-model-catalog-beta.4">
+    <link rel="stylesheet" href="style.css?v=0.9.0-model-catalog-beta.5">
 </head>
 <body class="basic-chat-mode">
     <div class="app-container workbench-shell">
@@ -106,6 +106,10 @@
                 <button class="rail-btn" id="rail-extensions" title="擴充中心" aria-label="擴充中心"
                     aria-controls="extension-center-workspace" aria-current="false">
                     <i data-lucide="puzzle"></i><span class="rail-label">擴充</span>
+                </button>
+                <button class="rail-btn" id="rail-mlops" title="MLOps" aria-label="模型生命週期工作區"
+                    aria-controls="mlops-workspace" aria-current="false">
+                    <i data-lucide="flask-conical"></i><span class="rail-label">MLOps</span>
                 </button>
                 <button class="rail-btn" id="rail-settings" title="設定" aria-label="設定中心">
                     <i data-lucide="settings"></i><span class="rail-label">設定</span>
@@ -1040,6 +1044,64 @@
                 <button class="btn btn-secondary" id="mm-refresh">重新整理</button>
                 <button class="btn btn-secondary" id="mm-close-btn">回到聊天</button>
             </div>
+        </div>
+    </main>
+
+    <main class="mlops-workspace" id="mlops-workspace" aria-labelledby="mlops-title" hidden>
+        <div class="management-workspace-shell mlops-workspace-shell">
+            <header class="workspace-header mlops-header">
+                <div>
+                    <span class="mlops-eyebrow">本機模型生命週期</span>
+                    <h1 id="mlops-title" tabindex="-1"><i data-lucide="flask-conical"></i>MLOps 工作區</h1>
+                    <p>管理資料集、實驗、訓練產物與執行健康；所有動作都經過共用政策與稽核契約。</p>
+                </div>
+                <button type="button" class="workspace-close" id="mlops-close" aria-label="返回聊天"><i data-lucide="x"></i></button>
+            </header>
+            <nav class="mlops-tabs" aria-label="MLOps 功能">
+                <button type="button" class="active" data-mlops-tab="overview">總覽</button>
+                <button type="button" data-mlops-tab="datasets">資料集</button>
+                <button type="button" data-mlops-tab="experiments">實驗與訓練</button>
+                <button type="button" data-mlops-tab="registry">模型登錄</button>
+                <button type="button" data-mlops-tab="health">健康與政策</button>
+            </nav>
+            <div class="mlops-content">
+                <section class="mlops-panel" data-mlops-panel="overview">
+                    <div class="mlops-summary-grid" id="mlops-summary"></div>
+                    <article class="mlops-notice">
+                        <strong>目前可用的本機訓練能力</strong>
+                        <p>提供受限的「文字分類基準訓練」，適合驗證資料、實驗、評估與模型登錄流程。它不是 LLM 微調；未來的 LoRA／PEFT Adapter 會沿用同一底座另行加入。</p>
+                    </article>
+                </section>
+                <section class="mlops-panel" data-mlops-panel="datasets" hidden>
+                    <div class="mlops-form-card">
+                        <h2>建立訓練資料集</h2>
+                        <p>匯入 JSON 或 JSONL；每筆需包含 <code>text</code> 與 <code>label</code>。資料只保存在本機。</p>
+                        <div class="mlops-form-row">
+                            <label>資料集名稱<input id="mlops-dataset-name" maxlength="160" placeholder="例如：客服意圖分類"></label>
+                            <label>資料檔案<input id="mlops-dataset-file" type="file" accept=".json,.jsonl,application/json"></label>
+                            <button type="button" class="btn btn-primary" id="mlops-create-dataset">建立並匯入</button>
+                        </div>
+                    </div>
+                    <div class="mlops-list" id="mlops-dataset-list"></div>
+                </section>
+                <section class="mlops-panel" data-mlops-panel="experiments" hidden>
+                    <div class="mlops-form-card">
+                        <h2>建立本機實驗</h2>
+                        <div class="mlops-form-row">
+                            <label>實驗名稱<input id="mlops-experiment-name" maxlength="160" placeholder="例如：意圖分類基準 v1"></label>
+                            <label>資料集版本<select id="mlops-dataset-version"></select></label>
+                            <button type="button" class="btn btn-primary" id="mlops-create-experiment">建立實驗</button>
+                        </div>
+                    </div>
+                    <div class="mlops-list" id="mlops-experiment-list"></div>
+                </section>
+                <section class="mlops-panel" data-mlops-panel="registry" hidden><div class="mlops-list" id="mlops-model-list"></div></section>
+                <section class="mlops-panel" data-mlops-panel="health" hidden>
+                    <article class="mlops-notice"><strong>共用健康契約</strong><p>模型安裝、Provider、MCP、Hermes 與訓練 Adapter 以相同狀態呈現；原模組仍保有自己的詳細診斷。</p></article>
+                    <div class="mlops-list" id="mlops-health-list"></div>
+                </section>
+            </div>
+            <footer class="workspace-footer"><span id="mlops-status">尚未載入專案資料。</span><button type="button" class="btn btn-secondary" id="mlops-refresh">重新整理</button></footer>
         </div>
     </main>
 
@@ -2094,6 +2156,7 @@
     <script src="n8n-workflows.js?v=0.9.1-hmi-controls"></script>
     <script src="n8n-agent-governance.js?v=0.9.1-personal-scope"></script>
     <script src="hermes-settings.js?v=1.1.3-tooltip-layer"></script>
-    <script src="app.js?v=0.9.0-model-catalog-beta.4"></script>
+    <script src="mlops-workspace.js?v=1.0.1"></script>
+    <script src="app.js?v=0.9.0-model-catalog-beta.5"></script>
 </body>
 </html>

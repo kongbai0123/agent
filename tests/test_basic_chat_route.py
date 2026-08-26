@@ -67,7 +67,7 @@ def test_post_chat_route_runs_basic_stream_end_to_end(monkeypatch):
     events = _events(response.text)
     names = [name for name, _ in events]
     assert names == ["meta", "token", "metrics", "done"]
-    assert not set(names) & {"plan", "tool_start", "agent_spawned", "safir", "validation"}
+    assert not set(names) & {"plan", "tool_start", "agent_spawned", "validation"}
     assert captured["payload"]["messages"][-1]["content"] == "route hello"
     assert "tools" not in captured["payload"]
     assert captured["payload"]["keep_alive"] == 0

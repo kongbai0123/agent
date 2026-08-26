@@ -119,6 +119,7 @@ def build_models_router(
     require_extension: Callable[[str, Optional[str]], Any],
     app_version: str,
     agent_protocol_version: int,
+    operations: Any = None,
 ) -> APIRouter:
     router = APIRouter(tags=["models"])
     APP_VERSION = app_version
@@ -258,6 +259,32 @@ def build_models_router(
     _MODEL_INSTALL_ACTIVE_STATES = {"queued", "starting", "downloading", "cancelling"}
     _MODEL_INSTALL_TERMINAL_STATES = {"ready", "failed", "cancelled"}
 
+    def _update_model_install(job_id: str, model: str, status: str, progress: int = 0,
+                              downloaded_bytes: int = 0, total_bytes: int = 0,
+                              message: Optional[str] = None, error: Optional[str] = None) -> None:
+        database.upsert_model_install_job(job_id, model, status, progress, downloaded_bytes, total_bytes, message, error)
+        if operations is None:
+            return
+        shared_status = {
+            "queued": "queued", "starting": "preparing", "downloading": "running",
+            "cancelling": "running", "ready": "completed", "failed": "failed", "cancelled": "cancelled",
+        }.get(status, "running")
+        try:
+            if operations.get_execution(job_id) is None:
+                operations.create_execution(execution_id=job_id, kind="model.install", owner_type="model",
+                    owner_id=model, status=shared_status, metadata={"source": "ollama", "message": message or ""})
+            else:
+                operations.update_execution(job_id, status=shared_status, progress=max(0, min(100, int(progress))),
+                    metadata={"downloaded_bytes": downloaded_bytes, "total_bytes": total_bytes, "message": message or ""},
+                    error_code="MODEL_INSTALL_FAILED" if error else None, error_reason=error)
+            if status == "ready" and not operations.list_artifacts(execution_id=job_id, limit=1):
+                operations.register_artifact(artifact_kind="installed_model", display_name=model,
+                    locator={"scheme": "ollama", "model": model}, execution_id=job_id,
+                    metadata={"provider": "ollama"})
+        except Exception:
+            # The existing install job remains authoritative during migration.
+            pass
+
 
     def _register_model_install(job_id: str) -> threading.Event:
         with _MODEL_INSTALL_LOCK:
@@ -284,7 +311,7 @@ def build_models_router(
 
     def _mark_model_install_cancelled(job_id: str, model: str, message: str = "Model install stopped by user.") -> None:
         current = database.get_model_install_job(job_id) or {}
-        database.upsert_model_install_job(
+        _update_model_install(
             job_id, model, "cancelled", int(current.get("progress") or 0),
             int(current.get("downloaded_bytes") or 0), int(current.get("total_bytes") or 0),
             message=message,
@@ -309,7 +336,7 @@ def build_models_router(
 
     def _model_install_worker(job_id: str, model: str) -> None:
         cancel_event = _register_model_install(job_id)
-        database.upsert_model_install_job(job_id, model, "starting", 0, message="Starting Ollama pull.")
+        _update_model_install(job_id, model, "starting", 0, message="Starting Ollama pull.")
         response: Optional[requests.Response] = None
         try:
             _ensure_ollama_enabled()
@@ -319,7 +346,7 @@ def build_models_router(
                 _mark_model_install_cancelled(job_id, model)
                 return
             if response.status_code != 200:
-                database.upsert_model_install_job(job_id, model, "failed", 100, message="Ollama pull failed.", error=response.text)
+                _update_model_install(job_id, model, "failed", 100, message="Ollama pull failed.", error=response.text)
                 return
             last_progress = 0
             for line in response.iter_lines():
@@ -338,15 +365,15 @@ def build_models_router(
                 progress = int(completed * 100 / total) if total else last_progress
                 last_progress = max(last_progress, progress)
                 status_text = data.get("status") or "downloading"
-                database.upsert_model_install_job(job_id, model, "downloading", last_progress, completed, total, status_text)
+                _update_model_install(job_id, model, "downloading", last_progress, completed, total, status_text)
                 if data.get("error"):
-                    database.upsert_model_install_job(job_id, model, "failed", last_progress, completed, total, status_text, data.get("error"))
+                    _update_model_install(job_id, model, "failed", last_progress, completed, total, status_text, data.get("error"))
                     return
             if cancel_event.is_set():
                 _mark_model_install_cancelled(job_id, model)
                 return
             current = database.get_model_install_job(job_id) or {}
-            database.upsert_model_install_job(
+            _update_model_install(
                 job_id, model, "ready", 100,
                 int(current.get("downloaded_bytes") or 0), int(current.get("total_bytes") or 0),
                 message="Model installed.",
@@ -355,7 +382,7 @@ def build_models_router(
             if cancel_event.is_set():
                 _mark_model_install_cancelled(job_id, model)
             else:
-                database.upsert_model_install_job(job_id, model, "failed", 100, message="Model install failed.", error=str(exc))
+                _update_model_install(job_id, model, "failed", 100, message="Model install failed.", error=str(exc))
         finally:
             if response is not None:
                 try:
@@ -376,7 +403,7 @@ def build_models_router(
                     return {"success": True, "job_id": existing["job_id"], "model": req.model, "status": existing["status"], "reused": True}
                 _mark_model_install_cancelled(existing["job_id"], req.model, "Install stopped because the backend was restarted.")
         job_id = create_id("job")
-        database.upsert_model_install_job(job_id, req.model, "queued", 0, message="Queued model install.")
+        _update_model_install(job_id, req.model, "queued", 0, message="Queued model install.")
         _register_model_install(job_id)
         background_tasks.add_task(_model_install_worker, job_id, req.model)
         return {"success": True, "job_id": job_id, "model": req.model, "status": "queued"}
@@ -407,14 +434,14 @@ def build_models_router(
             raise HTTPException(status_code=404, detail=error_payload("MODEL_INSTALL_JOB_NOT_FOUND", "Model install job not found.", recoverable=False))
         if job["status"] in _MODEL_INSTALL_TERMINAL_STATES:
             return {"success": True, "job_id": job_id, "status": job["status"], "already_finished": True}
-        database.upsert_model_install_job(
+        _update_model_install(
             job_id, job["model"], "cancelling", int(job.get("progress") or 0),
             int(job.get("downloaded_bytes") or 0), int(job.get("total_bytes") or 0),
             message="Stopping model install...",
         )
         controlled = _cancel_model_install(job_id)
         if not controlled:
-            database.upsert_model_install_job(
+            _update_model_install(
                 job_id, job["model"], "cancelled", int(job.get("progress") or 0),
                 int(job.get("downloaded_bytes") or 0), int(job.get("total_bytes") or 0),
                 message="Model install marked as stopped; no active download connection was found.",
@@ -465,7 +492,7 @@ def build_models_router(
         _require_ollama()
         _require_chat_model_install(req.model)
         job_id = create_id("job")
-        database.upsert_model_install_job(job_id, req.model, "queued", 0, message="Queued model install.")
+        _update_model_install(job_id, req.model, "queued", 0, message="Queued model install.")
         _register_model_install(job_id)
         threading.Thread(target=_model_install_worker, args=(job_id, req.model), daemon=True).start()
 

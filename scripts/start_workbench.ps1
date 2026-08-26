@@ -38,7 +38,7 @@ $hermesProjectsRoot = Join-Path $projectRoot "projects"
 $hermesStartScript = Join-Path $projectRoot "scripts\start_hermes_sidecar.ps1"
 $hermesProductionOps = Join-Path $projectRoot "scripts\hermes_production_ops.py"
 $backendUrl = "http://127.0.0.1:$BackendPort"
-$frontendVersion = "0.9.0-model-catalog-beta.4"
+$frontendVersion = "0.9.0-model-catalog-beta.5"
 $launcherShutdownHandoffMilliseconds = 75000
 $websiteUrl = "$backendUrl/index.html?v=$frontendVersion"
 $discoveryConfigPath = Join-Path $runtimeDir "server-discovery-config.json"
@@ -62,6 +62,7 @@ $hermesLaunchPlan = $null
 $hermesHealthFailureCount = 0
 $hermesRestartCount = 0
 $hermesNextProbeUtc = [DateTime]::MinValue
+$hermesMonitoringSuppressed = $false
 $hermesEnvironmentManaged = $false
 $previousHermesApiServerKey = [Environment]::GetEnvironmentVariable("HERMES_API_SERVER_KEY", "Process")
 $jobHandle = [IntPtr]::Zero
@@ -1010,8 +1011,39 @@ function Write-HermesProductionEvidence {
     }
 }
 
+function Write-HermesProductionEvidenceSafely {
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet("launcher-health-threshold", "launcher-restart-succeeded", "launcher-restart-exhausted")]
+        [string]$Operation,
+        [ValidateRange(0, 2)]
+        [int]$RestartCount
+    )
+
+    try {
+        Write-HermesProductionEvidence -Operation $Operation -RestartCount $RestartCount
+        return $true
+    }
+    catch {
+        # Hermes is optional.  Evidence persistence must fail closed for the
+        # sidecar without turning the failure into a Workbench-wide outage.
+        Write-LauncherLog "Hermes production evidence warning ($Operation): $($_.Exception.Message)"
+        return $false
+    }
+}
+
+function Stop-HermesMonitoringForLaunch {
+    param([Parameter(Mandatory = $true)][string]$Reason)
+
+    $script:hermesMonitoringSuppressed = $true
+    $script:hermesHealthFailureCount = 0
+    $script:hermesNextProbeUtc = [DateTime]::MaxValue
+    Write-LauncherLog "Hermes is unavailable for this launch; Workbench core will remain available. $Reason"
+}
+
 function Invoke-HermesMonitorTick {
     if ($null -eq $script:hermesLaunchPlan -or -not [bool]$script:hermesLaunchPlan.enabled) { return }
+    if ($script:hermesMonitoringSuppressed) { return }
     if ([DateTime]::UtcNow -lt $script:hermesNextProbeUtc) { return }
     $script:hermesNextProbeUtc = [DateTime]::UtcNow.AddSeconds(
         [int]$script:hermesLaunchPlan.monitoring.probe_interval_seconds
@@ -1027,11 +1059,12 @@ function Invoke-HermesMonitorTick {
 
     $restartLimit = [int]$script:hermesLaunchPlan.monitoring.max_restarts_per_launch
     if ($script:hermesRestartCount -ge $restartLimit) {
-        Write-HermesProductionEvidence -Operation "launcher-restart-exhausted" -RestartCount $script:hermesRestartCount
-        throw "Hermes failed its reviewed health gate after $restartLimit owned restart attempts."
+        $null = Write-HermesProductionEvidenceSafely -Operation "launcher-restart-exhausted" -RestartCount $script:hermesRestartCount
+        Stop-HermesMonitoringForLaunch -Reason "The reviewed health gate failed after $restartLimit owned restart attempts."
+        return
     }
     $script:hermesRestartCount += 1
-    Write-HermesProductionEvidence -Operation "launcher-health-threshold" -RestartCount $script:hermesRestartCount
+    $null = Write-HermesProductionEvidenceSafely -Operation "launcher-health-threshold" -RestartCount $script:hermesRestartCount
     Write-LauncherLog "Hermes reached its health-failure threshold; restarting the owned sidecar ($($script:hermesRestartCount)/$restartLimit)."
     $stoppedProcess = $script:hermesProcess
     Stop-HermesSidecar -Process $stoppedProcess
@@ -1039,9 +1072,27 @@ function Invoke-HermesMonitorTick {
     Start-Sleep -Seconds ([int]$script:hermesLaunchPlan.monitoring.restart_backoff_seconds)
     # Re-resolve persisted settings, receipt, project scope, and policy before
     # every restart. A disabled plan remains stopped and cannot retain tools.
-    Start-ManagedHermesSidecar
+    try {
+        Start-ManagedHermesSidecar
+    }
+    catch {
+        $script:hermesProcess = $null
+        $script:hermesHealthFailureCount = 0
+        $restartFailure = $_.Exception.Message
+        Write-LauncherLog "Hermes owned restart failed ($($script:hermesRestartCount)/$restartLimit): $restartFailure"
+        if ($script:hermesRestartCount -ge $restartLimit) {
+            $null = Write-HermesProductionEvidenceSafely -Operation "launcher-restart-exhausted" -RestartCount $script:hermesRestartCount
+            Stop-HermesMonitoringForLaunch -Reason "The optional sidecar could not restart: $restartFailure"
+        }
+        else {
+            $script:hermesNextProbeUtc = [DateTime]::UtcNow.AddSeconds(
+                [int]$script:hermesLaunchPlan.monitoring.probe_interval_seconds
+            )
+        }
+        return
+    }
     if ($null -ne $script:hermesLaunchPlan -and [bool]$script:hermesLaunchPlan.enabled) {
-        Write-HermesProductionEvidence -Operation "launcher-restart-succeeded" -RestartCount $script:hermesRestartCount
+        $null = Write-HermesProductionEvidenceSafely -Operation "launcher-restart-succeeded" -RestartCount $script:hermesRestartCount
     }
 }
 

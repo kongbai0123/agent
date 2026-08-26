@@ -405,6 +405,34 @@ def test_workbench_launcher_consumes_the_resolved_profile_without_hardcoding_can
     assert "--restart-count $RestartCount" in launcher
 
 
+def test_optional_hermes_monitor_failures_do_not_escape_to_workbench_launcher() -> None:
+    launcher = LAUNCHER.read_text(encoding="utf-8")
+    monitor = launcher.split("function Invoke-HermesMonitorTick {", 1)[1].split(
+        "\ntry {", 1
+    )[0]
+
+    assert "$hermesMonitoringSuppressed = $false" in launcher
+    assert "if ($script:hermesMonitoringSuppressed) { return }" in monitor
+    assert "function Stop-HermesMonitoringForLaunch" in launcher
+    assert "Workbench core will remain available" in launcher
+    assert "try {\n        Start-ManagedHermesSidecar" in monitor
+    assert "Hermes owned restart failed" in monitor
+    assert "Stop-HermesMonitoringForLaunch" in monitor
+    assert "throw \"Hermes failed its reviewed health gate" not in monitor
+
+
+def test_optional_hermes_evidence_failure_is_isolated() -> None:
+    launcher = LAUNCHER.read_text(encoding="utf-8")
+    safe_writer = launcher.split(
+        "function Write-HermesProductionEvidenceSafely {", 1
+    )[1].split("function Stop-HermesMonitoringForLaunch", 1)[0]
+
+    assert "try {" in safe_writer
+    assert "catch {" in safe_writer
+    assert "Hermes production evidence warning" in safe_writer
+    assert "return $false" in safe_writer
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows PowerShell launcher")
 def test_workbench_launcher_still_parses_in_windows_powershell() -> None:
     powershell = (

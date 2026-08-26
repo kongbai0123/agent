@@ -29,6 +29,7 @@ class HermesHealthSupervisor:
         manager_provider: Callable[[Mapping[str, Any]], Optional[Any]],
         probe_interval_seconds: float = 10.0,
         failure_threshold: int = 3,
+        health_reporter: Optional[Callable[[str, str, Mapping[str, Any]], Any]] = None,
     ) -> None:
         interval = float(probe_interval_seconds)
         if not 1.0 <= interval <= 300.0:
@@ -39,6 +40,7 @@ class HermesHealthSupervisor:
         self._manager_provider = manager_provider
         self._interval = interval
         self._failure_threshold = int(failure_threshold)
+        self._health_reporter = health_reporter
         self._task: Optional[asyncio.Task[None]] = None
         self._stop_event: Optional[asyncio.Event] = None
         self._lock = threading.RLock()
@@ -140,12 +142,21 @@ class HermesHealthSupervisor:
                         if self._consecutive_failures >= self._failure_threshold
                         else "degraded"
                     )
-            return {
+            result = {
                 "success": success,
                 "reason": reason,
                 "elapsed_ms": elapsed_ms,
                 "state": self._state,
             }
+        if self._health_reporter is not None:
+            shared_state = "healthy" if result["state"] == "healthy" else "disabled" if result["state"] == "disabled" else "unavailable" if result["state"] == "unhealthy" else "degraded"
+            try:
+                reported = self._health_reporter(shared_state, reason, {"elapsed_ms": elapsed_ms, "probe_state": result["state"]})
+                if asyncio.iscoroutine(reported):
+                    await reported
+            except Exception:
+                pass
+        return result
 
     async def _run(self) -> None:
         assert self._stop_event is not None

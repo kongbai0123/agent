@@ -466,9 +466,6 @@ const settingSubagentImplementerModel = document.getElementById('setting-subagen
 const settingSubagentCriticModel = document.getElementById('setting-subagent-critic-model');
 const settingSubagentCloudRouting = document.getElementById('setting-subagent-cloud-routing'), settingSubagentMaxParallel = document.getElementById('setting-subagent-max-parallel');
 const subagentResourcePlan = document.getElementById('subagent-resource-plan');
-// SAFIR controls are absent in basic-chat builds.  Keep the optional
-// reference defined so legacy settings handlers cannot abort UI startup.
-const safirModelStatus = document.getElementById('safir-model-status');
 const agentDisplayNameInputs = {
     planner: document.getElementById('setting-agent-name-planner'),
     explorer: document.getElementById('setting-agent-name-explorer'),
@@ -5162,7 +5159,6 @@ function renderRebuildReport(data) {
         `Sessions: ${data.sessions}`,
         `Messages: ${data.messages}`,
         `Runs: ${data.runs}`,
-        `SAFIR: ${data.safir_analyses}`,
         `Errors: ${data.errors?.length || 0}`,
         data.applied ? `Backup: ${data.backup_path}` : '目前僅為預覽'
     ].join('\n');
@@ -5390,7 +5386,6 @@ function initSettingsControls() {
                 checkN8nStatus();
                 checkCursorStatus();
             }
-            if (targetId === 'tab-settings-agent') refreshSafirStatus();
         });
     });
 
@@ -5482,24 +5477,6 @@ function initSettingsControls() {
             invalidateProviderToolAttestation(card);
         }
     });
-    safirModelStatus?.addEventListener('click', async event => {
-        if (!event.target.closest('[data-safir-evaluate]')) return;
-        const button = event.target.closest('[data-safir-evaluate]');
-        button.disabled = true;
-        safirModelStatus.className = 'safir-model-status is-loading';
-        safirModelStatus.textContent = '正在執行中文 SAFIR 評測並校正門檻…';
-        try {
-            const response = await removedBasicFeature('SAFIR evaluation');
-            const data = await response.json();
-            if (!response.ok || !data.success) throw new Error(data.detail?.message || `HTTP ${response.status}`);
-            showToast(`SAFIR 評測完成：NLI ${Math.round((data.calibration?.nli_accuracy || 0) * 100)}%`, data.calibration?.all_passed ? 'success' : 'warning');
-        } catch (error) {
-            showToast(`SAFIR 評測失敗：${error.message}`, 'error');
-        } finally {
-            refreshSafirStatus();
-        }
-    });
-
     // 4. 儲存設定邏輯
     btnSettingsSave.addEventListener('click', async () => {
         await updateSubagentResourcePlan(true);
@@ -5540,11 +5517,6 @@ function initSettingsControls() {
             agent_final_report_detail: settingAgentFinalReportDetail.value || 'standard',
             settings_modal_width: currentSettingsSize.width,
             settings_modal_height: currentSettingsSize.height,
-            safir_semantic_entailment_enabled: BASIC_CHAT_MODE ? false : settingSafirNliEnabled.checked,
-            safir_max_search_rounds: BASIC_CHAT_MODE ? 0 : (parseInt(settingSafirSearchRounds.value) || 0),
-            safir_max_external_sources: BASIC_CHAT_MODE ? 2 : (parseInt(settingSafirExternalSources.value) || 2),
-            safir_retrieval_timeout_seconds: BASIC_CHAT_MODE ? 20 : (parseInt(settingSafirTimeout.value) || 20),
-            safir_critic_max_output_tokens: BASIC_CHAT_MODE ? 512 : (parseInt(settingSafirCriticTokens.value) || 512),
             subagent_enabled: BASIC_CHAT_MODE ? false : settingSubagentEnabled.checked, subagent_allow_planner_cloud_routing: BASIC_CHAT_MODE ? false : !!settingSubagentCloudRouting?.checked,
             subagent_max_parallel: parseInt(settingSubagentMaxParallel.value) || 1,
             subagent_models: BASIC_CHAT_MODE ? {} : {
@@ -5674,13 +5646,6 @@ async function loadSettingsFromServer() {
         settingAgentAutoValidate.checked = data.agent_auto_validate !== false;
         settingAgentAllowWorkspaceWrite.checked = data.agent_allow_workspace_write !== false;
         settingAgentFinalReportDetail.value = data.agent_final_report_detail || 'standard';
-        if (!BASIC_CHAT_MODE) {
-            settingSafirNliEnabled.checked = data.safir_semantic_entailment_enabled !== false;
-            settingSafirSearchRounds.value = data.safir_max_search_rounds ?? 1;
-            settingSafirExternalSources.value = data.safir_max_external_sources ?? 2;
-            settingSafirTimeout.value = data.safir_retrieval_timeout_seconds ?? 20;
-            settingSafirCriticTokens.value = data.safir_critic_max_output_tokens ?? 512;
-        }
         settingSubagentEnabled.checked = data.subagent_enabled !== false; settingSubagentCloudRouting.checked = !!data.subagent_allow_planner_cloud_routing;
         settingSubagentMaxParallel.value = String(data.subagent_max_parallel || 1);
         applyAgentDisplayNames(data.agent_display_names || {});
@@ -5688,7 +5653,7 @@ async function loadSettingsFromServer() {
             if (input) input.value = agentDisplayNames[role];
         });
         if (BASIC_CHAT_MODE) applyBasicChatSettingsUi();
-        else { await loadSubagentModelOptions(data.subagent_models || {}); refreshSafirStatus(); }
+        else { await loadSubagentModelOptions(data.subagent_models || {}); }
         if (data.default_chat_model && [...modelSelect.options].some(option => option.value === data.default_chat_model)) {
             modelSelect.value = data.default_chat_model;
             activeModelName.textContent = data.default_chat_model;
@@ -5698,29 +5663,6 @@ async function loadSettingsFromServer() {
         renderAgentCollaboration();
     } catch (err) {
         console.error('Failed to load settings from server:', err);
-    }
-}
-
-async function refreshSafirStatus() {
-    if (!safirModelStatus) return;
-    safirModelStatus.className = 'safir-model-status is-loading';
-    safirModelStatus.innerHTML = '<span class="status-spinner"></span><span>正在檢查 NLI 模型與來源快取…</span>';
-    try {
-        const response = await removedBasicFeature('SAFIR status');
-        const data = await response.json();
-        if (!response.ok || !data.success) throw new Error(data.detail?.message || `HTTP ${response.status}`);
-        const nli = data.nli || {};
-        const cache = data.source_cache || {};
-        const calibration = data.calibration || {};
-        const state = !nli.enabled ? '停用' : nli.available ? '可用' : '不可用';
-        safirModelStatus.className = `safir-model-status ${nli.available ? 'is-ready' : nli.enabled ? 'is-error' : 'is-disabled'}`;
-        const calibrationText = calibration.evaluated_at
-            ? `校正 NLI ${Math.round((calibration.nli_accuracy || 0) * 100)}% · E ${calibration.entailment_threshold} / C ${calibration.contradiction_threshold} · 來源 ≥ ${calibration.source_reliability_threshold ?? '--'} · 信心 ≥ ${calibration.confidence_threshold ?? '--'}`
-            : '尚未執行中文評測';
-        safirModelStatus.innerHTML = `<strong>NLI ${escapeHtml(state)}</strong><span>${escapeHtml(nli.model || '--')}</span><span>來源快取 ${cache.fresh_count || 0}/${cache.source_count || 0} · ${cache.version_count || 0} 版本</span><span>${escapeHtml(calibrationText)}</span><button type="button" class="btn btn-secondary safir-evaluate-btn" data-safir-evaluate>重新評測與校正</button>${nli.error ? `<small>${escapeHtml(nli.error)}</small>` : ''}`;
-    } catch (error) {
-        safirModelStatus.className = 'safir-model-status is-error';
-        safirModelStatus.textContent = `無法取得 SAFIR 狀態：${error.message}`;
     }
 }
 
@@ -5737,7 +5679,6 @@ const runRetryInputs = new Map();      // 僅供同一頁面的「重新執行�
 let runHistory = [];                  // Agent Run 紀錄（Inspector Run tab）
 let sseLogBuffer = [];                // 原始 SSE 事件（Inspector Logs tab）
 let lastMetrics = null;               // 最近一次生成指標
-let latestSafirAnalysis = null;       // 最近一輪 SAFIR 語義驗證結果
 const CTX_WINDOW_TOKENS = 32 * 1024;  // 前端估算用 context window（無後端回報時的預設）
 
 // ---- Toast（P13：取代 alert）----
@@ -6015,7 +5956,6 @@ function openInspector(tab) {
     });
     if (tab === 'context') renderContextPane();
     if (tab === 'run') renderRunPane();
-    if (tab === 'safir') renderSafirPane();
     if (tab === 'models') renderModelsPane();
     if (tab === 'logs') renderLogsPane();
     return true;
@@ -6059,32 +5999,6 @@ function renderRunPane() {
             <div style="color:var(--text-muted); margin-top:6px; font-size:12px;">${m.elapsed ? `用時 ${m.elapsed.toFixed(1)}s` : ''}${m.tokps ? ` · ${m.tokps} tok/s` : ''}${r.sources && r.sources.length ? ` · ${r.sources.length} 來源` : ''}</div>
         </div>`;
     }).join('');
-}
-
-function renderSafirPane() {
-    const status = document.getElementById('ip-safir-status');
-    const graph = document.getElementById('ip-safir-graph');
-    const risk = document.getElementById('ip-safir-risk');
-    if (!status || !graph || !risk) return;
-    const data = latestSafirAnalysis;
-    if (!data) {
-        status.textContent = '本輪尚無 SAFIR 分析。';
-        graph.textContent = '--';
-        risk.textContent = '--';
-        return;
-    }
-    const claims = data.claims || [];
-    const evidence = data.evidence || [];
-    const verified = claims.filter(c => c.status === 'verified').length;
-    const quarantined = claims.filter(c => c.status === 'quarantined').length;
-    const semanticClaims = claims.filter(c => c.verification_method === 'multilingual_nli').length;
-    const qualities = evidence.map(item => Number(item.source_reliability)).filter(Number.isFinite);
-    const averageQuality = qualities.length ? Math.round((qualities.reduce((sum, value) => sum + value, 0) / qualities.length) * 100) : 0;
-    const ttlLabels = [...new Set(evidence.map(item => item.ttl).filter(Boolean))];
-    const safirStateLabel = data.delivery_action === 'repair' ? '補查中' : data.delivery_action === 'advisory' ? '有缺口／不阻擋' : '通過';
-    status.textContent = `${data.mode} · ${safirStateLabel} · 證據覆蓋率 ${Math.round((data.evidence_coverage || 0) * 100)}%`;
-    graph.textContent = `Claims ${claims.length}（verified ${verified} / 待確認 ${quarantined}） · Evidence ${evidence.length} · NLI ${semanticClaims} · 品質 ${averageQuality || '--'}% · TTL ${ttlLabels.join('/') || '--'}`;
-    risk.textContent = data.breaker_reasons?.length ? data.breaker_reasons.join('、') : '目前沒有未解決的查證提示';
 }
 
 function renderModelsPane() {
@@ -6976,6 +6890,9 @@ function initA11y() {
             } else if (primaryWorkspace === 'cloud') {
                 e.preventDefault();
                 window.workbenchCloudLlm?.close?.();
+            } else if (primaryWorkspace === 'mlops') {
+                e.preventDefault();
+                window.workbenchMLOps?.close?.();
             } else if (window.workbenchRunInspector?.isOpen?.()) {
                 e.preventDefault();
                 setOutputFloatingPanelOpen(false, { restoreFocus: true });
@@ -7039,29 +6956,32 @@ function activateChatForAuxiliaryPanel() {
 }
 
 function setPrimaryWorkspace(workspace = 'chat') {
-    const supportedWorkspaces = new Set(['chat', 'workflows', 'extensions', 'models', 'cloud']);
+    const supportedWorkspaces = new Set(['chat', 'workflows', 'extensions', 'models', 'cloud', 'mlops']);
     const nextWorkspace = supportedWorkspaces.has(workspace) ? workspace : 'chat';
     const workflowMode = nextWorkspace === 'workflows';
     const extensionMode = nextWorkspace === 'extensions';
     const modelMode = nextWorkspace === 'models';
     const cloudMode = nextWorkspace === 'cloud';
-    const managementMode = extensionMode || modelMode || cloudMode;
+    const mlopsMode = nextWorkspace === 'mlops';
+    const managementMode = extensionMode || modelMode || cloudMode || mlopsMode;
     const chatWorkspace = document.querySelector('main.chat-container');
     const workflowCenter = document.getElementById('n8n-workflow-center');
     const extensionCenter = document.getElementById('extension-center-workspace');
     const modelCenter = document.getElementById('model-manager-workspace');
     const cloudCenter = document.getElementById('cloud-llm-workspace');
+    const mlopsCenter = document.getElementById('mlops-workspace');
     const drawer = document.getElementById('chat-drawer');
     const railChat = document.getElementById('rail-chat');
     const railWorkflows = document.getElementById('rail-workflows');
     const railExtensions = document.getElementById('rail-extensions');
     const railModels = document.getElementById('rail-models');
     const railCloud = document.getElementById('rail-cloud-llm');
-    if (!chatWorkspace || !workflowCenter || !extensionCenter || !modelCenter || !cloudCenter || !drawer
-        || !railChat || !railWorkflows || !railExtensions || !railModels || !railCloud) return;
+    const railMlops = document.getElementById('rail-mlops');
+    if (!chatWorkspace || !workflowCenter || !extensionCenter || !modelCenter || !cloudCenter || !mlopsCenter || !drawer
+        || !railChat || !railWorkflows || !railExtensions || !railModels || !railCloud || !railMlops) return;
 
     const previousWorkspace = primaryWorkspace;
-    const previousManagementMode = ['extensions', 'models', 'cloud'].includes(previousWorkspace);
+    const previousManagementMode = ['extensions', 'models', 'cloud', 'mlops'].includes(previousWorkspace);
     if (previousWorkspace === 'cloud' && nextWorkspace !== 'cloud' && !cloudCenter.hidden) {
         void window.workbenchCloudLlm?.deactivate?.();
     }
@@ -7069,7 +6989,7 @@ function setPrimaryWorkspace(workspace = 'chat') {
     if (managementMode && !previousManagementMode) {
         runInspectorSuspendedWorkspace = previousWorkspace;
     }
-    const activeManagementRail = extensionMode ? railExtensions : (modelMode ? railModels : railCloud);
+    const activeManagementRail = extensionMode ? railExtensions : (modelMode ? railModels : (cloudMode ? railCloud : railMlops));
     window.workbenchRunInspector?.setAvailable?.(!managementMode, {
         focusTarget: managementMode ? activeManagementRail : null,
     });
@@ -7084,6 +7004,7 @@ function setPrimaryWorkspace(workspace = 'chat') {
     extensionCenter.hidden = !extensionMode;
     modelCenter.hidden = !modelMode;
     cloudCenter.hidden = !cloudMode;
+    mlopsCenter.hidden = !mlopsMode;
     drawer.hidden = nextWorkspace !== 'chat';
     syncChatDrawerA11y(drawer);
     const workspaceRails = new Map([
@@ -7092,6 +7013,7 @@ function setPrimaryWorkspace(workspace = 'chat') {
         ['extensions', railExtensions],
         ['models', railModels],
         ['cloud', railCloud],
+        ['mlops', railMlops],
     ]);
     workspaceRails.forEach((rail, name) => {
         const active = name === nextWorkspace;
@@ -7130,9 +7052,19 @@ function setPrimaryWorkspace(workspace = 'chat') {
 function initWorkbench(status) {
     const workbenchBody = document.querySelector('.workbench-body');
     const modelWorkspace = document.getElementById('model-manager-workspace');
+    const mlopsWorkspace = document.getElementById('mlops-workspace');
     if (workbenchBody && modelWorkspace && modelWorkspace.parentElement !== workbenchBody) {
         workbenchBody.appendChild(modelWorkspace);
     }
+    if (workbenchBody && mlopsWorkspace && mlopsWorkspace.parentElement !== workbenchBody) {
+        workbenchBody.appendChild(mlopsWorkspace);
+    }
+    window.workbenchMLOps?.init({
+        apiFetch, apiBase: API_BASE, showToast,
+        getActiveProjectId: () => activeProjectId,
+        onWorkspaceOpen: () => setPrimaryWorkspace('mlops'),
+        onWorkspaceClose: () => { setPrimaryWorkspace('chat'); document.getElementById('rail-chat')?.focus(); }
+    });
     window.workbenchExtensions?.init({
         apiFetch,
         apiBase: API_BASE,
@@ -7241,6 +7173,7 @@ function initWorkbench(status) {
     });
     document.getElementById('rail-cloud-llm').addEventListener('click', () => window.workbenchCloudLlm?.open());
     document.getElementById('rail-extensions').addEventListener('click', () => window.workbenchExtensions?.open('installed'));
+    document.getElementById('rail-mlops').addEventListener('click', () => window.workbenchMLOps?.open());
     document.getElementById('rail-settings').addEventListener('click', () => document.getElementById('btn-settings-trigger').click());
     setPrimaryWorkspace('chat');
 

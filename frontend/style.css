@@ -3544,7 +3544,14 @@ html:not([data-theme="dark"]) ::-webkit-scrollbar-thumb:hover {
     background: var(--sidebar-bg);
     border-right: 1px solid var(--panel-border);
     z-index: calc(var(--z-shell-navigation) - 5);
+    min-height: 0;
+    overflow-x: hidden;
+    overflow-y: auto;
+    scrollbar-width: thin;
+    scrollbar-color: var(--ink-12) transparent;
 }
+.icon-rail::-webkit-scrollbar { width: 4px; }
+.icon-rail::-webkit-scrollbar-thumb { background: var(--ink-12); border-radius: 999px; }
 .rail-btn {
     width: 44px;
     padding: 7px 0 5px;
@@ -4235,6 +4242,33 @@ html:not([data-theme="dark"]) ::-webkit-scrollbar-thumb:hover {
         transition-duration: 0.01ms !important;
     }
 }
+
+/* MLOps 是主工作區，不使用會遮擋其他功能的浮動圖層。 */
+.mlops-workspace { flex: 1 1 auto; min-width: 0; height: 100%; overflow: hidden; background: var(--bg-primary, #faf9f6); }
+.mlops-workspace-shell { height: 100%; display: grid; grid-template-rows: auto auto minmax(0, 1fr) auto; }
+.mlops-header { padding: 22px 28px 14px; }
+.mlops-header h1 { display: flex; align-items: center; gap: 9px; margin: 4px 0; }
+.mlops-eyebrow { color: var(--primary, #5658d8); font-size: 12px; letter-spacing: .08em; }
+.mlops-tabs { display: flex; gap: 6px; padding: 0 28px 10px; border-bottom: 1px solid var(--border-color, #dedbd4); overflow-x: auto; }
+.mlops-tabs button { border: 0; background: transparent; padding: 9px 13px; border-radius: 8px; white-space: nowrap; cursor: pointer; }
+.mlops-tabs button.active { color: var(--primary, #5658d8); background: color-mix(in srgb, var(--primary, #5658d8) 10%, transparent); }
+.mlops-content { min-height: 0; overflow: auto; padding: 20px 28px 32px; }
+.mlops-summary-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+.mlops-summary-grid article, .mlops-notice, .mlops-form-card, .mlops-item { border: 1px solid var(--border-color, #dedbd4); background: var(--bg-secondary, #fff); border-radius: 14px; }
+.mlops-summary-grid article { display: grid; gap: 5px; padding: 18px; }
+.mlops-summary-grid strong { font-size: 26px; }
+.mlops-notice, .mlops-form-card { padding: 18px; margin-top: 16px; }
+.mlops-notice p, .mlops-form-card p { margin: 7px 0 0; color: var(--text-secondary, #666); line-height: 1.55; }
+.mlops-form-card h2 { margin: 0; font-size: 17px; }
+.mlops-form-row { display: grid; grid-template-columns: minmax(180px, 1fr) minmax(220px, 1.5fr) auto; gap: 12px; align-items: end; margin-top: 15px; }
+.mlops-form-row label { display: grid; gap: 6px; font-size: 13px; }
+.mlops-form-row input, .mlops-form-row select { min-height: 40px; border: 1px solid var(--border-color, #d8d5cf); border-radius: 8px; padding: 8px 10px; background: var(--bg-primary, #fff); color: inherit; }
+.mlops-list { display: grid; gap: 10px; margin-top: 16px; }
+.mlops-item { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 14px 16px; }
+.mlops-item > div { display: grid; gap: 4px; min-width: 0; }
+.mlops-item span, .mlops-item p { color: var(--text-secondary, #666); font-size: 13px; margin: 0; overflow-wrap: anywhere; }
+.mlops-empty { color: var(--text-secondary, #777); padding: 20px; text-align: center; }
+@media (max-width: 900px) { .mlops-summary-grid { grid-template-columns: repeat(2, 1fr); } .mlops-form-row { grid-template-columns: 1fr; } .mlops-header, .mlops-content { padding-left: 16px; padding-right: 16px; } .mlops-tabs { padding-left: 16px; padding-right: 16px; } }
 
 /* Governed Agent administration for n8n. */
 .n8n-agent-governance {

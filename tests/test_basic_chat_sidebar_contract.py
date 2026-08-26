@@ -23,8 +23,5 @@ def test_only_unsupported_sidebar_surfaces_are_hidden_in_basic_chat_mode():
     assert "[hidden]" in STYLE_CSS and "display: none !important" in STYLE_CSS
 
 
-def test_basic_mode_skips_removed_skill_and_safir_controls():
+def test_basic_mode_skips_removed_skill_center():
     assert "typeof BASIC_CHAT_MODE !== 'undefined' && BASIC_CHAT_MODE" in SKILL_CENTER_JS
-    assert "safir_max_external_sources: BASIC_CHAT_MODE ? 2" in APP_JS
-    assert "safir_retrieval_timeout_seconds: BASIC_CHAT_MODE ? 20" in APP_JS
-    assert "safir_critic_max_output_tokens: BASIC_CHAT_MODE ? 512" in APP_JS

@@ -66,8 +66,7 @@ function configureBasicChatComposerUi() {
     document.querySelectorAll([
         '[data-target="tab-settings-rag"]', '[data-target="tab-settings-agent"]',
         '[data-target="tab-settings-integrations"]', '[data-target="tab-settings-runtime"]',
-        '[data-itab="run"]', '[data-itab="artifact"]', '[data-itab="logs"]',
-        '[data-itab="safir"]'
+        '[data-itab="run"]', '[data-itab="artifact"]', '[data-itab="logs"]'
     ].join(', '))
         .forEach(element => { element.hidden = true; });
     document.querySelector('#inspector-pane-context .ip-section')?.setAttribute('hidden', '');

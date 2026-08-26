@@ -260,6 +260,7 @@ class MCPSettingsCoordinator:
         project_ids_provider: Optional[ProjectIDsProvider] = None,
         secret_resolver: Optional[Callable[[str], str]] = None,
         client_factory: Optional[ClientFactory] = None,
+        operations: Any = None,
     ) -> None:
         if extension_registry is None:
             raise TypeError("extension_registry is required")
@@ -276,6 +277,7 @@ class MCPSettingsCoordinator:
         self.project_ids_provider = project_ids_provider or (lambda: ())
         self.secret_resolver = secret_resolver
         self.client_factory = client_factory
+        self.operations = operations
         self._active: dict[str, _ActiveMCP] = {}
         self._registered: dict[str, dict[str, str]] = {}
         self._health: dict[str, dict[str, Any]] = {}
@@ -361,6 +363,19 @@ class MCPSettingsCoordinator:
                 record["error_type"] = type(error).__name__
                 record["error"] = str(redact(str(error)))[:1000]
             self._health[extension_id] = record
+        if self.operations is not None:
+            shared_status = "healthy" if status == "healthy" else "disabled" if status == "disabled" else "degraded" if status not in {"unavailable", "unknown"} else "unavailable" if status == "unavailable" else "unknown"
+            reason = str(record.get("error_code") or (detail or {}).get("reason") or f"mcp_{status}").casefold().replace(" ", "_")[:128]
+            try:
+                self.operations.report_health(
+                    component_type="mcp",
+                    component_id=extension_id,
+                    status=shared_status,
+                    reason_code=reason,
+                    detail={"running": record["running"], "tool_count": record["tool_count"], "projects": record["projects"]},
+                )
+            except Exception:
+                pass
 
     @staticmethod
     async def _call(value: Any) -> Any:

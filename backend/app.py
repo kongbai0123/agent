@@ -42,6 +42,8 @@ from api.routes.extensions import build_extensions_router
 from api.routes.hermes import build_hermes_router
 from api.routes.models import build_models_router
 from api.routes.model_governance import build_model_governance_router
+from api.routes.mlops import build_mlops_router
+from api.routes.operations import build_operations_router
 from api.routes.n8n_agent import build_n8n_agent_router
 from api.routes.n8n_agent_tasks import build_n8n_agent_tasks_router
 from api.routes.n8n_gmail import build_n8n_gmail_router
@@ -117,6 +119,8 @@ from model_governance import (
     ModelGovernanceService,
     configure_model_governance,
 )
+from mlops_service import MLOpsService
+from operations_core import OperationsCore
 from n8n_gmail_crypto import AesGcmContentCipher
 from n8n_gmail_delivery import N8nDeliveryDispatcher
 from n8n_gmail_secrets import N8nGmailSecretStore
@@ -146,7 +150,7 @@ from hermes_project_skills_bridge import HermesProjectSkillsAttachment
 from hermes_rollout import HermesRolloutError, HermesRolloutGate
 from hermes_supervisor import HermesHealthSupervisor
 from ollama_cleanup import loaded_models_snapshot
-from paths import PROJECTS_ROOT, REPO_ROOT, ensure_runtime_dirs
+from paths import PROJECTS_ROOT, REPO_ROOT, RUNTIME_ROOT, ensure_runtime_dirs
 from pdf_parser import extract_pdf_text
 from project_storage import (
     attachments_dir as project_attachments_dir,
@@ -188,7 +192,7 @@ from workspace import (
 )
 
 
-APP_VERSION = "0.9.0-model-catalog-beta.4"
+APP_VERSION = "0.9.0-model-catalog-beta.5"
 SETTINGS_PATH = str(
     Path(
         os.environ.get("WORKBENCH_SETTINGS_PATH")
@@ -1371,9 +1375,17 @@ update_startup(
     progress_percent=28,
 )
 database.init_db()
-model_governance = ModelGovernanceService(database_module=database)
+operations_core = OperationsCore(database_module=database)
+operations_core.initialize()
+model_governance = ModelGovernanceService(database_module=database, operations=operations_core)
 model_governance.initialize()
 configure_model_governance(model_governance)
+mlops_service = MLOpsService(
+    database_module=database,
+    operations=operations_core,
+    storage_root=RUNTIME_ROOT / "mlops",
+)
+mlops_service.initialize()
 hook_audit_store = HookAuditStore(database_module=database)
 hook_dispatcher = configure_hook_dispatcher(
     HookDispatcher.from_builtin_plugins(
@@ -1520,6 +1532,7 @@ mcp_coordinator = MCPSettingsCoordinator(
     allowed_cwd_roots=(REPO_ROOT, PROJECTS_ROOT),
     project_ids_provider=_extension_project_ids,
     secret_resolver=_resolve_mcp_secret,
+    operations=operations_core,
 )
 
 
@@ -1837,6 +1850,19 @@ models_router = build_models_router(
     require_extension=require_extension_http,
     app_version=APP_VERSION,
     agent_protocol_version=1,
+    operations=operations_core,
+)
+
+operations_router = build_operations_router(
+    core=operations_core,
+    require_local=require_local_workbench,
+    require_project=database.get_project,
+)
+
+mlops_router = build_mlops_router(
+    service=mlops_service,
+    require_local=require_local_workbench,
+    require_project=database.get_project,
 )
 
 settings_router = build_settings_router(
@@ -1877,6 +1903,13 @@ hermes_health_supervisor = HermesHealthSupervisor(
     manager_provider=lambda settings: hermes_manager_cache.try_get(settings),
     probe_interval_seconds=10,
     failure_threshold=3,
+    health_reporter=lambda status, reason, detail: operations_core.report_health(
+        component_type="hermes",
+        component_id="sidecar",
+        status=status,
+        reason_code=reason,
+        detail=detail,
+    ),
 )
 hermes_rollout_gate = HermesRolloutGate(status_provider=hermes_operational_status)
 project_skills_router = build_project_skills_router(
@@ -2565,6 +2598,8 @@ for domain_router in (
     settings_router,
     models_router,
     model_governance_router,
+    operations_router,
+    mlops_router,
 ):
     app.include_router(domain_router)
 
