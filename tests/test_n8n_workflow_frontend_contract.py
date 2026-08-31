@@ -77,22 +77,39 @@ def test_workflow_hmi_directly_controls_the_real_managed_n8n_service():
     assert "state.dom.serviceOpen.addEventListener('click', openEditor)" in wiring
 
 
-def test_workflow_defaults_to_a_conversational_hmi_and_defers_advanced_settings():
+def test_workflow_uses_chat_as_the_creation_entry_and_defers_advanced_settings():
     for copy in (
-        "想讓 n8n 幫你做什麼？",
-        "直接描述想達成的結果",
-        "說出需求",
-        "確認執行",
-        "送出需求",
+        "在聊天中建立自動化",
+        "回到聊天描述需求",
+        "檢查提案並批准",
+        "檢查助理建議的流程",
+        "需求由目前聊天帶入",
+        "送出補充",
     ):
         assert copy in INDEX_HTML
-    assert 'id="n8n-plan-scope"' in INDEX_HTML
+    assert "想讓 n8n 幫你做什麼？" not in INDEX_HTML
+    assert "送出需求" not in INDEX_HTML
+    assert 'id="n8n-plan-workspace" aria-labelledby="n8n-plan-title" hidden' in INDEX_HTML
+    assert 'id="n8n-plan-form" class="workflow-form n8n-plan-form" hidden' in INDEX_HTML
+    assert 'id="n8n-plan-scope"' not in INDEX_HTML
     assert 'id="n8n-plan-scope-summary"' in INDEX_HTML
     assert '<details class="n8n-progressive-panel" id="n8n-advanced-settings">' in INDEX_HTML
     assert '<details class="n8n-progressive-panel" id="n8n-gmail-settings">' in INDEX_HTML
     assert 'id="n8n-advanced-settings" open' not in INDEX_HTML
     assert 'id="n8n-gmail-settings" open' not in INDEX_HTML
     assert "n8n-plan-layout:has(.n8n-plan-impact:not([hidden]))" in STYLE_CSS
+
+
+def test_workflow_can_prepare_in_background_without_switching_workspace():
+    prepare = _slice(WORKFLOW_JS, "async function prepare()", "function open()")
+    assert "await refreshExtensionState()" in prepare
+    assert "await ensureServiceForWorkspace()" in prepare
+    assert "refreshProfile()" in prepare
+    assert "refreshRuns()" in prepare
+    open_workspace = _slice(WORKFLOW_JS, "function open()", "function startBackgroundSync()")
+    assert "state.deps.onWorkspaceOpen?.()" in open_workspace
+    assert "return prepare()" in open_workspace
+    assert "prepare," in WORKFLOW_JS[WORKFLOW_JS.index("window.workbenchN8nWorkflows ="):]
 
 
 def test_single_profile_has_fixed_label_recipient_and_project_sources():
@@ -215,12 +232,13 @@ def test_workflow_workspace_starts_n8n_on_demand_only_after_safe_status_probe():
     assert "service.installed !== true" in ensure
     assert "service.isolation_ready !== true" in ensure
     assert "request('/api/integrations/n8n/start', { method: 'POST' })" in ensure
+    prepare = _slice(WORKFLOW_JS, "async function prepare()", "function open()")
+    assert "await refreshExtensionState()" in prepare
+    assert "if (!n8nExtensionReady())" in prepare
+    assert "await ensureServiceForWorkspace()" in prepare
     open_workspace = _slice(WORKFLOW_JS, "function open()", "function startBackgroundSync")
-    assert "await refreshExtensionState()" in open_workspace
-    assert "if (!n8nExtensionReady())" in open_workspace
-    assert "await ensureServiceForWorkspace()" in open_workspace
-    assert "const ready = (async () =>" in open_workspace
-    assert "return ready" in open_workspace
+    assert "state.deps.onWorkspaceOpen?.()" in open_workspace
+    assert "return prepare()" in open_workspace
 
 
 def test_workflow_header_uses_extension_state_while_details_keep_core_service_controls():

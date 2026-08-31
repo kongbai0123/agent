@@ -4522,6 +4522,36 @@ html:not([data-theme="dark"]) ::-webkit-scrollbar-thumb:hover {
     border-color: color-mix(in srgb, var(--primary-color) 36%, var(--border-color));
 }
 
+.workflow-card-head-actions {
+    display: flex;
+    flex: 0 0 auto;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+
+.n8n-plan-scope-summary-line {
+    margin: 12px 0 0;
+    padding: 9px 11px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    border: 1px solid var(--panel-border);
+    border-radius: 10px;
+    background: var(--surface-subtle);
+    color: var(--text-muted);
+    font-size: 12.5px;
+    line-height: 1.45;
+}
+
+.n8n-plan-scope-summary-line svg {
+    width: 16px;
+    height: 16px;
+    flex: 0 0 auto;
+    color: var(--primary-color);
+}
+
 .n8n-progressive-panel {
     min-width: 0;
     overflow: hidden;
@@ -5455,6 +5485,8 @@ html:not([data-theme="dark"]) ::-webkit-scrollbar-thumb:hover {
     align-items: center;
     gap: 8px;
     flex: 0 0 auto;
+    flex-wrap: wrap;
+    justify-content: flex-end;
 }
 .workflow-header-status-row {
     margin-top: 10px;
@@ -10399,8 +10431,52 @@ body.basic-chat-mode .assistant-answer-content > :last-child {
     margin-bottom: 0;
 }
 
+.n8n-chat-plan-handoff {
+    display: grid;
+    gap: 12px;
+}
+
+.n8n-chat-plan-handoff > p {
+    margin: 0;
+    color: var(--text-secondary);
+    line-height: 1.55;
+}
+
+.n8n-chat-plan-title {
+    color: var(--text-primary);
+    font-size: 15px;
+    line-height: 1.4;
+}
+
+.n8n-chat-plan-facts {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 7px;
+}
+
+.n8n-chat-plan-facts span {
+    padding: 5px 9px;
+    border: 1px solid color-mix(in srgb, var(--primary-color) 24%, var(--panel-border));
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--primary-color) 6%, var(--elev-bg));
+    color: var(--text-secondary);
+    font-size: 12px;
+    line-height: 1.35;
+}
+
+.n8n-chat-plan-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+
 body.basic-chat-mode .assistant-answer-content p {
     margin: 0 0 0.78em;
+}
+
+body.basic-chat-mode .n8n-chat-plan-handoff > p {
+    margin: 0;
 }
 
 body.basic-chat-mode .assistant-answer-content ul,

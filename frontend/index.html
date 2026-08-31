@@ -322,6 +322,9 @@
                         </div>
                     </div>
                     <div class="workflow-header-actions">
+                        <button type="button" class="btn btn-primary compact" id="workflow-chat-start">
+                            <i data-lucide="message-square" aria-hidden="true"></i>在聊天中建立自動化
+                        </button>
                         <button type="button" class="btn btn-secondary compact" id="workflow-refresh">
                             <i data-lucide="refresh-cw" aria-hidden="true"></i>重新整理
                         </button>
@@ -377,19 +380,30 @@
                         <div class="workflow-command-guide" aria-label="建議操作順序">
                             <span><strong>1</strong>啟動服務</span>
                             <i data-lucide="chevron-right" aria-hidden="true"></i>
-                            <span><strong>2</strong>說出需求</span>
+                            <span><strong>2</strong>回到聊天描述需求</span>
                             <i data-lucide="chevron-right" aria-hidden="true"></i>
-                            <span><strong>3</strong>確認執行</span>
+                            <span><strong>3</strong>檢查提案並批准</span>
                         </div>
                     </section>
-                    <section class="workflow-card n8n-plan-mode" aria-labelledby="n8n-plan-title">
+                    <section class="workflow-card n8n-plan-mode" id="n8n-plan-workspace" aria-labelledby="n8n-plan-title" hidden>
                         <div class="workflow-card-head">
                             <div>
-                                <span class="workflow-eyebrow">直接說出需求</span>
-                                <h2 id="n8n-plan-title">想讓 n8n 幫你做什麼？</h2>
-                                <p>直接描述想達成的結果，不必先理解節點或流程設定。只有外部寫入或敏感動作時，Workbench 才會請你確認。</p>
+                                <span class="workflow-eyebrow">聊天建立的自動化提案</span>
+                                <h2 id="n8n-plan-title">檢查助理建議的流程</h2>
+                                <p>需求由目前聊天帶入；這裡只顯示方案、風險、節點圖與待批准操作。</p>
                             </div>
-                            <span class="workflow-status-pill" id="n8n-plan-state" role="status" aria-live="polite">尚未開始</span>
+                            <div class="workflow-card-head-actions">
+                                <span class="workflow-status-pill" id="n8n-plan-state" role="status" aria-live="polite">正在準備</span>
+                                <button type="button" class="btn btn-secondary compact" id="n8n-plan-reset" disabled>結束提案</button>
+                            </div>
+                        </div>
+                        <p class="n8n-plan-scope-summary-line">
+                            <i data-lucide="folder-check" aria-hidden="true"></i>
+                            <span id="n8n-plan-scope-summary">會自動使用目前專案與對話</span>
+                        </p>
+                        <div hidden aria-hidden="true">
+                            <select id="n8n-agent-project" tabindex="-1"><option value="">目前專案</option></select>
+                            <select id="n8n-plan-session" tabindex="-1"><option value="">目前對話</option></select>
                         </div>
                         <div id="n8n-plan-provenance" class="n8n-plan-provenance" aria-label="規劃模型來源" hidden>
                             <span id="n8n-plan-primary-model"></span>
@@ -405,36 +419,15 @@
                                     </article>
                                 </div>
                                 <div id="n8n-plan-options" class="n8n-plan-options" role="group" aria-label="Agent 建議選項" hidden></div>
-                                <form id="n8n-plan-form" class="workflow-form n8n-plan-form">
+                                <form id="n8n-plan-form" class="workflow-form n8n-plan-form" hidden>
                                     <label for="n8n-plan-input">
-                                        <span>告訴 n8n 你想完成什麼</span>
-                                        <textarea id="n8n-plan-input" maxlength="4000" rows="3" placeholder="例如：收到指定客戶的 Gmail 後，整理內容並建立回覆草稿。" required></textarea>
-                                        <small>按 Enter 送出、Shift+Enter 換行。Workbench 會先整理方案，不會直接執行敏感動作。</small>
+                                        <span>補充或調整這份提案</span>
+                                        <textarea id="n8n-plan-input" maxlength="4000" rows="3" placeholder="補充助理詢問的必要資訊…" required></textarea>
+                                        <small>只有目前提案需要釐清時才會顯示；敏感動作仍須另外批准。</small>
                                     </label>
-                                    <details class="n8n-plan-scope" id="n8n-plan-scope">
-                                        <summary>
-                                            <span><i data-lucide="folder-check" aria-hidden="true"></i>工作範圍</span>
-                                            <small id="n8n-plan-scope-summary">會自動使用目前範圍；全新環境會在首次送出時建立個人工作區</small>
-                                        </summary>
-                                        <div class="workflow-grid n8n-plan-scope-grid">
-                                            <label for="n8n-agent-project">
-                                                <span>Project</span>
-                                                <select id="n8n-agent-project"><option value="">請選擇 Project</option></select>
-                                                <small>限制 Agent 只能使用這個專案的資料與工具。</small>
-                                            </label>
-                                            <label for="n8n-plan-session">
-                                                <span>對話</span>
-                                                <select id="n8n-plan-session">
-                                                    <option value="">請先選擇此 Project 的 Session</option>
-                                                </select>
-                                                <small>避免不同對話的提案與確認互相混用。</small>
-                                            </label>
-                                        </div>
-                                    </details>
                                     <div class="workflow-actions workflow-actions-end">
-                                        <button type="button" class="btn btn-secondary" id="n8n-plan-reset" disabled>重新規劃</button>
                                         <button type="submit" class="btn btn-primary" id="n8n-plan-send">
-                                            <i data-lucide="send" aria-hidden="true"></i>送出需求
+                                            <i data-lucide="send" aria-hidden="true"></i>送出補充
                                         </button>
                                     </div>
                                 </form>

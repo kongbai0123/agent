@@ -92,9 +92,9 @@ def test_api_route_contract_snapshot():
     """Physical router moves must not rename or drop an API by accident."""
     routes = sorted(_api_routes())
     payload = json.dumps(routes, separators=(",", ":"))
-    assert len(routes) == 190
+    assert len(routes) == 191
     assert hashlib.sha256(payload.encode("utf-8")).hexdigest() == (
-        "10bf7f0983bdc83a90984db8df7866270532ba50fe996160e9d9da3c0be4fb46"
+        "2d6d4ad07a4f72edb55fb6a66384b528a65f6f06c15c8d18a487cc45c059f39d"
     )
 
 

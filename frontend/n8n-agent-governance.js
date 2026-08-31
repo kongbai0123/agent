@@ -6,6 +6,7 @@
         initialized: false, deps: {}, dom: {}, policy: null, operations: [], workflows: [], audits: [],
         credentialAliases: [], runtimeApprovals: [], inspectorScope: '', inspectorLease: null,
         plan: null, planMessages: [], planScope: '', planBusy: false, planBusyAction: '', scopeBusy: false,
+        planWorkspaceVisible: false, planRestoreRequestId: 0,
         catalogResults: [], catalogDigest: '', adoptionPreview: null,
         requestId: 0, refreshTimer: null,
     };
@@ -199,6 +200,8 @@
         });
         return {
             id: String(source.id || source.plan_id || payload.plan_id || '').trim(),
+            projectId: String(source.project_id || '').trim(),
+            sessionId: String(source.session_id || '').trim(),
             planSchema,
             digest,
             status,
@@ -219,6 +222,10 @@
             issues,
             questions,
             generationProvenance,
+            operationId: String(source.operation_id || '').trim(),
+            createdAt: String(source.created_at || '').trim(),
+            updatedAt: String(source.updated_at || '').trim(),
+            expiresAt: String(source.expires_at || '').trim(),
             readyToMaterialize: blockers.length === 0 && Boolean(selectedOptionId) && ['selected', 'needs_input'].includes(status),
             readyToPropose: blockers.length === 0 && status === 'graph_ready'
                 && validationStatus === 'ready' && /^[a-f0-9]{64}$/.test(graphDigest),
@@ -302,6 +309,7 @@
 
     function renderPlanner() {
         if (!state.initialized) return;
+        state.dom.planWorkspace.hidden = !state.planWorkspaceVisible;
         const hasProject = Boolean(projectId());
         const hasSession = Boolean(sessionId());
         const hasScope = hasProject && hasSession;
@@ -375,12 +383,14 @@
         state.dom.planProposal.hidden = !proposalReady;
         state.dom.planProposalSummary.textContent = plan?.summary || '這一步只會建立可執行的待核准提案；核准後 Broker 才會依提案內容實際操作 n8n。';
         state.dom.planPropose.disabled = state.planBusy || !proposalReady || !state.dom.planProposalAck.checked;
+        const acceptsFollowup = Boolean(plan && ['needs_input', 'selected', 'blocked', 'proposal_failed'].includes(plan.status));
+        state.dom.planForm.hidden = !acceptsFollowup;
         const scopeCanBePrepared = canAutoProvisionScope();
         state.dom.planInput.disabled = state.planBusy || state.scopeBusy || (!hasScope && !scopeCanBePrepared);
         state.dom.planSend.disabled = state.planBusy || state.scopeBusy || (!hasScope && !scopeCanBePrepared);
         state.dom.planInput.placeholder = plan?.status === 'needs_input'
-            ? '補充我需要知道的資訊…' : '例如：每天整理新訂單，將異常項目通知我…';
-        state.dom.planSend.textContent = plan?.status === 'needs_input' ? '送出補充' : '送出需求';
+            ? '補充助理詢問的必要資訊…' : '補充或調整這份提案…';
+        state.dom.planSend.textContent = '送出補充';
         state.dom.planReset.disabled = state.planBusy || state.scopeBusy || (!plan && state.planMessages.length === 0);
         const blocked = Boolean(plan?.blockers?.length || plan?.status === 'blocked');
         const busyLabel = state.planBusyAction === 'materializing' ? '正在產生唯一節點圖'
@@ -392,12 +402,13 @@
         state.deps.createIcons?.();
     }
 
-    function resetPlanner({ announce = false } = {}) {
+    function resetPlanner({ announce = false, keepVisible = false } = {}) {
         state.plan = null;
         state.planMessages = [];
         state.planScope = '';
         state.planBusy = false;
         state.planBusyAction = '';
+        state.planWorkspaceVisible = keepVisible;
         state.dom.planInput.value = '';
         state.dom.planProposalAck.checked = false;
         if (announce) appendPlanMessage('system', '已清除上一份規劃；尚未建立或執行任何 n8n 操作。');
@@ -410,7 +421,7 @@
             'N8N_PLAN_GRAPH_STALE', 'N8N_PLAN_MODEL_STALE',
         ]);
         if (!restartCodes.has(String(error?.code || ''))) return false;
-        resetPlanner({ announce: true });
+        resetPlanner({ announce: true, keepVisible: true });
         state.deps.showToast?.('規劃快照已失效，請重新規劃。', 'warning');
         return true;
     }
@@ -485,8 +496,11 @@
         const content = String(options.message || '').trim();
         if (!content) throw new Error('缺少要規劃的 n8n 操作需求。');
 
+        state.planRestoreRequestId += 1;
         resetPlanner();
+        state.planWorkspaceVisible = true;
         renderProjects();
+        renderPlanner();
 
         const requestedSession = String(options.sessionId || '').trim();
         // activeProjectId can briefly be empty while the sidebar is restoring.
@@ -496,7 +510,7 @@
         const requestedSessionRecord = (state.deps.getSessions?.() || [])
             .find(session => String(session?.id || '') === requestedSession);
         const requestedProject = String(
-            options.projectId || requestedSessionRecord?.project_id || ''
+            options.projectId || requestedSessionRecord?.project_id || state.dom.project.value || ''
         ).trim();
         const projectAvailable = requestedProject
             && [...state.dom.project.options].some(option => option.value === requestedProject);
@@ -507,24 +521,29 @@
             state.dom.project.value = '';
             renderPlanSessions();
         }
-        const sessionAvailable = requestedSession
-            && [...state.dom.planSession.options].some(option => option.value === requestedSession);
-        state.dom.planSession.value = sessionAvailable ? requestedSession : '';
+        const preferredSession = requestedSession || state.dom.planSession.value;
+        let sessionAvailable = preferredSession
+            && [...state.dom.planSession.options].some(option => option.value === preferredSession);
+        state.dom.planSession.value = sessionAvailable ? preferredSession : '';
 
         state.dom.planInput.value = content;
         const blockers = [];
-        if (!projectAvailable) blockers.push('請先選擇一個未封存的 Project。');
-        if (!sessionAvailable) blockers.push('請先選擇該 Project 內的一般聊天 Session。');
         if (options.hasAttachments === true) {
             blockers.push('n8n 操作規劃不會接收聊天圖片或附件；請移除附件後再送出。');
         }
+        if (!blockers.length && (!projectAvailable || !sessionAvailable) && canAutoProvisionScope()) {
+            await ensurePersonalScope();
+            sessionAvailable = Boolean(sessionId());
+        }
+        if (!projectId()) blockers.push('請先在左側選擇一個未封存的專案。');
+        if (!sessionAvailable) blockers.push('請先回到該專案的一般聊天再提出需求。');
         if (blockers.length) {
             state.planMessages = [
                 { role: 'agent', content: '我已辨識這是 n8n 操作要求，並轉到受治理的操作助理。' },
                 { role: 'system', content: `尚未送出規劃，也未操作 n8n：${blockers.join(' ')}` },
             ];
             renderPlanner();
-            return { status: 'blocked', message: blockers.join(' ') };
+            return { status: 'blocked', message: blockers.join(' '), plan: null };
         }
 
         const sent = await sendPlanMessage(content);
@@ -532,6 +551,7 @@
             return {
                 status: 'blocked',
                 message: sent?.error?.message || 'n8n 操作規劃未送出，且未執行任何操作。',
+                plan: state.plan ? { ...state.plan } : null,
             };
         }
         if (state.plan?.blockers?.length) {
@@ -540,13 +560,62 @@
                 message: state.plan.blockers.join(' '),
                 planId: state.plan.id || '',
                 digest: state.plan.digest || '',
+                plan: { ...state.plan },
             };
         }
         return {
             status: state.plan?.status || 'planning',
             planId: state.plan?.id || '',
             digest: state.plan?.digest || '',
+            plan: state.plan ? { ...state.plan } : null,
         };
+    }
+
+    async function restorePlanForScope(options = {}) {
+        if (!state.initialized) return { status: 'unavailable', plan: null };
+        const requestedProject = String(options.projectId || '').trim();
+        const requestedSession = String(options.sessionId || '').trim();
+        const requestId = ++state.planRestoreRequestId;
+        resetPlanner();
+        renderProjects();
+
+        const projectAvailable = requestedProject
+            && [...state.dom.project.options].some(option => option.value === requestedProject);
+        if (!projectAvailable) return { status: 'scope_unavailable', plan: null };
+        state.dom.project.value = requestedProject;
+        renderPlanSessions();
+        const sessionAvailable = requestedSession
+            && [...state.dom.planSession.options].some(option => option.value === requestedSession);
+        if (!sessionAvailable) return { status: 'scope_unavailable', plan: null };
+        state.dom.planSession.value = requestedSession;
+
+        try {
+            const payload = await api(
+                `/api/integrations/n8n/plans/current?project_id=${query(requestedProject)}&session_id=${query(requestedSession)}`,
+                { cache: 'no-store' }
+            );
+            const liveProject = String(state.deps.getActiveProjectId?.() || '').trim();
+            const liveSession = String(state.deps.getCurrentSessionId?.() || '').trim();
+            if (requestId !== state.planRestoreRequestId
+                || liveProject !== requestedProject || liveSession !== requestedSession) {
+                return { status: 'stale', plan: null };
+            }
+            if (!payload?.plan) {
+                resetPlanner();
+                return { status: 'empty', plan: null };
+            }
+            applyPlanResponse(payload.plan);
+            state.planWorkspaceVisible = true;
+            renderPlanner();
+            return { status: 'restored', plan: { ...state.plan } };
+        } catch (error) {
+            if (requestId === state.planRestoreRequestId) resetPlanner();
+            return {
+                status: 'unavailable',
+                plan: null,
+                message: error?.message || '無法恢復 n8n 提案。',
+            };
+        }
     }
 
     async function materializePlan() {
@@ -684,29 +753,29 @@
     }
 
     function syncPlanScopeDisclosure() {
-        if (!state.dom?.planScope || !state.dom?.planScopeSummary) return;
+        if (!state.dom?.planScopeSummary) return;
         const projectOption = state.dom.project?.selectedOptions?.[0];
         const sessionOption = state.dom.planSession?.selectedOptions?.[0];
         const hasProject = Boolean(projectId());
         const hasSession = Boolean(sessionId());
         state.dom.planScopeSummary.textContent = hasProject && hasSession
-            ? `${projectOption?.textContent || '目前專案'} · ${sessionOption?.textContent || '目前對話'}`
+            ? `自動沿用：${projectOption?.textContent || '目前專案'} · ${sessionOption?.textContent || '目前對話'}`
             : canAutoProvisionScope() ? '首次送出時會自動準備個人工作區'
-                : !hasProject ? '需要選擇一個 Project' : '需要選擇這次使用的對話';
-        if ((!hasProject || !hasSession) && !canAutoProvisionScope()) state.dom.planScope.open = true;
+                : !hasProject ? '請先在左側選擇專案' : '請先回到聊天選擇一個對話';
     }
 
     function renderProjects() {
         if (!state.initialized || !state.dom?.project) return;
-        const selected = projectId();
-        state.dom.project.replaceChildren(new Option('請選擇 Project', ''));
+        const selected = String(state.dom.project.value || '');
+        state.dom.project.replaceChildren(new Option('請選擇專案', ''));
         const projects = liveProjects();
         projects.forEach(project => {
             state.dom.project.appendChild(new Option(project.name || project.id, project.id));
         });
-        const active = String(selected || state.deps.getActiveProjectId?.() || '');
-        const preferred = projects.some(project => String(project.id) === active)
-            ? active
+        const active = String(state.deps.getActiveProjectId?.() || '');
+        const requested = active || selected;
+        const preferred = projects.some(project => String(project.id) === requested)
+            ? requested
             : projects.length === 1 ? String(projects[0].id) : '';
         state.dom.project.value = preferred;
         renderPlanSessions();
@@ -717,10 +786,10 @@
         const selected = state.dom.planSession.value;
         const current = String(state.deps.getCurrentSessionId?.() || '');
         const project = projectId();
-        state.dom.planSession.replaceChildren(new Option('請先選擇此 Project 的 Session', ''));
+        state.dom.planSession.replaceChildren(new Option('請先選擇此專案的對話', ''));
         const sessions = liveSessionsFor(project);
         sessions.forEach(session => state.dom.planSession.appendChild(new Option(session.title || session.id, session.id)));
-        const requested = String(selected || current || '');
+        const requested = String(current || selected || '');
         const preferred = sessions.some(session => String(session.id) === requested)
             ? requested
             : sessions.length === 1 ? String(sessions[0].id) : '';
@@ -1338,13 +1407,14 @@
         state.deps = options;
         const id = value => document.getElementById(value);
         state.dom = {
+            chatStart: id('workflow-chat-start'), planWorkspace: id('n8n-plan-workspace'),
             form: id('n8n-agent-policy-form'), project: id('n8n-agent-project'), mode: id('n8n-agent-mode'), duration: id('n8n-agent-duration'), ack: id('n8n-agent-ack'), state: id('n8n-agent-policy-state'), message: id('n8n-agent-policy-message'),
             apiKeyForm: id('n8n-agent-api-key-form'), apiKey: id('n8n-agent-api-key'), workflows: id('n8n-managed-workflows-list'), workflowCount: id('n8n-managed-workflows-count'), operations: id('n8n-operation-requests-list'), operationCount: id('n8n-operation-requests-count'), audits: id('n8n-agent-audits-list'),
             credentialAliasForm: id('n8n-credential-alias-form'), credentialAliasName: id('n8n-credential-alias-name'), credentialAliasId: id('n8n-credential-alias-id'),
             credentialAliases: id('n8n-credential-aliases-list'), credentialAliasCount: id('n8n-credential-aliases-count'),
             runtimeApprovals: id('n8n-runtime-approvals-list'), runtimeApprovalCount: id('n8n-runtime-approvals-count'),
             planForm: id('n8n-plan-form'), planInput: id('n8n-plan-input'), planSend: id('n8n-plan-send'), planReset: id('n8n-plan-reset'),
-            planSession: id('n8n-plan-session'), planScope: id('n8n-plan-scope'), planScopeSummary: id('n8n-plan-scope-summary'),
+            planSession: id('n8n-plan-session'), planScopeSummary: id('n8n-plan-scope-summary'),
             planState: id('n8n-plan-state'), planMessages: id('n8n-plan-messages'), planOptions: id('n8n-plan-options'), planImpact: id('n8n-plan-impact'),
             planProvenance: id('n8n-plan-provenance'), planPrimaryModel: id('n8n-plan-primary-model'),
             planStructuredMode: id('n8n-plan-structured-mode'), planRepairModel: id('n8n-plan-repair-model'),
@@ -1364,10 +1434,11 @@
             chatExecution: id('run-execution-content'), chatResults: id('run-results-content'), inspectorExecution: id('mail-inspector-execution'), inspectorResults: id('mail-inspector-results'),
         };
         if (Object.values(state.dom).some(value => !value)) throw new Error('n8n governance DOM is incomplete.');
+        state.dom.chatStart.addEventListener('click', () => state.deps.openChatComposer?.());
         state.dom.form.addEventListener('submit', savePolicy); state.dom.apiKeyForm.addEventListener('submit', saveApiKey);
         state.dom.credentialAliasForm.addEventListener('submit', adoptCredentialAlias);
-        state.dom.project.addEventListener('change', () => { releaseInspectorContext(); resetProjectScopedRuntime(); resetPlanner(); resetAdoptionPreview(); renderPlanSessions(); void refreshAll(); });
-        state.dom.planSession.addEventListener('change', () => { resetPlanner(); resetAdoptionPreview(); void refreshAll(); });
+        state.dom.project.addEventListener('change', () => { state.planRestoreRequestId += 1; releaseInspectorContext(); resetProjectScopedRuntime(); resetPlanner(); resetAdoptionPreview(); renderPlanSessions(); void refreshAll(); });
+        state.dom.planSession.addEventListener('change', () => { state.planRestoreRequestId += 1; resetPlanner(); resetAdoptionPreview(); void refreshAll(); });
         state.dom.mode.addEventListener('change', () => {
             const advanced = state.dom.mode.value === 'full_audit';
             state.dom.duration.disabled = !advanced;
@@ -1380,7 +1451,7 @@
             event.preventDefault();
             state.dom.planForm.requestSubmit();
         });
-        state.dom.planReset.addEventListener('click', () => resetPlanner({ announce: true }));
+        state.dom.planReset.addEventListener('click', () => resetPlanner());
         state.dom.planMaterialize.addEventListener('click', () => void materializePlan());
         state.dom.planProposalAck.addEventListener('change', renderPlanner);
         state.dom.planPropose.addEventListener('click', () => void proposePlan());
@@ -1404,6 +1475,7 @@
         refreshProjects: renderProjects,
         releaseInspectorContext,
         startPlanFromChat,
+        restorePlanForScope,
         getState: () => state,
     };
 })();

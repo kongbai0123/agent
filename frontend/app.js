@@ -30,6 +30,20 @@ let isCancellingGeneration = false;
 let currentSessionId = null;
 let activeProjectId = null;
 let currentImages = []; // 儲存當前待上傳圖片的 Base64 列表
+const LAST_ACTIVE_SESSION_KEY = 'workbench-last-active-session-id';
+
+function rememberActiveSession(sessionId) {
+    const value = String(sessionId || '').trim().slice(0, 128);
+    try {
+        if (value) localStorage.setItem(LAST_ACTIVE_SESSION_KEY, value);
+        else localStorage.removeItem(LAST_ACTIVE_SESSION_KEY);
+    } catch (_error) { /* 瀏覽器未開放本機儲存時維持原本行為。 */ }
+}
+
+function rememberedActiveSession() {
+    try { return String(localStorage.getItem(LAST_ACTIVE_SESSION_KEY) || '').trim().slice(0, 128); }
+    catch (_error) { return ''; }
+}
 
 // 第十階段高階功能變數
 let temporaryContextText = '';
@@ -90,6 +104,7 @@ async function ensureSession() {
     if (!res.ok) throw new Error(`建立會話失敗 (HTTP ${res.status})`);
     const data = await res.json();
     currentSessionId = data.session_id;
+    rememberActiveSession(currentSessionId);
     window.workbenchProjectSkills?.setSessionContext({
         sessionId: currentSessionId,
         projectId: activeProjectId,
@@ -1479,6 +1494,7 @@ async function initApp() {
 
     // 4. Workbench Shell（Rail / Chips / Dashboard / Wizard / Palette / Inspector）
     initWorkbench(status);
+    await restoreRememberedSession();
 }
 
 async function refreshProviderGovernanceAlert() {
@@ -2787,6 +2803,7 @@ async function createNewSession(projectId = null) {
         });
         const data = await res.json();
         currentSessionId = data.session_id;
+        rememberActiveSession(currentSessionId);
         resetConversationState(); // P0-1：新會話 → 清空 LLM 記憶
         agentCollaborationState = createAgentCollaborationState();
         closeAgentCollaboration(false);
@@ -2813,6 +2830,7 @@ async function changeSession(sessionId) {
     if (sessionId === currentSessionId) return;
     if (isGenerating) await cancelActiveChatRun();
     currentSessionId = sessionId;
+    rememberActiveSession(currentSessionId);
     clearOutputSkillsContext();
     chatMessages.innerHTML = '';
     welcomeCard.style.display = 'none';
@@ -2862,9 +2880,21 @@ async function changeSession(sessionId) {
             chatMessages.appendChild(welcomeCard);
             welcomeCard.style.display = 'block';
         }
+        await restoreN8nPlanHandoffForSession(sessionId);
     } catch (e) {
         console.error('Failed to fetch session messages:', e);
     }
+}
+
+async function restoreRememberedSession() {
+    const remembered = rememberedActiveSession();
+    if (!remembered) return;
+    const session = sidebarSessions.find(item => String(item.id) === remembered);
+    if (!session || session.archived || String(session.mode || 'chat') === 'email') {
+        rememberActiveSession(null);
+        return;
+    }
+    await changeSession(remembered);
 }
 
 async function deleteSession(sessionId) {
@@ -2874,6 +2904,7 @@ async function deleteSession(sessionId) {
         if (data.success) {
             if (currentSessionId === sessionId) {
                 currentSessionId = null;
+                rememberActiveSession(null);
                 clearOutputSkillsContext('請先選擇專案');
                 resetConversationState(); // P0-1
                 chatMessages.innerHTML = '';
@@ -3330,17 +3361,97 @@ function isExplicitN8nWorkflowAuthoringIntent(value) {
         && /(?:create|add|build|design|update|edit|connect|wire|deploy|建立|新增|設計|修改|連接|串接|配對|部署|拉)/i.test(text);
 }
 
+function appendN8nPlanHandoff(question, result = {}) {
+    const plan = result.plan && typeof result.plan === 'object' ? result.plan : null;
+    const planId = String(plan?.id || result.planId || '').trim();
+    const scope = `${String(plan?.projectId || activeProjectId || '')}::${String(plan?.sessionId || currentSessionId || '')}`;
+    const duplicate = [...chatMessages.querySelectorAll('.n8n-chat-plan-handoff')]
+        .some(item => item.dataset.n8nPlanId === planId && item.dataset.n8nPlanScope === scope);
+    if (planId && duplicate) return null;
+
+    if (welcomeCard.style.display !== 'none') welcomeCard.style.display = 'none';
+    if (result.restored !== true && String(question || '').trim()) appendMessage('user', question);
+    const messageEl = appendMessage('assistant', '');
+    const content = messageEl.querySelector('.assistant-answer-content');
+    if (!content) return null;
+
+    const blocked = result.status === 'blocked' || Boolean(plan?.blockers?.length);
+    const title = document.createElement('strong');
+    title.className = 'n8n-chat-plan-title';
+    title.textContent = result.restored === true
+        ? '已恢復 n8n 自動化提案'
+        : blocked ? 'n8n 規劃尚未完成' : '已建立 n8n 自動化提案';
+
+    const summary = document.createElement('p');
+    summary.textContent = blocked
+        ? String(result.message || plan?.assistant || '目前尚未建立流程，也沒有執行任何外部操作。')
+        : String(plan?.summary || plan?.assistant || '助理已整理可選方案；目前尚未建立、發布或執行工作流程。');
+
+    const facts = document.createElement('div');
+    facts.className = 'n8n-chat-plan-facts';
+    const optionCount = Array.isArray(plan?.options) ? plan.options.length : 0;
+    const statusLabels = {
+        architecture_ready: '等待選擇方案', selected: '等待驗證節點圖',
+        needs_input: '需要補充資訊', blocked: '前置條件未就緒',
+        materializing: '正在驗證節點圖', graph_ready: '等待建立核准提案',
+        proposing: '正在建立核准提案', proposed: '等待人工核准',
+        proposal_failed: '建立核准提案失敗',
+    };
+    const statusLabel = statusLabels[String(plan?.status || '')] || '';
+    const factValues = blocked
+        ? ['尚未操作 n8n', '可前往流程管理檢查設定']
+        : [
+            optionCount ? `${optionCount} 個可選方案` : '提案已建立',
+            ...(statusLabel ? [`狀態：${statusLabel}`] : []),
+            '自動沿用目前專案與對話',
+            '外部寫入仍須批准',
+        ];
+    if (result.restored === true) factValues.unshift('已從本機提案記錄恢復');
+    factValues.forEach(value => {
+        const item = document.createElement('span');
+        item.textContent = value;
+        facts.appendChild(item);
+    });
+
+    const actions = document.createElement('div');
+    actions.className = 'n8n-chat-plan-actions';
+    const review = document.createElement('button');
+    review.type = 'button';
+    review.className = 'btn btn-primary compact';
+    review.textContent = blocked ? '開啟流程頁' : '查看並確認提案';
+    review.addEventListener('click', () => void window.workbenchN8nWorkflows?.open?.());
+    actions.appendChild(review);
+
+    content.classList.add('n8n-chat-plan-handoff');
+    content.dataset.n8nPlanId = planId;
+    content.dataset.n8nPlanScope = scope;
+    content.replaceChildren(title, summary, facts, actions);
+    safeCreateIcons();
+    scrollToBottom();
+    return messageEl;
+}
+
+async function restoreN8nPlanHandoffForSession(sessionId) {
+    const requestedSession = String(sessionId || '').trim();
+    const session = sidebarSessions.find(item => String(item.id) === requestedSession);
+    const requestedProject = String(session?.project_id || '').trim();
+    const governance = window.workbenchN8nGovernance;
+    if (!requestedProject || requestedSession !== currentSessionId
+        || typeof governance?.restorePlanForScope !== 'function') return;
+    const result = await governance.restorePlanForScope({
+        projectId: requestedProject,
+        sessionId: requestedSession,
+    });
+    if (requestedSession !== currentSessionId || requestedProject !== String(activeProjectId || '')
+        || result?.status !== 'restored' || !result.plan) return;
+    appendN8nPlanHandoff('', { ...result, restored: true });
+}
+
 async function routeExplicitN8nOperationToPlanner(question) {
     if (!isExplicitN8nOperationIntent(question)) return false;
 
-    // Opening the dedicated workspace does not grant authority. The planner
-    // remains tool-free and the existing digest-bound proposal plus separate
-    // human approval are still required before the Broker can mutate n8n.
-    // Wait for the managed n8n lifecycle check/start attempt to settle before
-    // asking the Planner for its live readiness snapshot.  This avoids a
-    // false "runtime not ready" result during the on-demand startup race.
-    await window.workbenchN8nWorkflows?.open?.();
     if (isExplicitN8nMailOperation(question) && !isExplicitN8nWorkflowAuthoringIntent(question)) {
+        await window.workbenchN8nWorkflows?.open?.();
         const mailResult = await window.workbenchN8nWorkflows?.createComposeFromChat?.({
             instruction: question,
         });
@@ -3356,23 +3467,29 @@ async function routeExplicitN8nOperationToPlanner(question) {
         userInput.style.height = 'auto';
         return true;
     }
-    const planner = window.workbenchN8nGovernance;
-    if (typeof planner?.startPlanFromChat !== 'function') {
-        showToast('n8n 操作助理尚未就緒；本次要求未送到一般聊天，也未操作 n8n。', 'warning');
-        return true;
-    }
 
+    // Prepare the managed service without navigating away from chat. This does
+    // not grant authority: the tool-free Planner, digest-bound proposal and
+    // separate human approval still gate every n8n mutation.
     try {
+        const workflows = window.workbenchN8nWorkflows;
+        if (typeof workflows?.prepare === 'function') await workflows.prepare();
+        const planner = window.workbenchN8nGovernance;
+        if (typeof planner?.startPlanFromChat !== 'function') {
+            showToast('n8n 操作助理尚未就緒；本次要求未送到一般聊天，也未操作 n8n。', 'warning');
+            return true;
+        }
         const result = await planner.startPlanFromChat({
             message: question,
             projectId: activeProjectId || '',
             sessionId: currentSessionId || '',
             hasAttachments: currentImages.length > 0,
         });
+        appendN8nPlanHandoff(question, result);
         if (result?.status === 'blocked') {
-            showToast(result.message || '請先完成 n8n 規劃所需的 Project 與 Session。', 'warning');
+            showToast(result.message || '請先完成 n8n 規劃所需的目前工作範圍。', 'warning');
         } else {
-            showToast('已轉入 n8n 操作助理；目前尚未操作 n8n。', 'success');
+            showToast('n8n 提案已建立；可留在聊天，或開啟流程頁檢查。', 'success');
         }
         userInput.value = '';
         userInput.style.height = 'auto';
@@ -4907,6 +5024,7 @@ async function clearChatHistory() {
             try {
                 await apiFetch(`${API_BASE}/api/sessions/${currentSessionId}`, { method: 'DELETE' });
                 currentSessionId = null;
+                rememberActiveSession(null);
                 clearOutputSkillsContext('請先選擇專案');
                 resetConversationState(); // P0-1
                 chatMessages.innerHTML = '';
@@ -7812,6 +7930,11 @@ function initWorkbench(status) {
         getActiveProjectId: () => activeProjectId,
         getCurrentSessionId: () => currentSessionId,
         refreshWorkspaceScope: () => loadSessions(searchSessionsInput.value.trim()),
+        openChatComposer: () => {
+            setPrimaryWorkspace('chat');
+            userInput.focus();
+            showToast('請直接在聊天中描述要自動完成的工作，並明確提及 n8n。', 'info');
+        },
     });
     // Rail 導覽
     const drawer = document.getElementById('chat-drawer');

@@ -226,6 +226,18 @@ def build_n8n_agent_router(
         except Exception as exc:
             raise failure(exc) from exc
 
+    @router.get("/api/integrations/n8n/plans/current")
+    def current_plan(
+        request: Request,
+        project_id: str = Query(min_length=1, max_length=128),
+        session_id: str = Query(min_length=1, max_length=128),
+    ):
+        local(request)
+        try:
+            return planning_service().current(project_id=project_id, session_id=session_id)
+        except Exception as exc:
+            raise failure(exc) from exc
+
     @router.post("/api/integrations/n8n/plans/{plan_id}/messages")
     def add_plan_message(plan_id: str, payload: PlanMessage, request: Request):
         local(request)

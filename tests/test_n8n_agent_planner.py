@@ -172,6 +172,55 @@ def test_plan_is_scoped_and_returns_clear_choices_without_payload(scope):
     assert mismatch.value.code == "N8N_PLAN_SCOPE_MISMATCH"
 
 
+def test_current_plan_restores_only_the_latest_unexpired_scoped_snapshot(scope):
+    planner = N8nPlanningService(
+        governance_service=Governance(), generator=two_stage_generator()
+    )
+    assert planner.current(project_id="project-a", session_id="session-a") == {"plan": None}
+
+    plan = planner.start(
+        project_id="project-a", session_id="session-a", message="Build a webhook workflow"
+    )
+    restored = planner.current(project_id="project-a", session_id="session-a")["plan"]
+    assert restored["id"] == plan["id"]
+    assert restored["project_id"] == "project-a"
+    assert restored["session_id"] == "session-a"
+    assert restored["messages"][0] == {
+        "role": "user", "content": "Build a webhook workflow",
+    }
+    assert restored["messages"][-1]["role"] == "assistant"
+    assert "semantic" not in json.dumps(restored)
+    assert planner.current(project_id="project-b", session_id="session-b") == {"plan": None}
+
+    with pytest.raises(N8nPlannerError) as mismatch:
+        planner.current(project_id="project-b", session_id="session-a")
+    assert mismatch.value.code == "N8N_PLAN_SCOPE_MISMATCH"
+
+    with database.get_db_conn() as conn:
+        conn.execute(
+            "UPDATE n8n_agent_plans SET expires_at=? WHERE id=?",
+            ("2000-01-01T00:00:00+00:00", plan["id"]),
+        )
+    assert planner.current(project_id="project-a", session_id="session-a") == {"plan": None}
+    with database.get_db_conn() as conn:
+        status = conn.execute(
+            "SELECT status FROM n8n_agent_plans WHERE id=?", (plan["id"],)
+        ).fetchone()["status"]
+    assert status == "expired"
+
+    stale = planner.start(
+        project_id="project-a", session_id="session-a", message="Build another workflow"
+    )
+    with database.get_db_conn() as conn:
+        conn.execute(
+            "UPDATE n8n_agent_plans SET plan_schema=? WHERE id=?",
+            ("workbench.n8n.old.v0", stale["id"]),
+        )
+    with pytest.raises(N8nPlannerError) as schema_error:
+        planner.current(project_id="project-a", session_id="session-a")
+    assert schema_error.value.code == "N8N_PLAN_SCHEMA_STALE"
+
+
 def test_workflow_inventory_preserves_session_elevation_scope(scope):
     calls = []
 
@@ -542,6 +591,16 @@ def test_planner_routes_match_frontend_contract(scope):
     })
     assert started.status_code == 201
     plan = started.json()
+    current = client.get("/api/integrations/n8n/plans/current", params={
+        "project_id": "project-a", "session_id": "session-a",
+    })
+    assert current.status_code == 200
+    assert current.json()["plan"]["id"] == plan["id"]
+    assert current.json()["plan"]["messages"][0]["content"] == "Build a workflow"
+    wrong_scope = client.get("/api/integrations/n8n/plans/current", params={
+        "project_id": "project-b", "session_id": "session-a",
+    })
+    assert wrong_scope.status_code == 409
     missing_digest = client.post(f"/api/integrations/n8n/plans/{plan['id']}/messages", json={
         "project_id": "project-a", "session_id": "session-a", "message": "Select minimal",
         "selected_option_id": plan["choices"][0]["id"],

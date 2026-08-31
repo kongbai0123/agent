@@ -155,6 +155,7 @@ const showRuntimeApproval = () => {{ inspectorUpdates += 1; }};
 
 def test_workflow_center_has_project_scoped_agent_plan_mode():
     for marker in (
+        'id="workflow-chat-start"', 'id="n8n-plan-workspace"',
         'id="n8n-plan-form"', 'id="n8n-plan-messages"', 'id="n8n-plan-options"',
         'id="n8n-plan-session"',
         'id="n8n-plan-provenance"', 'id="n8n-plan-primary-model"',
@@ -168,19 +169,29 @@ def test_workflow_center_has_project_scoped_agent_plan_mode():
     assert "state.deps.getSessions?.()" in JS
     assert "String(session.project_id) === String(id || '')" in JS
     assert "expected_digest: plan.digest, explicit_confirmation: true" in JS
-    assert "想讓 n8n 幫你做什麼？" in HTML
-    assert "直接描述想達成的結果" in HTML
+    assert 'id="n8n-plan-workspace" aria-labelledby="n8n-plan-title" hidden' in HTML
+    assert 'id="n8n-plan-form" class="workflow-form n8n-plan-form" hidden' in HTML
+    assert "檢查助理建議的流程" in HTML
+    assert "需求由目前聊天帶入" in HTML
+    assert "在聊天中建立自動化" in HTML
+    assert "想讓 n8n 幫你做什麼？" not in HTML
+    assert "送出需求" not in HTML
     assert "核准後 Broker 才會依提案內容實際操作 n8n" in HTML
 
 
-def test_simple_mode_auto_selects_a_single_scope_and_only_expands_when_needed():
-    assert 'id="n8n-plan-scope"' in HTML
+def test_chat_first_mode_keeps_scope_internal_and_auto_selects_current_context():
+    assert 'id="n8n-plan-scope"' not in HTML
     assert 'id="n8n-plan-scope-summary"' in HTML
+    assert '<div hidden aria-hidden="true">' in HTML
     assert HTML.index('id="n8n-agent-project"') < HTML.index('id="n8n-plan-session"')
     assert "projects.length === 1 ? String(projects[0].id) : ''" in JS
     assert "sessions.length === 1 ? String(sessions[0].id) : ''" in JS
-    assert "if ((!hasProject || !hasSession) && !canAutoProvisionScope()) state.dom.planScope.open = true" in JS
-    assert "全新環境會在首次送出時建立個人工作區" in HTML
+    assert "const requested = active || selected" in JS
+    assert "const requested = String(current || selected || '')" in JS
+    assert "state.dom.planScope.open" not in JS
+    assert "自動沿用：" in JS
+    assert "請先在左側選擇專案" in JS
+    assert "請先回到聊天選擇一個對話" in JS
 
 
 def test_empty_single_user_workspace_is_prepared_on_first_request_without_weakening_permissions():
@@ -194,6 +205,9 @@ def test_empty_single_user_workspace_is_prepared_on_first_request_without_weaken
     assert "permission_mode: 'read_only'" in JS
     assert "api('/api/sessions'" in JS
     assert "title: 'n8n 自動化'" in JS
+    handoff = JS[JS.index("async function startPlanFromChat"):JS.index("async function materializePlan")]
+    assert "canAutoProvisionScope()" in handoff
+    assert "await ensurePersonalScope()" in handoff
     assert "refreshWorkspaceScope: () => loadSessions" in APP_JS
     assert '<select id="n8n-agent-project" required' not in HTML
     assert '<select id="n8n-plan-session" required' not in HTML
@@ -346,6 +360,10 @@ def test_styles_keep_twelve_pixel_minimum_and_responsive_layout():
     assert ".n8n-plan-graph-stage" in CSS
     assert ".n8n-plan-graph-columns { grid-template-columns: 1fr; }" in CSS
     assert ".n8n-node-catalog-results { grid-template-columns: 1fr; }" in CSS
+    assert ".workflow-card-head-actions" in CSS
+    assert ".n8n-plan-scope-summary-line" in CSS
+    assert ".n8n-chat-plan-handoff" in CSS
+    assert ".n8n-chat-plan-facts" in CSS
 
 
 def test_explicit_chat_operation_routes_to_governed_planner_before_general_chat():
@@ -357,6 +375,7 @@ def test_explicit_chat_operation_routes_to_governed_planner_before_general_chat(
 
     assert detector_start < router_start < submit_start < route_call < chat_fetch
     assert "await window.workbenchN8nWorkflows?.open?.();" in APP_JS[router_start:submit_start]
+    assert "await workflows.prepare()" in APP_JS[router_start:submit_start]
     assert "isExplicitN8nMailOperation(question)" in APP_JS[router_start:submit_start]
     assert "!isExplicitN8nWorkflowAuthoringIntent(question)" in APP_JS[router_start:submit_start]
     assert "createComposeFromChat" in APP_JS[router_start:submit_start]
@@ -364,6 +383,8 @@ def test_explicit_chat_operation_routes_to_governed_planner_before_general_chat(
     assert "planner.startPlanFromChat" in APP_JS[router_start:submit_start]
     assert "projectId: activeProjectId || ''" in APP_JS[router_start:submit_start]
     assert "sessionId: currentSessionId || ''" in APP_JS[router_start:submit_start]
+    assert "appendN8nPlanHandoff(question, result)" in APP_JS[router_start:submit_start]
+    assert "可留在聊天" in APP_JS[router_start:submit_start]
     assert "未送到一般聊天，也未操作 n8n" in APP_JS[router_start:submit_start]
 
 
@@ -373,12 +394,60 @@ def test_chat_handoff_preserves_scope_and_cannot_skip_planner_approval():
     assert "sessionAvailable" in handoff
     assert "requestedSessionRecord?.project_id" in handoff
     assert "options.hasAttachments === true" in handoff
+    assert "state.planWorkspaceVisible = true" in handoff
     assert "await sendPlanMessage(content)" in handoff
+    assert "plan: state.plan ? { ...state.plan } : null" in handoff
     assert "尚未送出規劃，也未操作 n8n" in handoff
     assert "api_key" not in handoff.lower()
     assert "proposePlan(" not in handoff
     assert "approve" not in handoff.lower()
     assert "broker" not in handoff.lower()
+
+
+def test_workflow_header_returns_to_chat_without_exposing_scope_controls():
+    assert "openChatComposer: () =>" in APP_JS
+    assert "setPrimaryWorkspace('chat')" in APP_JS
+    assert "請直接在聊天中描述要自動完成的工作" in APP_JS
+    assert "state.dom.chatStart.addEventListener('click'" in JS
+    assert "state.deps.openChatComposer?.()" in JS
+
+
+def test_n8n_plan_handoff_is_restored_from_scoped_server_state_after_reload():
+    restore = JS[JS.index("async function restorePlanForScope"):JS.index("async function materializePlan")]
+    assert "/api/integrations/n8n/plans/current?project_id=" in restore
+    assert "session_id=${query(requestedSession)}" in restore
+    assert "requestId !== state.planRestoreRequestId" in restore
+    assert "liveProject !== requestedProject || liveSession !== requestedSession" in restore
+    assert "state.planWorkspaceVisible = true" in restore
+    assert "restorePlanForScope," in JS
+
+    app_restore = APP_JS[
+        APP_JS.index("function appendN8nPlanHandoff"):
+        APP_JS.index("async function routeExplicitN8nOperationToPlanner")
+    ]
+    assert "dataset.n8nPlanId" in app_restore
+    assert "dataset.n8nPlanScope" in app_restore
+    assert "result.restored !== true" in app_restore
+    assert "已恢復 n8n 自動化提案" in app_restore
+    assert "restoreN8nPlanHandoffForSession" in APP_JS[
+        APP_JS.index("async function changeSession"):
+        APP_JS.index("async function deleteSession")
+    ]
+
+
+def test_reload_reopens_only_a_server_validated_remembered_session():
+    assert "const LAST_ACTIVE_SESSION_KEY = 'workbench-last-active-session-id'" in APP_JS
+    assert "localStorage.setItem(LAST_ACTIVE_SESSION_KEY, value)" in APP_JS
+    assert "localStorage.removeItem(LAST_ACTIVE_SESSION_KEY)" in APP_JS
+    assert "await restoreRememberedSession()" in APP_JS
+    restore = APP_JS[
+        APP_JS.index("async function restoreRememberedSession"):
+        APP_JS.index("async function deleteSession")
+    ]
+    assert "sidebarSessions.find" in restore
+    assert "session.archived" in restore
+    assert "String(session.mode || 'chat') === 'email'" in restore
+    assert "await changeSession(remembered)" in restore
 
 
 def test_chat_n8n_intent_detector_is_conservative_and_operation_only():

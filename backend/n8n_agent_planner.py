@@ -1610,7 +1610,9 @@ class N8nPlanningService:
             status_code=502,
         )
 
-    def _public(self, row: Mapping[str, Any]) -> dict[str, Any]:
+    def _public(
+        self, row: Mapping[str, Any], *, include_conversation: bool = False
+    ) -> dict[str, Any]:
         response = _loads(row["response_json"], {})
         public_choices = []
         for choice in response.get("choices") or []:
@@ -1629,7 +1631,7 @@ class N8nPlanningService:
                 )
             }
             public_materialization["diff"] = _public_graph_diff(materialization.get("diff"))
-        return {
+        public = {
             "id": row["id"], "project_id": row["project_id"], "session_id": row["session_id"],
             "plan_schema": row["plan_schema"] if "plan_schema" in row.keys() else None,
             "stage": row["status"],
@@ -1656,6 +1658,42 @@ class N8nPlanningService:
             "materialization": public_materialization,
             "created_at": row["created_at"], "updated_at": row["updated_at"],
             "expires_at": row["expires_at"],
+        }
+        if include_conversation:
+            public["messages"] = [
+                {"role": item["role"], "content": item["content"]}
+                for item in _loads(row["conversation_json"], [])
+                if isinstance(item, Mapping)
+                and item.get("role") in {"user", "assistant"}
+                and isinstance(item.get("content"), str)
+            ][:50]
+        return public
+
+    def current(self, *, project_id: str, session_id: str) -> dict[str, Any]:
+        """Return the newest unexpired plan for one authoritative chat scope."""
+
+        actual_project, actual_session, _policy = self._scope(project_id, session_id)
+        now = _now()
+        now_text = _iso(now)
+        with self.database.get_db_conn() as conn:
+            conn.execute(
+                """UPDATE n8n_agent_plans
+                   SET status='expired',updated_at=?
+                   WHERE project_id=? AND session_id=? AND status!='expired'
+                     AND expires_at<=?""",
+                (now_text, actual_project, actual_session, now_text),
+            )
+            row = conn.execute(
+                """SELECT * FROM n8n_agent_plans
+                   WHERE project_id=? AND session_id=? AND status!='expired'
+                     AND expires_at>?
+                   ORDER BY updated_at DESC,id DESC LIMIT 1""",
+                (actual_project, actual_session, now_text),
+            ).fetchone()
+        if row:
+            self._require_schema(row)
+        return {
+            "plan": self._public(row, include_conversation=True) if row else None,
         }
 
     def _row(self, plan_id: str, project_id: str, session_id: str) -> Mapping[str, Any]:

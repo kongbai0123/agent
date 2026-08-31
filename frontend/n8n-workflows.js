@@ -1219,25 +1219,31 @@
         }
     }
 
+    async function prepare() {
+        await refreshExtensionState();
+        if (!n8nExtensionReady()) {
+            await refreshService();
+            state.deps.createIcons?.();
+            return { ready: false, extension: state.extension, service: state.service };
+        }
+        startBackgroundSync();
+        await ensureServiceForWorkspace();
+        await Promise.allSettled([refreshProfile(), refreshRuns()]);
+        state.deps.createIcons?.();
+        void window.workbenchN8nGovernance?.refreshAll?.();
+        return {
+            ready: state.service?.running === true || state.service?.reachable === true,
+            extension: state.extension,
+            service: state.service,
+        };
+    }
+
     function open() {
         state.deps.onWorkspaceOpen?.();
         state.dom.center.hidden = false;
         state.dom.title.setAttribute('tabindex', '-1');
         state.dom.title.focus();
-        const ready = (async () => {
-            await refreshExtensionState();
-            if (!n8nExtensionReady()) {
-                await refreshService();
-                state.deps.createIcons?.();
-                return;
-            }
-            startBackgroundSync();
-            await ensureServiceForWorkspace();
-            await Promise.allSettled([refreshProfile(), refreshRuns()]);
-            state.deps.createIcons?.();
-            void window.workbenchN8nGovernance?.refreshAll?.();
-        })();
-        return ready;
+        return prepare();
     }
 
     function startBackgroundSync() {
@@ -1342,6 +1348,7 @@
 
     window.workbenchN8nWorkflows = {
         init,
+        prepare,
         open,
         close,
         openRun,
