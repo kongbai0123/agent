@@ -14,6 +14,11 @@ EXTENSION_JS = (FRONTEND / "extension-center.js").read_text(encoding="utf-8")
 STYLE_CSS = (FRONTEND / "style.css").read_text(encoding="utf-8")
 
 
+def test_workflow_assets_use_current_cache_keys():
+    assert "n8n-workflows.js?v=0.9.2-chat-first" in INDEX_HTML
+    assert "n8n-agent-governance.js?v=0.9.2-plan-restore" in INDEX_HTML
+
+
 def _slice(source: str, start: str, end: str) -> str:
     start_index = source.index(start)
     return source[start_index:source.index(end, start_index)]

@@ -1,5 +1,11 @@
 # Local AI Workbench 改版紀錄
 
+## 2026-08-31 — `0.9.0-model-catalog-beta.8`
+
+- 更新主介面、n8n 工作流程與提案治理資源的快取版本，避免 Workbench 重新啟動後仍混用舊 JavaScript／CSS，造成側邊欄無法切換。
+- 啟動畫面服務不再直接提供主 Workbench 介面；若誤開根目錄或 `index.html`，會導回具備 API 與工作階段保護的後端來源，避免全頁設定遮罩攔截側邊欄。
+- n8n 建立流程改由聊天作為主要入口；有效提案可依原專案與對話在重新載入後恢復。
+
 ## 2026-08-26 — `0.9.0-model-catalog-beta.7`
 
 ### Agent 規劃與能力驗證

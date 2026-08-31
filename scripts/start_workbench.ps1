@@ -38,7 +38,7 @@ $hermesProjectsRoot = Join-Path $projectRoot "projects"
 $hermesStartScript = Join-Path $projectRoot "scripts\start_hermes_sidecar.ps1"
 $hermesProductionOps = Join-Path $projectRoot "scripts\hermes_production_ops.py"
 $backendUrl = "http://127.0.0.1:$BackendPort"
-$frontendVersion = "0.9.0-model-catalog-beta.7"
+$frontendVersion = "0.9.0-model-catalog-beta.8"
 $launcherShutdownHandoffMilliseconds = 75000
 $websiteUrl = "$backendUrl/index.html?v=$frontendVersion"
 $discoveryConfigPath = Join-Path $runtimeDir "server-discovery-config.json"
@@ -1229,7 +1229,7 @@ try {
     & $pythonPath $startupProgressScript begin | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "Unable to initialize startup progress." }
 
-    $frontendArgs = @($startupServerScript, "--port", "$FrontendPort", "--bind", "127.0.0.1", "--directory", (Join-Path $projectRoot "frontend"), "--backend-directory", (Join-Path $projectRoot "backend"))
+    $frontendArgs = @($startupServerScript, "--port", "$FrontendPort", "--bind", "127.0.0.1", "--directory", (Join-Path $projectRoot "frontend"), "--backend-directory", (Join-Path $projectRoot "backend"), "--backend-url", $backendUrl)
     $frontendProcess = Start-Process -FilePath $pythonPath -ArgumentList $frontendArgs -WorkingDirectory $projectRoot -WindowStyle Hidden -RedirectStandardOutput $frontendOut -RedirectStandardError $frontendErr -PassThru
     Add-ProcessToJob -Job $jobHandle -Process $frontendProcess
     $frontendProcess.PriorityClass = [Diagnostics.ProcessPriorityClass]::BelowNormal

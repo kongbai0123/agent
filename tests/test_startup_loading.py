@@ -1,3 +1,5 @@
+import argparse
+import importlib.util
 import re
 import unittest
 from pathlib import Path
@@ -6,6 +8,15 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 LOADING_PAGE = ROOT / "frontend" / "loading.html"
 LAUNCHER = ROOT / "scripts" / "start_workbench.ps1"
+STARTUP_SERVER = ROOT / "scripts" / "startup_http_server.py"
+
+
+def _load_startup_server_module():
+    spec = importlib.util.spec_from_file_location("workbench_startup_http_server", STARTUP_SERVER)
+    module = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    spec.loader.exec_module(module)
+    return module
 
 
 class StartupLoadingTests(unittest.TestCase):
@@ -13,6 +24,7 @@ class StartupLoadingTests(unittest.TestCase):
     def setUpClass(cls):
         cls.page = LOADING_PAGE.read_text(encoding="utf-8")
         cls.launcher = LAUNCHER.read_text(encoding="utf-8")
+        cls.startup_server = STARTUP_SERVER.read_text(encoding="utf-8")
 
     def test_loading_page_exposes_stage_progress_and_slow_feedback(self):
         self.assertIn('role="progressbar"', self.page)
@@ -57,6 +69,26 @@ class StartupLoadingTests(unittest.TestCase):
         self.assertIn("consecutiveStatusFailures", self.page)
         self.assertIn("無法連線到啟動服務", self.page)
         self.assertIn("連接埠已變更", self.page)
+
+    def test_startup_origin_cannot_serve_the_main_workbench_shell(self):
+        self.assertIn('"--backend-url", $backendUrl', self.launcher)
+        self.assertIn('request.path in {"/", "/index.html"}', self.startup_server)
+        self.assertIn("HTTPStatus.TEMPORARY_REDIRECT", self.startup_server)
+        self.assertIn('self.send_header("Location", location)', self.startup_server)
+
+    def test_startup_redirect_accepts_only_explicit_loopback_backend_origins(self):
+        module = _load_startup_server_module()
+        self.assertEqual(module._loopback_backend_url("http://127.0.0.1:8000"), "http://127.0.0.1:8000")
+        self.assertEqual(module._loopback_backend_url("http://localhost:8765/"), "http://localhost:8765")
+        for unsafe in (
+            "https://127.0.0.1:8000",
+            "http://example.com:8000",
+            "http://127.0.0.1",
+            "http://user@127.0.0.1:8000",
+            "http://127.0.0.1:8000/path",
+        ):
+            with self.subTest(unsafe=unsafe), self.assertRaises(argparse.ArgumentTypeError):
+                module._loopback_backend_url(unsafe)
 
     def test_launcher_detects_ipv4_ipv6_and_wildcard_port_conflicts(self):
         port_check = self.launcher[

@@ -17,7 +17,7 @@ def test_workflow_center_has_policy_workflows_operations_and_audits():
         'id="n8n-agent-audits-list"', 'id="n8n-agent-api-key-form"',
     ):
         assert marker in HTML
-    assert "n8n-agent-governance.js?v=0.9.1-personal-scope" in HTML
+    assert "n8n-agent-governance.js?v=0.9.2-plan-restore" in HTML
 
 
 def test_project_scoped_credential_alias_ui_never_renders_credential_id():
