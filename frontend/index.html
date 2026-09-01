@@ -17,7 +17,7 @@
     <link rel="stylesheet" href="katex.min.css">
     <script src="katex.min.js"></script>
     <script src="auto-render.min.js"></script>
-    <link rel="stylesheet" href="style.css?v=0.9.0-model-catalog-beta.8">
+    <link rel="stylesheet" href="style.css?v=0.9.0-model-catalog-beta.11">
 </head>
 <body class="basic-chat-mode">
     <div class="app-container workbench-shell">
@@ -82,6 +82,10 @@
                     aria-controls="n8n-workflow-center" aria-current="false">
                     <i data-lucide="workflow"></i><span class="rail-label">流程</span>
                     <span class="rail-notification-badge" id="workflow-rail-badge" aria-hidden="true" hidden>0</span>
+                </button>
+                <button class="rail-btn" id="rail-integrations" title="整合中心" aria-label="管理第三方服務與對外 API"
+                    aria-controls="integration-center-workspace" aria-current="false">
+                    <i data-lucide="plug"></i><span class="rail-label">整合</span>
                 </button>
                 <button class="rail-btn" id="rail-knowledge" title="知識庫" aria-label="知識庫管理"
                     aria-controls="knowledge-workspace" aria-current="false">
@@ -1841,6 +1845,227 @@
         </div>
     </div>
 
+    <!-- 統一整合中心：集中治理第三方服務、對外 API、專案權限與稽核。 -->
+    <main class="integration-workspace" id="integration-center-workspace"
+        aria-labelledby="integration-center-title" hidden>
+        <div class="management-workspace-shell integration-workspace-shell">
+            <header class="workspace-header integration-workspace-header">
+                <div>
+                    <span class="integration-eyebrow">外部連線與存取治理</span>
+                    <h1 id="integration-center-title" tabindex="-1"><i data-lucide="plug"></i>整合中心</h1>
+                    <p>集中管理第三方服務、Workbench 對外 API、專案放行範圍與稽核紀錄。</p>
+                </div>
+                <div class="integration-header-actions">
+                    <label class="integration-project-picker" for="integration-project-select">
+                        <span>目前專案</span>
+                        <select id="integration-project-select" class="settings-input" aria-label="整合中心目前專案">
+                            <option value="">請先選擇專案</option>
+                        </select>
+                    </label>
+                    <button type="button" class="btn btn-secondary compact" id="integration-refresh">
+                        <i data-lucide="refresh-cw"></i>重新整理
+                    </button>
+                    <button type="button" class="workspace-close" id="integration-close" aria-label="返回聊天">
+                        <i data-lucide="x"></i>
+                    </button>
+                </div>
+            </header>
+
+            <nav class="integration-tabs" role="tablist" aria-label="整合中心功能">
+                <button type="button" class="active" id="integration-tab-overview" data-integration-tab="overview"
+                    role="tab" aria-controls="integration-panel-overview" aria-selected="true">概覽</button>
+                <button type="button" id="integration-tab-services" data-integration-tab="services"
+                    role="tab" aria-controls="integration-panel-services" aria-selected="false" tabindex="-1">第三方服務</button>
+                <button type="button" id="integration-tab-api" data-integration-tab="api"
+                    role="tab" aria-controls="integration-panel-api" aria-selected="false" tabindex="-1">對外 API</button>
+                <button type="button" id="integration-tab-policy" data-integration-tab="policy"
+                    role="tab" aria-controls="integration-panel-policy" aria-selected="false" tabindex="-1">權限方案</button>
+                <button type="button" id="integration-tab-audit" data-integration-tab="audit"
+                    role="tab" aria-controls="integration-panel-audit" aria-selected="false" tabindex="-1">健康與稽核</button>
+            </nav>
+
+            <div class="integration-content">
+                <section class="integration-panel" id="integration-panel-overview" data-integration-panel="overview"
+                    role="tabpanel" aria-labelledby="integration-tab-overview">
+                    <div class="integration-summary-grid" id="integration-summary-grid" aria-live="polite">
+                        <article><strong>—</strong><span>已連線服務</span></article>
+                        <article><strong>—</strong><span>有效 API Key</span></article>
+                        <article><strong>—</strong><span>已放行整合</span></article>
+                        <article><strong>—</strong><span>需要處理</span></article>
+                    </div>
+                    <article class="integration-notice">
+                        <i data-lucide="shield-check" aria-hidden="true"></i>
+                        <div>
+                            <strong>所有外部存取都受 Project 範圍限制</strong>
+                            <p>整合中心只統一管理權限；GitHub、Notion、Gmail、n8n 與 MCP 的憑證仍保存在各自的安全儲存區。</p>
+                        </div>
+                    </article>
+                    <div class="integration-section-head">
+                        <div><h2>整合狀態</h2><p>快速確認各服務是否可由目前專案使用。</p></div>
+                        <button type="button" class="btn btn-secondary compact" data-integration-open-tab="services">管理服務</button>
+                    </div>
+                    <div class="integration-compact-list" id="integration-overview-list">
+                        <div class="integration-empty">正在載入整合狀態…</div>
+                    </div>
+                </section>
+
+                <section class="integration-panel" id="integration-panel-services" data-integration-panel="services"
+                    role="tabpanel" aria-labelledby="integration-tab-services" hidden>
+                    <div class="integration-section-head">
+                        <div>
+                            <h2>第三方服務</h2>
+                            <p>在同一處查看 Gmail、GitHub、Notion、n8n、本機 MCP 與 Workbench 對外 API。</p>
+                        </div>
+                    </div>
+                    <div class="integration-service-grid" id="integration-service-list" aria-live="polite">
+                        <div class="integration-empty">正在載入第三方服務…</div>
+                    </div>
+                </section>
+
+                <section class="integration-panel" id="integration-panel-api" data-integration-panel="api"
+                    role="tabpanel" aria-labelledby="integration-tab-api" hidden>
+                    <article class="integration-machine-card">
+                        <div>
+                            <span class="integration-eyebrow">此電腦的 Workbench</span>
+                            <h2 id="integration-installation-label">正在讀取安裝識別…</h2>
+                            <p id="integration-api-base">API 位址尚未載入。</p>
+                        </div>
+                        <button type="button" class="btn btn-secondary compact" id="integration-copy-api-base" disabled>
+                            <i data-lucide="copy"></i>複製 API 位址
+                        </button>
+                    </article>
+                    <p class="integration-security-copy">API Key 由這台電腦的 Workbench 產生並綁定此安裝；完整金鑰只會顯示一次，Workbench 僅保留不可逆摘要。授予「建立 Agent 工作」後，外部系統可觸發該 Project 已放行的 Agent 工具；建議為自動化建立專用 Project，並使用「限制權限」。</p>
+
+                    <article class="integration-risk-callout" id="integration-api-recovery" role="alert" hidden>
+                        <i data-lucide="shield-alert" aria-hidden="true"></i>
+                        <div>
+                            <strong>此電腦的 API 驗證資料需要修復</strong>
+                            <p>舊金鑰目前無法驗證。重設會撤銷所有既有 API Key，並為這台電腦建立新的安裝身分；外部系統之後都必須換用新金鑰。</p>
+                            <button type="button" class="btn btn-danger compact" id="integration-reset-installation">重設安裝身分</button>
+                        </div>
+                    </article>
+
+                    <article class="integration-secret-panel" id="integration-secret-panel" role="alert" hidden>
+                        <div>
+                            <span class="integration-eyebrow">只顯示這一次</span>
+                            <h2>立即保存新的 API Key</h2>
+                            <p id="integration-secret-notice">離開或重新載入後，完整金鑰無法再次顯示。</p>
+                        </div>
+                        <div class="integration-secret-row">
+                            <input id="integration-secret-value" class="settings-input" type="text" readonly
+                                aria-label="新建立的 Workbench API Key">
+                            <button type="button" class="btn btn-primary" id="integration-copy-secret"><i data-lucide="copy"></i>複製金鑰</button>
+                        </div>
+                        <button type="button" class="btn btn-secondary" id="integration-confirm-secret">我已安全保存，清除此畫面</button>
+                    </article>
+
+                    <div class="integration-api-layout">
+                        <form class="integration-form-card" id="integration-api-key-form">
+                            <div><h2>建立對外 API Key</h2><p>金鑰只能呼叫你明確選取的 Project 與能力。</p></div>
+                            <label>金鑰名稱
+                                <input id="integration-api-key-name" class="settings-input" maxlength="80"
+                                    autocomplete="off" placeholder="例如：n8n 本機自動化" required>
+                            </label>
+                            <fieldset class="integration-scope-fieldset">
+                                <legend>允許能力</legend>
+                                <label><input type="checkbox" name="integration-api-scope" value="runs:create" checked>建立 Agent 工作</label>
+                                <label><input type="checkbox" name="integration-api-scope" value="runs:read" checked>讀取工作狀態與結果</label>
+                                <label><input type="checkbox" name="integration-api-scope" value="runs:cancel">取消工作</label>
+                                <label><input type="checkbox" name="integration-api-scope" value="capabilities:read" checked>讀取可用能力</label>
+                            </fieldset>
+                            <div class="integration-form-grid">
+                                <label>到期日
+                                    <input id="integration-api-key-expiry" class="settings-input" type="date">
+                                    <small>留空表示不設定日期；仍可隨時撤銷。</small>
+                                </label>
+                                <label>每分鐘請求上限
+                                    <input id="integration-api-key-rate" class="settings-input" type="number" min="1" max="600" value="60" required>
+                                </label>
+                                <label>每日請求上限
+                                    <input id="integration-api-key-daily" class="settings-input" type="number" min="1" max="100000" value="1000" required>
+                                </label>
+                            </div>
+                            <button type="submit" class="btn btn-primary" id="integration-create-api-key">
+                                <i data-lucide="key-round"></i>為此電腦建立金鑰
+                            </button>
+                        </form>
+                        <section class="integration-list-card" aria-labelledby="integration-api-key-list-title">
+                            <div><h2 id="integration-api-key-list-title">已簽發金鑰</h2><p>只顯示前綴與使用狀態，不會顯示完整秘密。</p></div>
+                            <div class="integration-key-list" id="integration-api-key-list" aria-live="polite">
+                                <div class="integration-empty">正在載入 API Key…</div>
+                            </div>
+                        </section>
+                    </div>
+                </section>
+
+                <section class="integration-panel" id="integration-panel-policy" data-integration-panel="policy"
+                    role="tabpanel" aria-labelledby="integration-tab-policy" hidden>
+                    <div class="integration-section-head">
+                        <div><h2>Project 整合權限方案</h2><p>一次選取多個服務，統一套用至目前專案。</p></div>
+                        <span class="integration-revision" id="integration-policy-revision">版本 —</span>
+                    </div>
+                    <form id="integration-policy-form" class="integration-policy-form">
+                        <label class="integration-policy-name">方案名稱
+                            <input id="integration-policy-name" class="settings-input" maxlength="100" value="專案整合權限" required>
+                        </label>
+                        <fieldset class="integration-mode-fieldset">
+                            <legend>權限等級</legend>
+                            <label class="integration-mode-card is-blocked">
+                                <input type="radio" name="integration-permission-mode" value="blocked">
+                                <span><strong>不開放權限</strong><small>完全不開放。Agent 需要這些功能時會明確告知受到哪項權限限制，不會送出外部請求。</small></span>
+                            </label>
+                            <label class="integration-mode-card is-restricted">
+                                <input type="radio" name="integration-permission-mode" value="restricted" checked>
+                                <span><strong>限制權限</strong><small>允許唯讀及低風險操作；外部寫入或高風險操作前，必須說明可能風險與結果並取得你的批准。</small></span>
+                            </label>
+                            <label class="integration-mode-card is-open">
+                                <input type="radio" name="integration-permission-mode" value="open">
+                                <span><strong>開放權限</strong><small>在下方勾選的 Project、服務與資源範圍內直接操作，不再逐次詢問；誤送、誤改與第三方帳號變更將由你承擔。</small></span>
+                            </label>
+                        </fieldset>
+                        <article class="integration-risk-callout" id="integration-open-risk" hidden>
+                            <i data-lucide="triangle-alert" aria-hidden="true"></i>
+                            <div><strong>開放權限會取消逐次確認</strong><p>Agent 可能直接建立資料、傳送郵件或修改第三方內容。付款、刪除、授權與系統操作仍不會被此方案放寬。</p></div>
+                        </article>
+                        <fieldset class="integration-grant-fieldset">
+                            <legend>一併放行的服務</legend>
+                            <div id="integration-policy-services" class="integration-policy-services">
+                                <div class="integration-empty">正在載入可管理服務…</div>
+                            </div>
+                        </fieldset>
+                        <label class="integration-open-ack" id="integration-open-ack-row" hidden>
+                            <input type="checkbox" id="integration-open-ack">
+                            我已理解上述風險，確認對勾選的服務套用「開放權限」。
+                        </label>
+                        <button type="submit" class="btn btn-primary" id="integration-save-policy">
+                            <i data-lucide="shield-check"></i>儲存並套用方案
+                        </button>
+                    </form>
+                </section>
+
+                <section class="integration-panel" id="integration-panel-audit" data-integration-panel="audit"
+                    role="tabpanel" aria-labelledby="integration-tab-audit" hidden>
+                    <div class="integration-section-head">
+                        <div><h2>健康與稽核</h2><p>查看整合健康、權限變更與外部 API 使用紀錄；秘密內容不會寫入稽核。</p></div>
+                    </div>
+                    <div class="integration-health-list" id="integration-health-list" aria-live="polite">
+                        <div class="integration-empty">正在載入健康狀態…</div>
+                    </div>
+                    <div class="integration-section-head integration-audit-head">
+                        <div><h2>最近稽核</h2><p>僅顯示遮罩後的安全紀錄。</p></div>
+                    </div>
+                    <div class="integration-audit-list" id="integration-audit-list" aria-live="polite">
+                        <div class="integration-empty">正在載入稽核紀錄…</div>
+                    </div>
+                </section>
+            </div>
+            <footer class="workspace-footer integration-workspace-footer">
+                <span id="integration-status" role="status" aria-live="polite">尚未載入整合資料。</span>
+                <button type="button" class="btn btn-secondary" id="integration-back-chat">回到聊天</button>
+            </footer>
+        </div>
+    </main>
+
     <!-- 外掛程式主工作區：只接受內建目錄與本機受信任 manifest。 -->
     <main class="extension-workspace" id="extension-center-workspace"
         aria-labelledby="extensions-title" hidden>
@@ -1881,14 +2106,14 @@
             <div class="extension-tabs" id="extension-tabs" role="tablist" aria-label="擴充分類">
                 <div class="extension-primary-tabs" role="presentation">
                     <button type="button" class="extension-tab-btn is-primary active" role="tab" aria-selected="true"
+                        aria-controls="extension-pane-available" data-extension-tab="available">
+                        <i data-lucide="compass" aria-hidden="true"></i><span data-extension-zh="探索" data-extension-en="Discover">探索</span>
+                        <span class="extension-tab-count" id="extension-available-count" aria-label="0 個可探索功能">0</span>
+                    </button>
+                    <button type="button" class="extension-tab-btn is-primary" role="tab" aria-selected="false"
                         aria-controls="extension-pane-installed" data-extension-tab="installed">
                         <i data-lucide="check-circle-2" aria-hidden="true"></i><span data-extension-zh="已安裝" data-extension-en="Installed">已安裝</span>
                         <span class="extension-tab-count" id="extension-installed-count" aria-label="0 個已安裝">0</span>
-                    </button>
-                    <button type="button" class="extension-tab-btn is-primary" role="tab" aria-selected="false"
-                        aria-controls="extension-pane-available" data-extension-tab="available">
-                        <i data-lucide="download" aria-hidden="true"></i><span data-extension-zh="未安裝" data-extension-en="Not installed">未安裝</span>
-                        <span class="extension-tab-count" id="extension-available-count" aria-label="0 個未安裝">0</span>
                     </button>
                 </div>
                 <div class="extension-secondary-tabs" role="presentation">
@@ -1913,8 +2138,8 @@
                     </div>
                     <div id="extension-detail-content"></div>
                 </section>
-                <section class="extension-tab-panel active" id="extension-pane-installed" role="tabpanel"
-                    data-extension-panel="installed">
+                <section class="extension-tab-panel" id="extension-pane-installed" role="tabpanel"
+                    data-extension-panel="installed" hidden>
                     <header class="extension-section-intro">
                         <div><span class="workflow-eyebrow" data-extension-zh="已加入" data-extension-en="INSTALLED">已加入</span><h4 data-extension-zh="已安裝" data-extension-en="Installed">已安裝</h4></div>
                         <p data-extension-zh="這些功能已加入 Workbench。點選項目可查看實際用途、使用範例與權限。" data-extension-en="These extensions are available in Workbench. Open one to review its purpose, examples, and permissions.">這些功能已加入 Workbench。點選項目可查看實際用途、使用範例與權限。</p>
@@ -1923,12 +2148,15 @@
                         <div class="extension-state is-loading" data-extension-zh="載入已安裝擴充中…" data-extension-en="Loading installed extensions…">載入已安裝擴充中…</div>
                     </div>
                 </section>
-                <section class="extension-tab-panel" id="extension-pane-available" role="tabpanel"
-                    data-extension-panel="available" hidden>
+                <section class="extension-tab-panel active" id="extension-pane-available" role="tabpanel"
+                    data-extension-panel="available">
                     <header class="extension-section-intro">
-                        <div><span class="workflow-eyebrow" data-extension-zh="尚未加入" data-extension-en="NOT INSTALLED">尚未加入</span><h4 data-extension-zh="未安裝" data-extension-en="Not installed">未安裝</h4></div>
-                        <p data-extension-zh="安裝前會先用白話說明它能做什麼、會接觸哪些資料，以及需要哪些權限。" data-extension-en="Before installation, Workbench explains what it does, what data it can access, and which permissions it needs.">安裝前會先用白話說明它能做什麼、會接觸哪些資料，以及需要哪些權限。</p>
+                        <div><span class="workflow-eyebrow" data-extension-zh="先發現，後使用" data-extension-en="DISCOVER BEFORE USE">先發現，後使用</span><h4 data-extension-zh="探索可用功能" data-extension-en="Discover capabilities">探索可用功能</h4></div>
+                        <p data-extension-zh="這裡會同時顯示已安裝、可安裝與尚未提供的整合。只有在你看過用途與風險後，才會進入安裝、連線與專案放行。" data-extension-en="This catalog shows installed, installable, and planned integrations. Installation, connection, and Project approval only happen after you review their purpose and risks.">這裡會同時顯示已安裝、可安裝與尚未提供的整合。只有在你看過用途與風險後，才會進入安裝、連線與專案放行。</p>
                     </header>
+                    <div class="extension-discovery-flow" role="note" aria-label="擴充啟用流程">
+                        <span data-extension-zh="探索" data-extension-en="Discover">探索</span><i data-lucide="chevron-right" aria-hidden="true"></i><span data-extension-zh="審查用途與風險" data-extension-en="Review purpose and risks">審查用途與風險</span><i data-lucide="chevron-right" aria-hidden="true"></i><span data-extension-zh="安裝／連線" data-extension-en="Install or connect">安裝／連線</span><i data-lucide="chevron-right" aria-hidden="true"></i><span data-extension-zh="Project 放行" data-extension-en="Project approval">Project 放行</span><i data-lucide="chevron-right" aria-hidden="true"></i><span data-extension-zh="Agent 使用" data-extension-en="Agent use">Agent 使用</span>
+                    </div>
                     <div class="extension-list" id="extension-available-list" aria-live="polite">
                         <div class="extension-state is-loading" data-extension-zh="載入未安裝擴充中…" data-extension-en="Loading available extensions…">載入未安裝擴充中…</div>
                     </div>
@@ -2239,8 +2467,8 @@
         <div class="task-progress-list" id="task-progress-list"></div>
     </section>
 
-    <script src="extension-center.js?v=1.9.2-model-capabilities"></script>
-    <script src="connector-center.js?v=1.0.1-extension-gate"></script>
+    <script src="extension-center.js?v=1.10.0-gmail-connector"></script>
+    <script src="connector-center.js?v=1.1.0-gmail-import"></script>
     <script src="skill-center.js?v=1.0.2-chat-reset"></script>
     <script src="cloud-llm-center.js?v=1.2.0-governance"></script>
     <script src="agent-collaboration.js?v=1.1.0-model-trace"></script>
@@ -2251,6 +2479,7 @@
     <script src="n8n-agent-governance.js?v=0.9.2-plan-restore"></script>
     <script src="hermes-settings.js?v=1.1.3-tooltip-layer"></script>
     <script src="mlops-workspace.js?v=1.0.1"></script>
-    <script src="app.js?v=0.9.0-model-catalog-beta.8"></script>
+    <script src="integration-center.js?v=1.1.0-gmail-connector"></script>
+    <script src="app.js?v=0.9.0-model-catalog-beta.11"></script>
 </body>
 </html>

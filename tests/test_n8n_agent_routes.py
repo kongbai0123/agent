@@ -36,6 +36,7 @@ def test_governance_routes_are_project_scoped_and_secret_safe(tmp_path, monkeypa
     service = N8nAgentGovernanceService(
         broker=Broker(), cipher=AesGcmContentCipher(lambda: b"k" * 32),
         n8n_running=lambda: True,
+        integration_permission_check=lambda *_args, **_kwargs: {"decision": "allow"},
         _allow_legacy_raw_workflows_for_tests=True,
     )
     secrets = Secrets()
@@ -86,7 +87,9 @@ def test_normal_operation_rejects_embedded_secret(tmp_path, monkeypatch):
     database.init_db(); database.create_project("p1", "P1", str(tmp_path / "p1"))
     service = N8nAgentGovernanceService(
         broker=Broker(), cipher=AesGcmContentCipher(lambda: b"k" * 32),
-        n8n_running=lambda: True, _allow_legacy_raw_workflows_for_tests=True,
+        n8n_running=lambda: True,
+        integration_permission_check=lambda *_args, **_kwargs: {"decision": "allow"},
+        _allow_legacy_raw_workflows_for_tests=True,
     )
     app = FastAPI(); app.include_router(build_n8n_agent_router(service=service, secret_store=Secrets(), require_local=lambda _r: None, error_payload=lambda code, message, **kwargs: {"code": code, "message": message}))
     response = TestClient(app).post("/api/integrations/n8n/operation-requests", json={

@@ -265,6 +265,15 @@ def test_registered_secret_crossing_old_chunk_boundary_is_redacted(monkeypatch):
     assert not boundary_redacted.endswith(secret[:2])
 
 
+def test_external_agent_api_key_is_removed_from_knowledge_text():
+    secret = "wbk_0123456789ab_" + ("B" * 43)
+    redacted = app_module._redact_knowledge_text(
+        f"測試內容包含 {secret}，不應進入知識快照。"
+    )
+    assert secret not in redacted
+    assert "[redacted]" in redacted
+
+
 def test_project_knowledge_retrieval_does_not_block_the_request_event_loop(monkeypatch):
     caller_thread = threading.get_ident()
     retrieval_threads: list[int] = []

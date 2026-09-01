@@ -30,7 +30,7 @@ class ConnectorEntrypoint(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     type: Literal["connector"] = "connector"
-    adapter: Literal["github", "notion"]
+    adapter: Literal["github", "notion", "gmail"]
 
 
 class ConnectorExtensionDescriptor(BaseModel):
@@ -49,7 +49,7 @@ class ConnectorExtensionDescriptor(BaseModel):
     category: str = Field(min_length=1, max_length=64)
     entrypoint: ConnectorEntrypoint
     permissions: list[ExtensionPermission] = Field(min_length=1, max_length=32)
-    health_probe: Literal["github", "notion"]
+    health_probe: Literal["github", "notion", "gmail"]
     removable: bool = True
     default_installed: bool = False
     default_enabled: bool = False
@@ -246,6 +246,28 @@ def builtin_connector_descriptors() -> tuple[ConnectorExtensionDescriptor, ...]:
             ],
             "health_probe": "notion",
         },
+        {
+            "id": "connector.gmail",
+            "name": "Gmail",
+            "version": "1.0.0",
+            "description": "搜尋及閱讀信件，並在逐次核准後建立或寄送草稿。",
+            "publisher": "Local AI Workbench",
+            "category": "productivity",
+            "entrypoint": {"adapter": "gmail"},
+            "permissions": [
+                _permission(
+                    "connector.gmail.message.read",
+                    "external_read",
+                    "讀取目前專案已授權 Gmail 帳號中的信件。",
+                ),
+                _permission(
+                    "connector.gmail.draft.write",
+                    "external_write",
+                    "建立或寄送 Gmail 草稿；每次操作都受權限政策與核准治理。",
+                ),
+            ],
+            "health_probe": "gmail",
+        },
     )
     return tuple(ConnectorExtensionDescriptor.model_validate(item) for item in definitions)
 
@@ -349,6 +371,24 @@ _BUILTIN_METADATA: dict[str, dict[str, Any]] = {
             "limitations": ["禁止刪除、封存與留言；未綁定的頁面或資料庫不會提供給 Agent。"],
         },
     },
+    "connector.gmail": {
+        "runtime_available": True,
+        "connection_required": True,
+        "connector_id": "gmail",
+        "capabilities": ["message_search", "message_read", "draft_create", "draft_send"],
+        "documentation": {
+            "summary": "連接你的 Gmail 帳號，讓 Agent 在目前專案內搜尋與閱讀郵件，並在你核准後建立或寄送草稿。",
+            "overview": "導入後會開啟 Google 帳號授權。Workbench 只保存加密權杖，不保存你的 Google 密碼；Agent 只會在已綁定的 Project 中取得這個信箱工具。",
+            "common_tasks": [
+                {"title": "搜尋與閱讀郵件", "description": "依寄件者、日期、標籤或關鍵字搜尋，再讀取指定信件內容。"},
+                {"title": "建立草稿", "description": "依對話內容整理收件者、主旨與正文，取得你的批准後存入 Gmail 草稿。"},
+                {"title": "寄送草稿", "description": "只有在再次確認草稿 ID 並取得逐次批准後，才會要求 Gmail 寄出。"},
+            ],
+            "data_handling": "郵件查詢與必要內容會傳送給目前 Agent 使用的模型；OAuth Client Secret 與權杖只存於本機加密保管庫。",
+            "approval_policy": "搜尋與閱讀可依 Project 範圍直接執行；建立草稿及寄送屬外部寫入，必須依目前權限等級取得批准。",
+            "limitations": ["首次導入需使用你自己的 Google OAuth 應用程式資料。", "目前不支援刪除郵件、修改標籤或變更 Gmail 設定。"],
+        },
+    },
 }
 
 _EN_BUILTIN_DOCUMENTATION: dict[str, dict[str, Any]] = {
@@ -411,6 +451,18 @@ _EN_BUILTIN_DOCUMENTATION: dict[str, dict[str, Any]] = {
         "data_handling": "Content moves between Workbench and the Notion API. Tokens are encrypted, and root ancestry is checked before execution.",
         "approval_policy": "Reads inside the bound scope may run directly. Every Notion write requires per-operation approval.",
         "limitations": ["Deletion, archiving, and comments are prohibited. Unbound content is never exposed to the Agent."],
+    },
+    "connector.gmail": {
+        "summary": "Connect Gmail so the Agent can search and read project-authorized mail, then create or send drafts after approval.",
+        "overview": "Import opens Google account authorization. Workbench stores encrypted OAuth tokens, never the Google password, and exposes the mailbox only to bound projects.",
+        "common_tasks": [
+            {"title": "Search and read mail", "description": "Find messages by sender, date, label, or keyword and read selected results."},
+            {"title": "Create drafts", "description": "Prepare recipients, a subject, and content, then create the Gmail draft after approval."},
+            {"title": "Send drafts", "description": "Send a specific draft only after a separate per-operation approval."},
+        ],
+        "data_handling": "Mail queries and required content are sent to the active Agent model. OAuth secrets and tokens remain in the encrypted local vault.",
+        "approval_policy": "Reads inside the project scope may run directly. Draft creation and sending are governed external writes.",
+        "limitations": ["Initial setup uses your own Google OAuth application.", "Deletion, label changes, and Gmail settings are not supported."],
     },
 }
 

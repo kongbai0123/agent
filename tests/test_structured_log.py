@@ -59,6 +59,13 @@ def test_a_secret_under_an_innocent_key_is_still_removed():
     assert REDACTED in result["note"]
 
 
+def test_external_agent_api_key_under_an_innocent_key_is_redacted():
+    credential = "wbk_0123456789ab_" + ("A" * 43)
+    result = redact({"note": f"temporary value: {credential}"})
+    assert credential not in result["note"]
+    assert REDACTED in result["note"]
+
+
 def test_a_runtime_literal_can_be_registered_for_redaction():
     register_secret("live-session-token-value")
     result = redact({"detail": "header was live-session-token-value"})

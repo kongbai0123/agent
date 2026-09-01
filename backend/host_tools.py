@@ -17,6 +17,7 @@ except ImportError:  # pragma: no cover - package import compatibility
 
 ProjectPreparer = Callable[[str], Any]
 CallContextResolver = Callable[[str, ToolDefinition, Mapping[str, Any]], Any]
+CapabilityStatusQuery = Callable[[str, str], Any]
 
 
 @dataclass(frozen=True)
@@ -36,6 +37,7 @@ class HostToolRuntime:
         approval_broker: ToolApprovalBroker,
         prepare_project: Optional[ProjectPreparer] = None,
         resolve_call_context: Optional[CallContextResolver] = None,
+        capability_status_query: Optional[CapabilityStatusQuery] = None,
         independent_scope_id: Optional[str] = None,
     ) -> None:
         self.registry = registry
@@ -43,6 +45,7 @@ class HostToolRuntime:
         self.approval_broker = approval_broker
         self.prepare_project = prepare_project
         self.resolve_call_context_callback = resolve_call_context
+        self.capability_status_query_callback = capability_status_query
         self.independent_scope_id = str(independent_scope_id or "").strip() or None
         self._event_queues: dict[str, asyncio.Queue[tuple[str, dict[str, Any]]]] = {}
         self._prior_audit_sink = dispatcher.audit_sink
@@ -106,6 +109,21 @@ class HostToolRuntime:
             if inspect.isawaitable(result):
                 await result
         return self.registry.for_project(project_id)
+
+    async def query_capability_status(
+        self,
+        project_id: str,
+        query: str,
+    ) -> Optional[Mapping[str, Any]]:
+        """Return the authoritative read-only capability snapshot, if wired."""
+
+        callback = self.capability_status_query_callback
+        if callback is None:
+            return None
+        resolved = callback(project_id, query)
+        if inspect.isawaitable(resolved):
+            resolved = await resolved
+        return dict(resolved) if isinstance(resolved, Mapping) else None
 
     async def resolve_call_context(
         self,

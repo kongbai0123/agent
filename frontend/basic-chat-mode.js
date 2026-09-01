@@ -98,6 +98,7 @@ function basicPaletteActions(actions) {
     const allowed = new Set([
         '上傳文件（知識庫）', '開啟知識庫工作區', '執行檢索測試',
         '切換模型', '安裝模型', '管理雲端 LLM API', '開新任務（新對話）',
+        '開啟整合中心',
         '切換淺色 / 深色主題', '開啟設定中心', '執行模型測速'
     ]);
     return actions.filter(action => allowed.has(action.label));

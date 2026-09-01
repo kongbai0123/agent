@@ -26,6 +26,10 @@ COMPILED_REVISION = "wbr_compiled_revision_token_001"
 ACTIVE_VERSION = "active-version-uuid-001"
 
 
+def _allow_integration_permission(*_args, **_kwargs):
+    return {"decision": "allow", "policy_revision": 1}
+
+
 class Clock:
     def __init__(self) -> None:
         self.value = datetime(2026, 8, 14, 1, 0, tzinfo=timezone.utc)
@@ -34,7 +38,15 @@ class Clock:
         return self.value
 
 
-def _setup(tmp_path, monkeypatch, *, boot_id="boot-one", full_audit=False):
+def _setup(
+    tmp_path,
+    monkeypatch,
+    *,
+    boot_id="boot-one",
+    full_audit=False,
+    integration_permission_check=_allow_integration_permission,
+    execution_gate=None,
+):
     monkeypatch.setattr(database, "DB_PATH", str(tmp_path / "runtime.sqlite"))
     database.init_db()
     database.create_project("project-one", "Project One", str(tmp_path / "p1"))
@@ -88,6 +100,8 @@ def _setup(tmp_path, monkeypatch, *, boot_id="boot-one", full_audit=False):
             }
             if full_audit else None
         ),
+        execution_gate=execution_gate,
+        integration_permission_check=integration_permission_check,
         workflow_revision_resolver=lambda workflow_id: {
             "active": workflow_id == "workflow-one",
             "active_version_id": clock.live_version,
@@ -243,6 +257,126 @@ def test_provisional_binding_task_is_project_scoped_tool_free_and_encrypted(tmp_
     assert scope.value.status_code == 404
 
 
+def test_task_submission_fails_closed_without_unified_policy_gate(tmp_path, monkeypatch):
+    runtime, _clock, generated = _setup(
+        tmp_path,
+        monkeypatch,
+        integration_permission_check=None,
+    )
+    binding_id = _binding(runtime)
+
+    with pytest.raises(N8nAgentTaskError) as unavailable:
+        runtime.submit_task(
+            {
+                "request_id": "policy-missing",
+                "workflow_id": "workflow-one",
+                "workflow_revision": COMPILED_REVISION,
+                "node_id": "agent-node-runtime",
+                "agent_binding_id": binding_id,
+                "input": {"message": "must not run"},
+            }
+        )
+
+    assert unavailable.value.code == "N8N_INTEGRATION_POLICY_UNAVAILABLE"
+    assert unavailable.value.status_code == 503
+    assert generated == []
+
+
+def test_restricted_project_does_not_treat_workflow_binding_as_task_approval(tmp_path, monkeypatch):
+    runtime, _clock, generated = _setup(
+        tmp_path,
+        monkeypatch,
+        integration_permission_check=lambda *_args, **_kwargs: {
+            "decision": "require_approval",
+            "policy_revision": 4,
+        },
+    )
+    binding_id = _binding(runtime)
+
+    with pytest.raises(N8nAgentTaskError) as approval:
+        runtime.submit_task(
+            {
+                "request_id": "restricted-task",
+                "workflow_id": "workflow-one",
+                "workflow_revision": COMPILED_REVISION,
+                "node_id": "agent-node-runtime",
+                "agent_binding_id": binding_id,
+                "input": {"message": "must await an exact approval contract"},
+            }
+        )
+
+    assert approval.value.code == "N8N_INTEGRATION_APPROVAL_REQUIRED"
+    assert generated == []
+    with database.get_db_conn() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM n8n_agent_tasks").fetchone()[0] == 0
+
+
+def test_extension_revocation_after_queue_terminates_task_without_model_call(tmp_path, monkeypatch):
+    enabled = {"value": True}
+    runtime, _clock, generated = _setup(
+        tmp_path,
+        monkeypatch,
+        execution_gate=lambda _project_id: enabled["value"],
+    )
+    binding_id = _binding(runtime)
+    task = runtime.submit_task(
+        {
+            "request_id": "extension-revoked",
+            "workflow_id": "workflow-one",
+            "workflow_revision": COMPILED_REVISION,
+            "node_id": "agent-node-runtime",
+            "agent_binding_id": binding_id,
+            "input": {"message": "must not reach the model"},
+        }
+    )
+    enabled["value"] = False
+
+    result = runtime.process_task(task["task_id"])
+
+    assert result["status"] == "generation_failed"
+    assert result["error_code"] == "EXTENSION_DISABLED"
+    assert generated == []
+    assert runtime.process_next_task() is None
+
+
+def test_background_worker_rechecks_policy_before_model_execution(tmp_path, monkeypatch):
+    checks = []
+
+    def permission(project_id, capability, **scope):
+        checks.append((project_id, capability, dict(scope)))
+        # submit_task and the worker's pre-claim check pass.  Revocation is
+        # observed by the final check immediately before the model call.
+        return {"decision": "allow" if len(checks) < 3 else "deny"}
+
+    runtime, _clock, generated = _setup(
+        tmp_path,
+        monkeypatch,
+        integration_permission_check=permission,
+    )
+    binding_id = _binding(runtime)
+    task = runtime.submit_task(
+        {
+            "request_id": "policy-revoked",
+            "workflow_id": "workflow-one",
+            "workflow_revision": COMPILED_REVISION,
+            "node_id": "agent-node-runtime",
+            "agent_binding_id": binding_id,
+            "input": {"message": "must not reach the model"},
+        }
+    )
+
+    result = runtime.process_task(task["task_id"])
+
+    assert result["status"] == "generation_failed"
+    assert result["error_code"] == "N8N_INTEGRATION_POLICY_DENIED"
+    assert generated == []
+    assert [item[1] for item in checks] == [
+        "agent.task.submit",
+        "agent.task.submit",
+        "agent.task.submit",
+    ]
+
+
 def test_manual_revision_mismatch_and_secret_input_fail_closed(tmp_path, monkeypatch):
     runtime, _clock, _generated = _setup(tmp_path, monkeypatch)
     binding_id = _binding(runtime)
@@ -350,6 +484,206 @@ def test_runtime_action_status_rechecks_live_active_version(tmp_path, monkeypatc
     assert stale.value.code == "N8N_WORKFLOW_REVISION_CHANGED"
     assert runtime.get_binding(binding_id, project_id="project-one")["active"] is False
     assert runtime.list_runtime_approvals("project-one")[0]["status"] == "revoked"
+
+
+def test_approved_runtime_action_is_not_released_after_project_policy_revocation(tmp_path, monkeypatch):
+    policy = {"decision": "allow"}
+
+    def permission(*_args, **_kwargs):
+        return {"decision": policy["decision"], "policy_revision": 11}
+
+    runtime, _clock, _generated = _setup(
+        tmp_path,
+        monkeypatch,
+        integration_permission_check=permission,
+    )
+    _binding(runtime)
+    approval_scope = _approval_scope(runtime)
+    runtime.adopt_credential_alias(
+        {
+            "project_id": "project-one",
+            "alias": "gmail-work",
+            "credential_id": "internal-credential-77",
+        }
+    )
+    pending = runtime.request_runtime_approval(
+        {
+            "request_id": "policy-revoked-after-approval",
+            "workflow_id": "workflow-one",
+            "workflow_revision": COMPILED_REVISION,
+            "node_id": approval_scope["node_id"],
+            "credential_alias": "gmail-work",
+            "target_kind": "email",
+            "target": "recipient@example.test",
+            "action": "send_email",
+            "run_key": "policy-revoked-run",
+            "task_id": None,
+        }
+    )
+    runtime.decide_runtime_approval(
+        pending["approval_id"],
+        project_id="project-one",
+        expected_digest=pending["request_digest"],
+        approved=True,
+    )
+    policy["decision"] = "deny"
+
+    with pytest.raises(N8nAgentTaskError) as denied:
+        runtime.get_runtime_approval_for_n8n(
+            pending["approval_id"],
+            workflow_id="workflow-one",
+        )
+
+    assert denied.value.code == "N8N_INTEGRATION_POLICY_DENIED"
+
+
+def test_runtime_approval_binds_integration_policy_revision(tmp_path, monkeypatch):
+    policy = {"revision": 17}
+
+    def permission(*_args, **_kwargs):
+        return {
+            "decision": "require_approval",
+            "policy_revision": policy["revision"],
+        }
+
+    runtime, _clock, _generated = _setup(
+        tmp_path,
+        monkeypatch,
+        integration_permission_check=permission,
+    )
+    _binding(runtime)
+    approval_scope = _approval_scope(runtime)
+    runtime.adopt_credential_alias(
+        {
+            "project_id": "project-one",
+            "alias": "gmail-work",
+            "credential_id": "internal-credential-77",
+        }
+    )
+    pending = runtime.request_runtime_approval(
+        {
+            "request_id": "policy-revision-action",
+            "workflow_id": "workflow-one",
+            "workflow_revision": COMPILED_REVISION,
+            "node_id": approval_scope["node_id"],
+            "credential_alias": "gmail-work",
+            "target_kind": "email",
+            "target": "recipient@example.test",
+            "action": "send_email",
+            "run_key": "policy-revision-run",
+            "task_id": None,
+        }
+    )
+    policy["revision"] = 18
+
+    with pytest.raises(N8nAgentTaskError) as stale:
+        runtime.decide_runtime_approval(
+            pending["approval_id"],
+            project_id="project-one",
+            expected_digest=pending["request_digest"],
+            approved=True,
+        )
+
+    assert stale.value.code == "N8N_INTEGRATION_APPROVAL_STALE"
+    assert runtime.list_runtime_approvals("project-one")[0]["status"] == "pending"
+
+
+def test_runtime_approval_is_released_exactly_once(tmp_path, monkeypatch):
+    runtime, _clock, _generated = _setup(tmp_path, monkeypatch)
+    _binding(runtime)
+    approval_scope = _approval_scope(runtime)
+    runtime.adopt_credential_alias(
+        {
+            "project_id": "project-one",
+            "alias": "gmail-work",
+            "credential_id": "internal-credential-77",
+        }
+    )
+    pending = runtime.request_runtime_approval(
+        {
+            "request_id": "one-shot-action",
+            "workflow_id": "workflow-one",
+            "workflow_revision": COMPILED_REVISION,
+            "node_id": approval_scope["node_id"],
+            "credential_alias": "gmail-work",
+            "target_kind": "email",
+            "target": "recipient@example.test",
+            "action": "send_email",
+            "run_key": "one-shot-run",
+            "task_id": None,
+        }
+    )
+    runtime.decide_runtime_approval(
+        pending["approval_id"],
+        project_id="project-one",
+        expected_digest=pending["request_digest"],
+        approved=True,
+    )
+
+    first = runtime.get_runtime_approval_for_n8n(
+        pending["approval_id"], workflow_id="workflow-one"
+    )
+    second = runtime.get_runtime_approval_for_n8n(
+        pending["approval_id"], workflow_id="workflow-one"
+    )
+
+    assert first["status"] == "approved"
+    assert second["status"] == "consumed"
+
+
+def test_runtime_approval_cannot_expire_between_read_and_atomic_consume(tmp_path, monkeypatch):
+    advance = {"value": False}
+    clock_holder = {}
+
+    def permission(*_args, **_kwargs):
+        if advance["value"]:
+            clock_holder["clock"].value += timedelta(seconds=2)
+            advance["value"] = False
+        return {"decision": "allow", "policy_revision": 1}
+
+    runtime, clock, _generated = _setup(
+        tmp_path,
+        monkeypatch,
+        integration_permission_check=permission,
+    )
+    clock_holder["clock"] = clock
+    _binding(runtime)
+    approval_scope = _approval_scope(runtime)
+    runtime.adopt_credential_alias(
+        {
+            "project_id": "project-one",
+            "alias": "gmail-work",
+            "credential_id": "internal-credential-77",
+        }
+    )
+    pending = runtime.request_runtime_approval(
+        {
+            "request_id": "expiry-boundary-action",
+            "workflow_id": "workflow-one",
+            "workflow_revision": COMPILED_REVISION,
+            "node_id": approval_scope["node_id"],
+            "credential_alias": "gmail-work",
+            "target_kind": "email",
+            "target": "recipient@example.test",
+            "action": "send_email",
+            "run_key": "expiry-boundary-run",
+            "task_id": None,
+        }
+    )
+    runtime.decide_runtime_approval(
+        pending["approval_id"],
+        project_id="project-one",
+        expected_digest=pending["request_digest"],
+        approved=True,
+    )
+    clock.value = datetime.fromisoformat(pending["expires_at"]) - timedelta(seconds=1)
+    advance["value"] = True
+
+    result = runtime.get_runtime_approval_for_n8n(
+        pending["approval_id"], workflow_id="workflow-one"
+    )
+
+    assert result["status"] == "expired"
 
 
 def test_credential_alias_and_exact_runtime_approval_grants(tmp_path, monkeypatch):
@@ -576,6 +910,7 @@ def test_generating_task_is_requeued_after_restart_and_old_grant_is_revoked(tmp_
             "slug": slug, "sha256": sha, "instructions": "Use the approved tone."
         },
         credential_resolver=lambda _id: {},
+        integration_permission_check=lambda *_args, **_kwargs: {"decision": "allow"},
         workflow_revision_resolver=lambda _workflow: {
             "active": True,
             "active_version_id": ACTIVE_VERSION,

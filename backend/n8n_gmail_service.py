@@ -86,6 +86,7 @@ class N8nGmailService:
         draft_generator: Callable[[Mapping[str, Any]], Mapping[str, Any]],
         delivery_dispatcher: Callable[[Mapping[str, str]], Any],
         enable_guard: Optional[Callable[[Mapping[str, Any]], Any]] = None,
+        permission_check: Optional[Callable[..., Any]] = None,
         fixed_recipient: str = FIXED_TEST_RECIPIENT,
         recipient_configured: bool = True,
         clock: Callable[[], datetime] = _utcnow,
@@ -98,6 +99,7 @@ class N8nGmailService:
         self._draft_generator = draft_generator
         self._delivery_dispatcher = delivery_dispatcher
         self._enable_guard = enable_guard
+        self._permission_check = permission_check
         self.fixed_recipient = _text(
             fixed_recipient, "fixed_recipient", 320, allow_empty=False
         ).lower()
@@ -355,6 +357,98 @@ class N8nGmailService:
         return profile
 
     @staticmethod
+    def _require_profile_project(
+        row: Mapping[str, Any],
+        profile: Mapping[str, Any],
+        *,
+        code: str,
+        message: str,
+    ) -> None:
+        """Hide records that are outside the currently enabled Gmail Project.
+
+        Gmail uses one managed profile, but historical encrypted records can
+        remain after that profile is rebound to another Project.  Treat an
+        out-of-scope opaque id exactly like a missing record so callers cannot
+        enumerate or mutate a previous Project's mail data.
+        """
+
+        if not hmac.compare_digest(
+            str(row.get("project_id") or ""),
+            str(profile.get("project_id") or ""),
+        ):
+            raise GmailIntegrationError(code, message, status_code=404)
+
+    def _require_permission(
+        self,
+        project_id: Any,
+        capability: str,
+        *,
+        resource_type: Optional[str] = None,
+        resource_id: Optional[str] = None,
+        approval_satisfied: bool = False,
+    ) -> None:
+        """Fail closed against the unified Project integration policy.
+
+        The callback is intentionally narrow and receives no email content,
+        credential, claim token or delivery token.  ``require_approval`` is
+        accepted only after this service has itself verified the immutable
+        draft approval transition.
+        """
+
+        project = _safe_id(project_id, "project_id")
+        if self._permission_check is None:
+            raise GmailIntegrationError(
+                "gmail_permission_unavailable",
+                "Gmail 整合權限閘門尚未連線。",
+                status_code=503,
+                recoverable=True,
+            )
+        try:
+            outcome = self._permission_check(
+                project,
+                capability,
+                resource_type=resource_type,
+                resource_id=resource_id,
+            )
+        except Exception as exc:
+            raise GmailIntegrationError(
+                "gmail_permission_unavailable",
+                "目前無法確認 Gmail 整合權限。",
+                status_code=503,
+                recoverable=True,
+            ) from exc
+        if outcome is True:
+            return
+        if outcome is False:
+            decision = "deny"
+        elif isinstance(outcome, Mapping):
+            decision = str(outcome.get("decision") or "").strip().casefold()
+        else:
+            raise GmailIntegrationError(
+                "gmail_permission_unavailable",
+                "Gmail 整合權限閘門回傳無效結果。",
+                status_code=503,
+                recoverable=True,
+            )
+        if decision == "allow":
+            return
+        if decision == "require_approval" and approval_satisfied:
+            return
+        if decision == "require_approval":
+            raise GmailIntegrationError(
+                "gmail_permission_approval_required",
+                "這項 Gmail 操作需要使用者核准。",
+                status_code=409,
+                recoverable=True,
+            )
+        raise GmailIntegrationError(
+            "gmail_permission_denied",
+            "此 Project 的整合權限不允許這項 Gmail 操作。",
+            status_code=403,
+            recoverable=False,
+        )
+
+    @staticmethod
     def _validate_attachments(value: Any) -> List[Dict[str, Any]]:
         if value is None:
             return []
@@ -443,6 +537,18 @@ class N8nGmailService:
         label_set = {item.casefold() for item in labels}
         if profile["required_label"].casefold() not in label_set or "inbox" not in label_set or "sent" in label_set:
             raise GmailIntegrationError("message_not_eligible", "The Gmail message does not satisfy the inbound label policy.", status_code=403)
+        self._require_permission(
+            profile["project_id"],
+            "message.read",
+            resource_type="label",
+            resource_id=str(profile["required_label"]),
+        )
+        self._require_permission(
+            profile["project_id"],
+            "draft.create",
+            resource_type="recipient",
+            resource_id=str(profile["fixed_recipient"]),
+        )
         event_id = _safe_id(payload.get("event_id"), "event_id")
         message_id = _safe_id(payload.get("gmail_message_id"), "gmail_message_id")
         gmail_thread_id = _safe_id(payload.get("gmail_thread_id"), "gmail_thread_id")
@@ -467,6 +573,12 @@ class N8nGmailService:
             event_id=event_id, gmail_message_id=message_id
         )
         if duplicate:
+            self._require_profile_project(
+                duplicate,
+                profile,
+                code="event_not_found",
+                message="Gmail event not found.",
+            )
             if duplicate["request_sha256"] != request_sha:
                 raise GmailIntegrationError(
                     "idempotency_conflict",
@@ -492,6 +604,12 @@ class N8nGmailService:
             "payload_ciphertext": encrypted, "state": "received",
         })
         if not created:
+            self._require_profile_project(
+                event,
+                profile,
+                code="event_not_found",
+                message="Gmail event not found.",
+            )
             if event["request_sha256"] != request_sha:
                 raise GmailIntegrationError("idempotency_conflict", "The event ID or Gmail message ID was reused with different content.", status_code=409)
             return {
@@ -526,6 +644,12 @@ class N8nGmailService:
         if set(payload) - {"instruction", "model", "subject"}:
             raise GmailIntegrationError("invalid_request", "The compose request contains unknown fields.")
         profile = self._profile_ready()
+        self._require_permission(
+            profile["project_id"],
+            "draft.create",
+            resource_type="recipient",
+            resource_id=str(profile["fixed_recipient"]),
+        )
         instruction = _text(payload.get("instruction", ""), "instruction", _MAX_INSTRUCTION, allow_empty=False)
         subject = _text(payload.get("subject", ""), "subject", _MAX_SUBJECT)
         model_value = payload.get("model")
@@ -581,6 +705,16 @@ class N8nGmailService:
 
     def generate_draft(self, draft_id: str) -> Dict[str, Any]:
         draft_id = _safe_id(draft_id, "draft_id")
+        draft = database.get_n8n_gmail_draft(draft_id)
+        if not draft or draft.get("tombstoned_at"):
+            raise GmailIntegrationError("draft_not_found", "Draft not found.", status_code=404)
+        profile = self._profile_ready()
+        self._require_profile_project(
+            draft,
+            profile,
+            code="draft_not_found",
+            message="Draft not found.",
+        )
         if not database.claim_n8n_gmail_generation(draft_id):
             current = database.get_n8n_gmail_draft(draft_id)
             if not current:
@@ -588,8 +722,27 @@ class N8nGmailService:
             return {"draft_id": draft_id, "status": current["status"], "claimed": False}
         draft = database.get_n8n_gmail_draft(draft_id)
         try:
-            source = self._generation_input(draft)
             profile = self._profile_ready()
+            self._require_profile_project(
+                draft,
+                profile,
+                code="draft_not_found",
+                message="Draft not found.",
+            )
+            if draft.get("event_id"):
+                self._require_permission(
+                    draft["project_id"],
+                    "message.read",
+                    resource_type="label",
+                    resource_id=str(profile["required_label"]),
+                )
+            self._require_permission(
+                draft["project_id"],
+                "draft.create",
+                resource_type="recipient",
+                resource_id=str(profile["fixed_recipient"]),
+            )
+            source = self._generation_input(draft)
             profile_instruction = self.cipher.decrypt_text(
                 profile["instruction_ciphertext"], aad="gmail-profile-instruction:gmail"
             )
@@ -769,21 +922,66 @@ class N8nGmailService:
         row = database.get_n8n_gmail_draft(_safe_id(draft_id, "draft_id"))
         if not row or row["tombstoned_at"]:
             raise GmailIntegrationError("draft_not_found", "Draft not found.", status_code=404)
+        profile = self._profile_ready()
+        self._require_profile_project(
+            row,
+            profile,
+            code="draft_not_found",
+            message="Draft not found.",
+        )
+        self._require_permission(
+            row["project_id"],
+            "message.read",
+            resource_type="label",
+            resource_id=str(profile.get("required_label") or DEFAULT_LABEL),
+        )
         return self._public_draft(row, include_body=True)
 
     def get_mail_run(self, run_id: str) -> Dict[str, Any]:
         row = database.get_n8n_gmail_draft_by_run(_safe_id(run_id, "run_id"))
         if not row or row["tombstoned_at"]:
             raise GmailIntegrationError("mail_run_not_found", "Mail run not found.", status_code=404)
+        profile = self._profile_ready()
+        self._require_profile_project(
+            row,
+            profile,
+            code="mail_run_not_found",
+            message="Mail run not found.",
+        )
+        self._require_permission(
+            row["project_id"],
+            "message.read",
+            resource_type="label",
+            resource_id=str(profile.get("required_label") or DEFAULT_LABEL),
+        )
         return self._public_draft(row, include_body=True)
 
     def list_drafts(self, *, status: Optional[str] = None, limit: int = 100) -> List[Dict[str, Any]]:
-        return [self._public_draft(row, include_body=False) for row in database.list_n8n_gmail_drafts(status=status, limit=limit)]
+        profile = self._profile_ready()
+        rows = database.list_n8n_gmail_drafts(
+            status=status,
+            project_id=str(profile["project_id"]),
+            limit=limit,
+        )
+        if rows:
+            self._require_permission(
+                rows[0]["project_id"],
+                "message.read",
+                resource_type="label",
+                resource_id=str(profile.get("required_label") or DEFAULT_LABEL),
+            )
+        return [self._public_draft(row, include_body=False) for row in rows]
 
     def public_event_snapshot(self) -> Dict[str, Any]:
         """Content-free change signal for the browser SSE channel."""
 
-        rows = database.list_n8n_gmail_drafts(limit=250)
+        profile = database.get_n8n_gmail_profile() or {}
+        project_id = str(profile.get("project_id") or "").strip()
+        rows = (
+            database.list_n8n_gmail_drafts(project_id=project_id, limit=250)
+            if project_id
+            else []
+        )
         counts: Dict[str, int] = {}
         latest = None
         for row in rows:
@@ -811,6 +1009,19 @@ class N8nGmailService:
         current = database.get_n8n_gmail_draft(draft_id)
         if not current or current["tombstoned_at"]:
             raise GmailIntegrationError("draft_not_found", "Draft not found.", status_code=404)
+        profile = self._profile_ready()
+        self._require_profile_project(
+            current,
+            profile,
+            code="draft_not_found",
+            message="Draft not found.",
+        )
+        self._require_permission(
+            current["project_id"],
+            "draft.create",
+            resource_type="recipient",
+            resource_id=str(profile["fixed_recipient"]),
+        )
         expected_revision = int(payload.get("expected_revision"))
         expected_sha = str(payload.get("expected_sha256") or "")
         supplied_subject = payload.get("subject")
@@ -843,12 +1054,19 @@ class N8nGmailService:
         current = database.get_n8n_gmail_draft(draft_id)
         if not current:
             raise GmailIntegrationError("draft_not_found", "Draft not found.", status_code=404)
-        if str(current.get("project_id") or "") != str(profile.get("project_id") or ""):
-            raise GmailIntegrationError(
-                "draft_scope_changed",
-                "The draft no longer belongs to the enabled Gmail project.",
-                status_code=409,
-            )
+        self._require_profile_project(
+            current,
+            profile,
+            code="draft_not_found",
+            message="Draft not found.",
+        )
+        self._require_permission(
+            current["project_id"],
+            "message.send",
+            resource_type="recipient",
+            resource_id=str(profile["fixed_recipient"]),
+            approval_satisfied=True,
+        )
         expected_revision = int(payload.get("expected_revision"))
         expected_sha = str(payload.get("expected_sha256") or "")
         delivery_id = self._id_factory("email_delivery")
@@ -873,14 +1091,21 @@ class N8nGmailService:
         delivery = database.get_n8n_gmail_delivery(_safe_id(delivery_id, "delivery_id"))
         if not delivery:
             raise GmailIntegrationError("delivery_not_found", "Delivery not found.", status_code=404)
-        if str(delivery.get("project_id") or "") != str(profile.get("project_id") or ""):
-            raise GmailIntegrationError(
-                "delivery_scope_changed",
-                "The delivery no longer belongs to the enabled Gmail project.",
-                status_code=409,
-            )
+        self._require_profile_project(
+            delivery,
+            profile,
+            code="delivery_not_found",
+            message="Delivery not found.",
+        )
         if delivery["status"] != "pending":
             return {"delivery_id": delivery_id, "status": delivery["status"], "dispatched": False}
+        self._require_permission(
+            delivery["project_id"],
+            "message.send",
+            resource_type="recipient",
+            resource_id=str(profile["fixed_recipient"]),
+            approval_satisfied=True,
+        )
         claim_token = hmac.new(
             self._outbound_secret(),
             f"claim\n{delivery_id}\n{delivery['revision']}\n{delivery['content_sha256']}".encode("utf-8"),
@@ -903,8 +1128,19 @@ class N8nGmailService:
         return database.list_pending_n8n_gmail_deliveries(now=now, limit=limit)
 
     def reject_draft(self, draft_id: str, payload: Mapping[str, Any]) -> Dict[str, Any]:
+        draft_id = _safe_id(draft_id, "draft_id")
+        current = database.get_n8n_gmail_draft(draft_id)
+        if not current or current.get("tombstoned_at"):
+            raise GmailIntegrationError("draft_not_found", "Draft not found.", status_code=404)
+        profile = self._profile_ready()
+        self._require_profile_project(
+            current,
+            profile,
+            code="draft_not_found",
+            message="Draft not found.",
+        )
         if not database.reject_n8n_gmail_draft(
-            _safe_id(draft_id, "draft_id"), expected_revision=int(payload.get("expected_revision")),
+            draft_id, expected_revision=int(payload.get("expected_revision")),
             expected_sha256=str(payload.get("expected_sha256") or ""),
         ):
             raise GmailIntegrationError("draft_revision_conflict", "The draft cannot be rejected in its current state.", status_code=409)
@@ -914,8 +1150,25 @@ class N8nGmailService:
         return {"draft_id": draft_id, "status": "rejected"}
 
     def regenerate_draft(self, draft_id: str, payload: Mapping[str, Any]) -> Dict[str, Any]:
+        safe_draft_id = _safe_id(draft_id, "draft_id")
+        current = database.get_n8n_gmail_draft(safe_draft_id)
+        if not current or current.get("tombstoned_at"):
+            raise GmailIntegrationError("draft_not_found", "Draft not found.", status_code=404)
+        profile = self._profile_ready()
+        self._require_profile_project(
+            current,
+            profile,
+            code="draft_not_found",
+            message="Draft not found.",
+        )
+        self._require_permission(
+            current["project_id"],
+            "draft.create",
+            resource_type="recipient",
+            resource_id=str(profile["fixed_recipient"]),
+        )
         if not database.queue_n8n_gmail_regeneration(
-            _safe_id(draft_id, "draft_id"), expected_revision=int(payload.get("expected_revision")),
+            safe_draft_id, expected_revision=int(payload.get("expected_revision")),
             expected_sha256=str(payload.get("expected_sha256") or ""),
             empty_sha256=hashlib.sha256(b"").hexdigest(),
         ):
@@ -940,12 +1193,19 @@ class N8nGmailService:
         # workflow and immutable Project checks before plaintext is released.
         if delivery.get("status") == "pending":
             profile = self._profile_ready()
-            if str(delivery.get("project_id") or "") != str(profile.get("project_id") or ""):
-                raise GmailIntegrationError(
-                    "delivery_scope_changed",
-                    "The delivery no longer belongs to the enabled Gmail project.",
-                    status_code=409,
-                )
+            self._require_profile_project(
+                delivery,
+                profile,
+                code="delivery_not_found",
+                message="Delivery not found.",
+            )
+            self._require_permission(
+                delivery["project_id"],
+                "message.send",
+                resource_type="recipient",
+                resource_id=str(profile["fixed_recipient"]),
+                approval_satisfied=True,
+            )
         token = secrets.token_urlsafe(32)
         outcome, delivery = database.claim_n8n_gmail_delivery(
             delivery_id, claim_id=claim_id, result_token_sha256=hashlib.sha256(token.encode()).hexdigest(),
@@ -1024,12 +1284,33 @@ class N8nGmailService:
         return {"delivery_id": delivery_id, "status": final["status"], "idempotent": outcome == "replay"}
 
     def tombstone_draft(self, draft_id: str) -> Dict[str, Any]:
-        if not database.tombstone_n8n_gmail_draft(_safe_id(draft_id, "draft_id")):
+        draft_id = _safe_id(draft_id, "draft_id")
+        current = database.get_n8n_gmail_draft(draft_id)
+        if not current or current.get("tombstoned_at"):
+            raise GmailIntegrationError("draft_not_found", "Draft not found.", status_code=404)
+        profile = self._profile_ready()
+        self._require_profile_project(
+            current,
+            profile,
+            code="draft_not_found",
+            message="Draft not found.",
+        )
+        if not database.tombstone_n8n_gmail_draft(draft_id):
             raise GmailIntegrationError("draft_not_found", "Draft not found.", status_code=404)
         return {"draft_id": draft_id, "status": "tombstoned"}
 
     def delete_thread(self, thread_id: str) -> Dict[str, Any]:
         thread_id = _safe_id(thread_id, "thread_id")
+        current = database.get_n8n_gmail_thread(thread_id=thread_id)
+        if not current or current.get("tombstoned_at"):
+            raise GmailIntegrationError("mail_thread_not_found", "Mail thread not found.", status_code=404)
+        profile = self._profile_ready()
+        self._require_profile_project(
+            current,
+            profile,
+            code="mail_thread_not_found",
+            message="Mail thread not found.",
+        )
         if database.n8n_gmail_thread_has_unresolved_delivery(thread_id):
             raise GmailIntegrationError(
                 "delivery_unresolved",

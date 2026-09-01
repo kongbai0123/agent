@@ -116,9 +116,15 @@
     function profileForm(connector, profile) {
         const form = document.createElement('form');
         form.className = 'connector-form';
+        if (connector.id === 'gmail') {
+            const guide = document.createElement('div');
+            guide.className = 'extension-state';
+            guide.textContent = '首次導入：在 Google Cloud 啟用 Gmail API、建立「網頁應用程式」OAuth 用戶端，並把下方回呼網址加入已授權的重新導向 URI。這是一次性設定，Workbench 不會要求你的 Google 密碼。';
+            form.append(guide);
+        }
 
         const callbackLabel = document.createElement('label');
-        callbackLabel.append(document.createTextNode('OAuth Callback URL'));
+        callbackLabel.append(document.createTextNode('OAuth 回呼網址'));
         const callbackRow = document.createElement('div');
         callbackRow.className = 'connector-callback';
         const callback = document.createElement('input');
@@ -128,7 +134,7 @@
         const copy = button('複製', 'copy');
         copy.addEventListener('click', async () => {
             await navigator.clipboard.writeText(callback.value);
-            state.deps?.showToast?.('已複製 Callback URL', 'success');
+            state.deps?.showToast?.('已複製 OAuth 回呼網址', 'success');
         });
         callbackRow.append(callback, copy);
         callbackLabel.append(callbackRow);
@@ -140,7 +146,7 @@
         }
 
         const clientIdLabel = document.createElement('label');
-        clientIdLabel.append(document.createTextNode('Client ID'));
+        clientIdLabel.append(document.createTextNode('OAuth 用戶端 ID（Client ID）'));
         const clientId = document.createElement('input');
         clientId.className = 'settings-input';
         clientId.required = true;
@@ -150,7 +156,7 @@
         clientIdLabel.append(clientId);
 
         const secretLabel = document.createElement('label');
-        secretLabel.append(document.createTextNode(profile?.configured ? 'Client Secret（留白代表不變）' : 'Client Secret'));
+        secretLabel.append(document.createTextNode(profile?.configured ? 'OAuth 用戶端密鑰（留白代表不變）' : 'OAuth 用戶端密鑰（Client Secret）'));
         const secret = document.createElement('input');
         secret.className = 'settings-input';
         secret.type = 'password';
@@ -442,15 +448,21 @@
             try {
                 const payload = await request(`/api/connectors/connections?connector_id=${encodeURIComponent(connectorId)}`);
                 const current = payload.connections || [];
-                const completed = current.some(connection => {
+                const completedConnection = current.find(connection => {
                     if (connection.status !== 'connected') return false;
                     const id = connectionId(connection);
                     return !baseline.has(id) || baseline.get(id) !== connectionVersion(connection);
                 });
-                if (completed) {
+                if (completedConnection) {
                     stopOAuthPolling();
+                    if (connectorId === 'gmail') {
+                        await finishGmailImport(completedConnection);
+                    }
                     await refresh();
-                    state.deps?.showToast?.('OAuth 連線完成', 'success');
+                    state.deps?.showToast?.(
+                        connectorId === 'gmail' ? 'Gmail 已導入，可由 Agent 在目前專案中使用' : 'OAuth 連線完成',
+                        'success'
+                    );
                     return;
                 }
             } catch (_error) { /* transient local error; retry until the flow expires */ }
@@ -459,6 +471,51 @@
             }
         };
         poll.timer = setTimeout(check, 600);
+    }
+
+    async function finishGmailImport(connection) {
+        if (!state.selectedProjectId) throw new Error('請先選擇要使用 Gmail 的專案。');
+        const projectId = encodeURIComponent(state.selectedProjectId);
+        const id = encodeURIComponent(connectionId(connection));
+        await request(`/api/projects/${projectId}/connections/${id}`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ enabled: true, mode: 'read_only' }),
+        });
+        const [current, discoverable] = await Promise.all([
+            request(`/api/projects/${projectId}/connections/${id}/resources`),
+            request(`/api/connectors/connections/${id}/resources?type=mailbox`),
+        ]);
+        const mailbox = (discoverable.resources || [])[0];
+        if (!mailbox) throw new Error('Google 已授權，但 Gmail 未回傳可用信箱。');
+        await request(`/api/projects/${projectId}/connections/${id}/resources`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ revision: Number(current.revision || 0), resources: [mailbox] }),
+        });
+
+        const policyResult = await request(`/api/integration-center/policies/${projectId}`);
+        const policy = policyResult.policy || {};
+        const grants = Array.isArray(policy.grants) ? [...policy.grants] : [];
+        if (!grants.some(grant => grant.integration_id === 'gmail')) {
+            grants.push({
+                integration_id: 'gmail',
+                connection_id: connectionId(connection),
+                capabilities: ['message.read'],
+                resources: [{ resource_type: 'mailbox', resource_id: mailbox.resource_id }],
+            });
+            await request(`/api/integration-center/policies/${projectId}`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    name: policy.name || '專案整合權限',
+                    permission_mode: policy.permission_mode || 'restricted',
+                    grants,
+                    revision: Number(policy.revision || 0),
+                    acknowledge_open_risk: policy.permission_mode === 'open',
+                }),
+            });
+        }
     }
 
     function connectorCard(connector) {
@@ -478,7 +535,7 @@
         head.className = 'connector-card-head';
         const title = document.createElement('h3');
         const icon = document.createElement('i');
-        icon.dataset.lucide = connector.id === 'github' ? 'github' : 'notebook-text';
+        icon.dataset.lucide = connector.id === 'github' ? 'github' : (connector.id === 'gmail' ? 'mail' : 'notebook-text');
         title.append(icon, document.createTextNode(connector.name || connector.id));
         const status = document.createElement('span');
         const connected = connections.some(item => item.status === 'connected');

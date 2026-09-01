@@ -101,6 +101,102 @@ _COMPAT_TOOL_CALL_PATTERN = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
+_CAPABILITY_STATUS_MARKERS = (
+    "狀態",
+    "啟用",
+    "連線",
+    "連接",
+    "權限",
+    "能不能用",
+    "是否可用",
+    "為何不能",
+    "無法使用",
+    "後台功能",
+    "available",
+    "enabled",
+    "connected",
+    "permission",
+    "status",
+)
+_CAPABILITY_SUBJECT_MARKERS = (
+    "gmail",
+    "github",
+    "notion",
+    "n8n",
+    "mcp",
+    "playwright",
+    "chrome",
+    "瀏覽器",
+    "外掛",
+    "擴充",
+    "模型",
+    "provider",
+    "供應商",
+    "agent api",
+    "api key",
+    "api 金鑰",
+    "功能",
+    "工具",
+)
+
+
+def is_capability_status_query(value: str) -> bool:
+    """Recognize requests that require authoritative Workbench state.
+
+    This intentionally requires both a state/permission expression and a
+    Workbench capability subject.  It does not route ordinary questions about
+    third-party product status through the local diagnostic service.
+    """
+
+    normalized = " ".join(str(value or "").casefold().split())[:2000]
+    if not normalized:
+        return False
+    return any(marker in normalized for marker in _CAPABILITY_STATUS_MARKERS) and any(
+        marker in normalized for marker in _CAPABILITY_SUBJECT_MARKERS
+    )
+
+
+def _capability_status_unavailable_snapshot(
+    *, project_id: str, query: str
+) -> Dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "project_id": project_id,
+        "queried_at": _now_iso(),
+        "query": str(query or "")[:500],
+        "items": [],
+        "summary": {"total": 0, "available": 0, "blocked": 0},
+        "error": {
+            "code": "CAPABILITY_STATUS_UNAVAILABLE",
+            "message": "目前無法驗證 Workbench 後台功能狀態，請稍後重新檢查。",
+        },
+    }
+
+
+def _capability_status_project_required_snapshot(query: str) -> Dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "project_id": None,
+        "queried_at": _now_iso(),
+        "query": str(query or "")[:500],
+        "items": [
+            {
+                "id": "project_scope",
+                "name": "Project 工作範圍",
+                "kind": "project_scope",
+                "available": False,
+                "reason_code": "project_required",
+                "reason": "功能狀態與權限必須在指定 Project 內查詢，避免讀取其他專案的設定。",
+                "repair": {
+                    "workspace": "chat",
+                    "section": "project_switcher",
+                    "label": "選擇 Project",
+                },
+            }
+        ],
+        "summary": {"total": 1, "available": 0, "blocked": 1},
+    }
+
 
 def _payload_with_tool_availability_note(
     payload: Mapping[str, Any],
@@ -116,6 +212,47 @@ def _payload_with_tool_availability_note(
             + "\n\nTool availability for this request: "
             + str(note).strip()
         )
+    return governed
+
+
+def _payload_with_capability_status_snapshot(
+    payload: Mapping[str, Any],
+    snapshot: Mapping[str, Any],
+) -> Dict[str, Any]:
+    governed = dict(payload)
+    governed["messages"] = [dict(item) for item in payload.get("messages") or []]
+    model_snapshot = {
+        **dict(snapshot),
+        "items": list(snapshot.get("items") or [])[:25],
+    }
+    status_json = json.dumps(
+        model_snapshot,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    if len(status_json) > 16_000:
+        model_snapshot["items"] = model_snapshot["items"][:10]
+        model_snapshot["truncated_for_model"] = True
+        status_json = json.dumps(
+            model_snapshot,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+    insert_at = len(governed["messages"])
+    if insert_at and governed["messages"][-1].get("role") == "user":
+        insert_at -= 1
+    governed["messages"].insert(
+        insert_at,
+        {
+            "role": "system",
+            "content": (
+                "Workbench 已在回答前查詢目前 Project 的權威功能狀態。"
+                "請只根據下列快照說明是否可用、阻擋原因與修復入口；"
+                "不得沿用舊對話中的猜測，也不得聲稱已變更設定。\n"
+                + status_json
+            ),
+        },
+    )
     return governed
 
 
@@ -1461,6 +1598,19 @@ async def _stream_model_tool_loop(
             "eligible project-scoped tools. Do not describe this as a permanent "
             "limitation of the Agent.",
         )
+        if is_capability_status_query(user_query):
+            project_snapshot = _capability_status_project_required_snapshot(user_query)
+            public_snapshot = {
+                **project_snapshot,
+                "run_id": run_id,
+                "session_id": session_id,
+            }
+            _record_public_event(run_id, "capability_status", public_snapshot)
+            yield encode_sse("capability_status", public_snapshot)
+            plain_payload = _payload_with_capability_status_snapshot(
+                plain_payload,
+                project_snapshot,
+            )
         async for event in _stream_model_tokens(
             settings=settings,
             payload=plain_payload,
@@ -1503,11 +1653,59 @@ async def _stream_model_tool_loop(
         model,
         project_id=project_id,
     )
+    capability_status_requested = is_capability_status_query(user_query)
     try:
         definitions = await host_tool_runtime.definitions_for_project(tool_scope_id)
     except Exception as exc:
         LOGGER.warning("Project tools unavailable (%s).", type(exc).__name__)
         definitions = ()
+    if not project_id or not capability_status_requested:
+        definitions = tuple(
+            definition
+            for definition in definitions
+            if str(getattr(definition, "extension_id", ""))
+            != "builtin.capability-status"
+        )
+    capability_status_snapshot: Optional[Dict[str, Any]] = None
+    if capability_status_requested:
+        if not project_id:
+            capability_status_snapshot = _capability_status_project_required_snapshot(
+                user_query
+            )
+            public_snapshot = {
+                **capability_status_snapshot,
+                "run_id": run_id,
+                "session_id": session_id,
+            }
+            _record_public_event(run_id, "capability_status", public_snapshot)
+            yield encode_sse("capability_status", public_snapshot)
+        else:
+            try:
+                snapshot = await host_tool_runtime.query_capability_status(
+                    project_id,
+                    user_query,
+                )
+                if isinstance(snapshot, Mapping):
+                    capability_status_snapshot = dict(snapshot)
+                else:
+                    capability_status_snapshot = _capability_status_unavailable_snapshot(
+                        project_id=project_id,
+                        query=user_query,
+                    )
+            except Exception as exc:
+                LOGGER.warning("Capability status preflight unavailable (%s).", type(exc).__name__)
+                capability_status_snapshot = _capability_status_unavailable_snapshot(
+                    project_id=project_id,
+                    query=user_query,
+                )
+            public_snapshot = {
+                **capability_status_snapshot,
+                "run_id": run_id,
+                "session_id": session_id,
+                "project_id": project_id,
+            }
+            _record_public_event(run_id, "capability_status", public_snapshot)
+            yield encode_sse("capability_status", public_snapshot)
     basic_tool_limit = _bounded_agent_setting(
         settings,
         "agent_max_tool_calls",
@@ -1555,6 +1753,11 @@ async def _stream_model_tool_loop(
             "Agent limitation; explain that the relevant extension and permission "
             "must be made available.",
         )
+        if capability_status_snapshot is not None:
+            plain_payload = _payload_with_capability_status_snapshot(
+                plain_payload,
+                capability_status_snapshot,
+            )
         async for event in _stream_model_tokens(
             settings=settings,
             payload=plain_payload,
@@ -1610,6 +1813,13 @@ async def _stream_model_tool_loop(
     if insert_at and governed_payload["messages"][-1].get("role") == "user":
         insert_at -= 1
     governed_payload["messages"].insert(insert_at, capability_update)
+    if capability_status_snapshot is not None:
+        # The snapshot is produced by the Host from authoritative local stores;
+        # it is not model-authored and contains no credential material.
+        governed_payload = _payload_with_capability_status_snapshot(
+            governed_payload,
+            capability_status_snapshot,
+        )
     if native_tool_mode and host_plan is None:
         governed_payload["tools"] = [definition.model_schema() for definition in definitions]
         governed_payload["tool_choice"] = "auto"

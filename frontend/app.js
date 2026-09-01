@@ -2079,6 +2079,7 @@ async function loadSessions(searchVal = '') {
         renderProjectSwitcher();
         window.workbenchN8nWorkflows?.refreshProjects?.();
         window.workbenchN8nGovernance?.refreshProjects?.();
+        window.workbenchIntegrationCenter?.syncProjects?.(activeProjectId);
         safeCreateIcons();
         loadKnowledgeRetrievalPreference(activeProjectId);
         void loadRagStatus();
@@ -3801,7 +3802,63 @@ async function handleChatSubmit(e) {
         let runInProgress = true;
         let isDrawerActive = true; // 記錄折疊面板展開/收合狀態，預設為展開
         let sources = [];          // P0-3：本輪 RAG 檢索來源（context/sources 事件）
+        let capabilityStatus = null; // Host 在回答前查得的 Project 權威功能狀態
         const nowHM = () => new Date().toTimeString().slice(0, 5);
+
+        function capabilityStatusHTML() {
+            if (!capabilityStatus || !Array.isArray(capabilityStatus.items)) return '';
+            if (capabilityStatus.error) {
+                return `<section class="capability-status-card is-blocked" aria-label="Workbench 功能狀態">
+                    <strong>目前無法驗證後台狀態</strong>
+                    <p>${escapeHtml(capabilityStatus.error.message || '請稍後重新檢查。')}</p>
+                </section>`;
+            }
+            const items = capabilityStatus.items.slice(0, 6);
+            if (!items.length) {
+                return `<section class="capability-status-card is-blocked" aria-label="Workbench 功能狀態">
+                    <strong>未找到相符的 Workbench 功能</strong>
+                    <p>系統已查詢目前 Project 的後台狀態，但沒有找到符合這個名稱的功能。</p>
+                </section>`;
+            }
+            const rows = items.map(item => {
+                const available = item.available === true;
+                const repair = item.repair || {};
+                const repairButton = available || !repair.workspace ? '' : `
+                    <button type="button" class="btn btn-secondary compact"
+                        data-capability-repair-workspace="${escapeHtml(repair.workspace)}"
+                        data-capability-repair-section="${escapeHtml(repair.section || '')}">
+                        ${escapeHtml(repair.label || '開啟設定')}
+                    </button>`;
+                return `<div class="capability-status-row ${available ? 'is-ready' : 'is-blocked'}">
+                    <div class="capability-status-copy">
+                        <strong>${escapeHtml(item.name || item.id || '未命名功能')}</strong>
+                        <span class="capability-status-badge">${available ? '可用' : '需處理'}</span>
+                        <p>${escapeHtml(item.reason || '目前沒有可顯示的狀態說明。')}</p>
+                    </div>
+                    ${repairButton}
+                </div>`;
+            }).join('');
+            return `<section class="capability-status-card" aria-label="Workbench 功能狀態">
+                <div class="capability-status-heading">
+                    <span>Workbench 已查詢後台狀態</span>
+                    <small>目前 Project</small>
+                </div>
+                ${rows}
+            </section>`;
+        }
+
+        function bindCapabilityRepairActions() {
+            bubbleEl.querySelectorAll('[data-capability-repair-workspace]').forEach(button => {
+                button.addEventListener('click', () => {
+                    const workspace = button.dataset.capabilityRepairWorkspace;
+                    const section = button.dataset.capabilityRepairSection || '';
+                    if (workspace === 'integrations') window.workbenchIntegrationCenter?.open(section || 'overview');
+                    else if (workspace === 'extensions') window.workbenchExtensions?.open(section || 'installed');
+                    else if (workspace === 'cloud') window.workbenchCloudLlm?.openTab?.(section || 'health');
+                    else if (workspace === 'chat' && section === 'project_switcher') projectSwitcherBtn?.click();
+                });
+            });
+        }
         
         // 💡 統合式更新泡泡 HTML 渲染器 💡
         // P0-5：heavy=false 時為串流輕量渲染（跳過 KaTeX / Artifacts 全文掃描 / 部分圖示重建）
@@ -3841,10 +3898,12 @@ async function handleChatSubmit(e) {
             cleanDisplay = cleanDisplay.replace(/```json[\s\S]*$/g, '');
             
             const parsedContentHTML = renderMarkdownSafe(cleanDisplay);
+            const statusHTML = capabilityStatusHTML();
             
             // 如果沒有任何 Agent 執行資訊，直接渲染 markdown
             if (executedTools.length === 0 && execLog.length === 0 && runTasks.length === 0 && !finalSummary) {
-                bubbleEl.innerHTML = `<div class="assistant-answer-content">${parsedContentHTML}</div>`;
+                bubbleEl.innerHTML = statusHTML + `<div class="assistant-answer-content">${parsedContentHTML}</div>`;
+                bindCapabilityRepairActions();
                 if (heavy) {
                     safeCreateIcons();
                     safeRenderMath(bubbleEl);
@@ -3946,11 +4005,12 @@ async function handleChatSubmit(e) {
             const finalHTML = renderAgentWorkReport(finalSummary, showFinalReport, finalValidationPassed);
             
             // 4. 面板、正式文字與最終報告拼接
-            bubbleEl.innerHTML = drawerHTML
+            bubbleEl.innerHTML = statusHTML + drawerHTML
                 + `<div class="assistant-answer-content">${parsedContentHTML}</div>` + finalHTML;
             
             // 5. 重新裝配 Lucide 圖示與折疊面板點擊事件
             safeCreateIcons();
+            bindCapabilityRepairActions();
             
             const trigger = bubbleEl.querySelector('.drawer-trigger');
             const content = bubbleEl.querySelector('.drawer-content');
@@ -4030,6 +4090,17 @@ async function handleChatSubmit(e) {
                             if (eventData.run_id && String(eventData.run_id) !== streamIdentity.runId) continue;
                         } else if (eventType === 'skills') {
                             window.workbenchSkills?.handleRunEvent(eventData);
+                        } else if (eventType === 'capability_status') {
+                            capabilityStatus = eventData;
+                            const total = Number(eventData.summary?.total || 0);
+                            const available = Number(eventData.summary?.available || 0);
+                            execLog.push({
+                                kind: 'validation',
+                                passed: total > 0 && available === total,
+                                text: `已查詢 Workbench 後台狀態：${available}/${total} 項可用`,
+                                time: nowHM()
+                            });
+                            updateBubble();
                         } else if (eventType === 'cancelled') {
                             chatProgressStatus = 'cancelled';
                             setAssistantResponsePhase(assistantMsgEl, 'clear');
@@ -7603,13 +7674,14 @@ const PALETTE_ACTIONS = [
     { label: '切換模型', icon: 'box', run: () => openModelManager('installed') },
     { label: '安裝模型', icon: 'download', run: () => openModelManager('recommended') },
     { label: '管理雲端 LLM API', icon: 'cloud-cog', run: () => window.workbenchCloudLlm?.open() },
+    { label: '開啟整合中心', icon: 'plug', run: () => window.workbenchIntegrationCenter?.open('overview') },
     { label: '開啟知識庫工作區', icon: 'book-open', run: () => openKnowledgeCenter('documents') },
     { label: '執行檢索測試', icon: 'search', run: () => openKnowledgeCenter('retrieval') },
     { label: '開啟 Artifact 工作區', icon: 'code-xml', run: () => { activateChatForAuxiliaryPanel(); openInspector('artifact'); } },
     { label: '開新任務（新對話）', icon: 'plus', run: () => createNewSession() },
     { label: '清空知識庫', icon: 'trash-2', run: () => confirmModal.classList.add('active') },
     { label: '切換淺色 / 深色主題', icon: 'moon', run: () => document.getElementById('btn-theme-toggle').click() },
-    { label: '開啟擴充中心', icon: 'puzzle', run: () => window.workbenchExtensions?.open('installed') },
+    { label: '開啟擴充中心', icon: 'puzzle', run: () => window.workbenchExtensions?.open('available') },
     { label: '開啟設定中心', icon: 'sliders', run: () => document.getElementById('btn-settings-trigger').click() },
     { label: '執行模型測速', icon: 'gauge', run: () => { openModelManager('benchmark'); } }
 ];
@@ -7669,6 +7741,9 @@ function initA11y() {
             } else if (primaryWorkspace === 'extensions') {
                 e.preventDefault();
                 window.workbenchExtensions?.close?.();
+            } else if (primaryWorkspace === 'integrations') {
+                e.preventDefault();
+                window.workbenchIntegrationCenter?.close?.();
             } else if (primaryWorkspace === 'knowledge') {
                 e.preventDefault();
                 setPrimaryWorkspace('chat');
@@ -7745,19 +7820,21 @@ function activateChatForAuxiliaryPanel() {
 }
 
 function setPrimaryWorkspace(workspace = 'chat') {
-    const supportedWorkspaces = new Set(['chat', 'workflows', 'knowledge', 'extensions', 'models', 'cloud', 'mlops']);
+    const supportedWorkspaces = new Set(['chat', 'workflows', 'knowledge', 'extensions', 'integrations', 'models', 'cloud', 'mlops']);
     const nextWorkspace = supportedWorkspaces.has(workspace) ? workspace : 'chat';
     const workflowMode = nextWorkspace === 'workflows';
     const knowledgeMode = nextWorkspace === 'knowledge';
     const extensionMode = nextWorkspace === 'extensions';
+    const integrationMode = nextWorkspace === 'integrations';
     const modelMode = nextWorkspace === 'models';
     const cloudMode = nextWorkspace === 'cloud';
     const mlopsMode = nextWorkspace === 'mlops';
-    const managementMode = knowledgeMode || extensionMode || modelMode || cloudMode || mlopsMode;
+    const managementMode = knowledgeMode || extensionMode || integrationMode || modelMode || cloudMode || mlopsMode;
     const chatWorkspace = document.querySelector('main.chat-container');
     const workflowCenter = document.getElementById('n8n-workflow-center');
     const knowledgeCenter = document.getElementById('knowledge-workspace');
     const extensionCenter = document.getElementById('extension-center-workspace');
+    const integrationCenter = document.getElementById('integration-center-workspace');
     const modelCenter = document.getElementById('model-manager-workspace');
     const cloudCenter = document.getElementById('cloud-llm-workspace');
     const mlopsCenter = document.getElementById('mlops-workspace');
@@ -7766,14 +7843,15 @@ function setPrimaryWorkspace(workspace = 'chat') {
     const railWorkflows = document.getElementById('rail-workflows');
     const railKnowledge = document.getElementById('rail-knowledge');
     const railExtensions = document.getElementById('rail-extensions');
+    const railIntegrations = document.getElementById('rail-integrations');
     const railModels = document.getElementById('rail-models');
     const railCloud = document.getElementById('rail-cloud-llm');
     const railMlops = document.getElementById('rail-mlops');
-    if (!chatWorkspace || !workflowCenter || !knowledgeCenter || !extensionCenter || !modelCenter || !cloudCenter || !mlopsCenter || !drawer
-        || !railChat || !railWorkflows || !railKnowledge || !railExtensions || !railModels || !railCloud || !railMlops) return;
+    if (!chatWorkspace || !workflowCenter || !knowledgeCenter || !extensionCenter || !integrationCenter || !modelCenter || !cloudCenter || !mlopsCenter || !drawer
+        || !railChat || !railWorkflows || !railKnowledge || !railExtensions || !railIntegrations || !railModels || !railCloud || !railMlops) return;
 
     const previousWorkspace = primaryWorkspace;
-    const previousManagementMode = ['knowledge', 'extensions', 'models', 'cloud', 'mlops'].includes(previousWorkspace);
+    const previousManagementMode = ['knowledge', 'extensions', 'integrations', 'models', 'cloud', 'mlops'].includes(previousWorkspace);
     if (previousWorkspace === 'cloud' && nextWorkspace !== 'cloud' && !cloudCenter.hidden) {
         void window.workbenchCloudLlm?.deactivate?.();
     }
@@ -7782,7 +7860,7 @@ function setPrimaryWorkspace(workspace = 'chat') {
     if (managementMode && !previousManagementMode) {
         runInspectorSuspendedWorkspace = previousWorkspace;
     }
-    const activeManagementRail = knowledgeMode ? railKnowledge : (extensionMode ? railExtensions : (modelMode ? railModels : (cloudMode ? railCloud : railMlops)));
+    const activeManagementRail = knowledgeMode ? railKnowledge : (extensionMode ? railExtensions : (integrationMode ? railIntegrations : (modelMode ? railModels : (cloudMode ? railCloud : railMlops))));
     window.workbenchRunInspector?.setAvailable?.(!managementMode, {
         focusTarget: managementMode ? activeManagementRail : null,
     });
@@ -7796,6 +7874,7 @@ function setPrimaryWorkspace(workspace = 'chat') {
     workflowCenter.hidden = !workflowMode;
     knowledgeCenter.hidden = !knowledgeMode;
     extensionCenter.hidden = !extensionMode;
+    integrationCenter.hidden = !integrationMode;
     modelCenter.hidden = !modelMode;
     cloudCenter.hidden = !cloudMode;
     mlopsCenter.hidden = !mlopsMode;
@@ -7806,6 +7885,7 @@ function setPrimaryWorkspace(workspace = 'chat') {
         ['workflows', railWorkflows],
         ['knowledge', railKnowledge],
         ['extensions', railExtensions],
+        ['integrations', railIntegrations],
         ['models', railModels],
         ['cloud', railCloud],
         ['mlops', railMlops],
@@ -7851,6 +7931,7 @@ function initWorkbench(status) {
     const modelWorkspace = document.getElementById('model-manager-workspace');
     const mlopsWorkspace = document.getElementById('mlops-workspace');
     const knowledgeWorkspace = document.getElementById('knowledge-workspace');
+    const integrationWorkspace = document.getElementById('integration-center-workspace');
     if (workbenchBody && modelWorkspace && modelWorkspace.parentElement !== workbenchBody) {
         workbenchBody.appendChild(modelWorkspace);
     }
@@ -7860,6 +7941,24 @@ function initWorkbench(status) {
     if (workbenchBody && knowledgeWorkspace && knowledgeWorkspace.parentElement !== workbenchBody) {
         workbenchBody.appendChild(knowledgeWorkspace);
     }
+    if (workbenchBody && integrationWorkspace && integrationWorkspace.parentElement !== workbenchBody) {
+        workbenchBody.appendChild(integrationWorkspace);
+    }
+    window.workbenchIntegrationCenter?.init({
+        apiFetch,
+        apiBase: API_BASE,
+        showToast,
+        createIcons: safeCreateIcons,
+        getProjects: () => sidebarProjects,
+        getActiveProjectId: () => activeProjectId,
+        onWorkspaceOpen: () => setPrimaryWorkspace('integrations'),
+        onWorkspaceClose: () => {
+            setPrimaryWorkspace('chat');
+            document.getElementById('rail-chat')?.focus();
+        },
+        openWorkflows: () => window.workbenchN8nWorkflows?.open?.(),
+        openExtensions: tab => window.workbenchExtensions?.open?.(tab),
+    });
     window.workbenchMLOps?.init({
         apiFetch, apiBase: API_BASE, showToast,
         getActiveProjectId: () => activeProjectId,
@@ -7874,6 +7973,7 @@ function initWorkbench(status) {
         getProjects: () => sidebarProjects,
         getActiveProjectId: () => activeProjectId,
         reloadProject: () => loadSessions(searchSessionsInput.value.trim()),
+        openIntegrationCenter: tab => window.workbenchIntegrationCenter?.open(tab),
         onWorkspaceOpen: () => setPrimaryWorkspace('extensions'),
         onWorkspaceClose: () => {
             setPrimaryWorkspace('chat');
@@ -7950,6 +8050,7 @@ function initWorkbench(status) {
         document.getElementById('rail-chat').classList.add('active');
     });
     document.getElementById('rail-workflows').addEventListener('click', () => window.workbenchN8nWorkflows?.open?.());
+    document.getElementById('rail-integrations').addEventListener('click', () => window.workbenchIntegrationCenter?.open('overview'));
     document.getElementById('chat-drawer-close').addEventListener('click', () => {
         if (window.matchMedia('(max-width: 900px)').matches) {
             drawer.classList.add('collapsed');
@@ -7978,7 +8079,7 @@ function initWorkbench(status) {
         window.workbenchCloudLlm?.openTab?.('budgets');
     });
     document.getElementById('rail-cloud-llm').addEventListener('click', () => window.workbenchCloudLlm?.open());
-    document.getElementById('rail-extensions').addEventListener('click', () => window.workbenchExtensions?.open('installed'));
+    document.getElementById('rail-extensions').addEventListener('click', () => window.workbenchExtensions?.open('available'));
     document.getElementById('rail-mlops').addEventListener('click', () => window.workbenchMLOps?.open());
     document.getElementById('rail-settings').addEventListener('click', () => document.getElementById('btn-settings-trigger').click());
     setPrimaryWorkspace('chat');

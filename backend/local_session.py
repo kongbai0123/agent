@@ -43,12 +43,15 @@ PUBLIC_API_PATHS = frozenset(
 )
 
 # These paths are not public.  They deliberately bypass the browser session
-# token because the n8n service authenticates every request with a separate,
-# route-level HMAC/one-time-token contract.  Keeping the prefix exact prevents
-# an integration credential from becoming a general Workbench API credential.
+# token because the calling service authenticates every request with a
+# separate route-level credential.  n8n uses HMAC/one-time tokens; the public
+# Agent API uses an installation-bound Bearer key.  Keeping each prefix exact
+# prevents an integration credential from becoming a general Workbench API
+# credential.  Management routes under /api/integration-center remain local.
 SERVICE_AUTH_API_PREFIXES = (
     "/api/integrations/n8n/v1/gmail/",
     "/api/integrations/n8n/v1/agent/",
+    "/api/public/v1/",
 )
 
 TOKEN_FILENAME = "workbench-session-token"
@@ -149,6 +152,23 @@ def install_local_session_guard(app: Any, error_payload: Callable[..., dict]) ->
             )
 
         if path in PUBLIC_API_PATHS:
+            return await call_next(request)
+
+        if path.startswith("/api/public/v1/"):
+            # Reject missing credentials before FastAPI parses a potentially
+            # malformed request body. The route still performs the real
+            # installation-bound key, scope, Project policy and rate checks.
+            authorization = str(request.headers.get("authorization") or "")
+            if not authorization.startswith("Bearer "):
+                return JSONResponse(
+                    status_code=401,
+                    content=error_payload(
+                        "EXTERNAL_API_AUTH_REQUIRED",
+                        "需要有效的 Workbench API Key。",
+                        recoverable=False,
+                    ),
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
             return await call_next(request)
 
         if any(path.startswith(prefix) for prefix in SERVICE_AUTH_API_PREFIXES):

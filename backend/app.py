@@ -41,7 +41,9 @@ from api.routes.connectors import (
     build_connectors_router,
 )
 from api.routes.extensions import build_extensions_router
+from api.routes.external_agent_api import build_external_agent_api_router
 from api.routes.hermes import build_hermes_router
+from api.routes.integration_center import build_integration_center_router
 from api.routes.knowledge import build_knowledge_router
 from api.routes.models import build_models_router
 from api.routes.model_governance import build_model_governance_router
@@ -74,6 +76,12 @@ from chat_cancellation import (
     register_chat_run,
     release_chat_run,
 )
+from capability_status import (
+    CAPABILITY_STATUS_EXTENSION_ID,
+    CAPABILITY_STATUS_MANIFEST_SHA256,
+    CapabilityStatusService,
+    build_capability_status_tool_definitions,
+)
 from conversation_store import archive_session, ensure_session_folder, export_session
 from connector_secrets import ConnectorSecretStore
 from connector_service import ConnectorService, ConnectorServiceError
@@ -90,6 +98,13 @@ from extension_registry import (
     ExtensionError,
     create_extension_registry,
 )
+from external_agent_api import (
+    ExternalAgentApiError,
+    ExternalAgentApiService,
+)
+from integration_center_service import IntegrationCenterService
+from integration_center_store import IntegrationCenterStore
+from integration_policy_applier import AuthoritativeIntegrationPolicyApplier
 from local_session import (
     SESSION_COOKIE_NAME,
     install_local_session_guard,
@@ -217,7 +232,7 @@ from workspace import (
 )
 
 
-APP_VERSION = "0.9.0-model-catalog-beta.8"
+APP_VERSION = "0.9.0-model-catalog-beta.11"
 SETTINGS_PATH = str(
     Path(
         os.environ.get("WORKBENCH_SETTINGS_PATH")
@@ -231,8 +246,16 @@ n8n_lifecycle: Optional[ManagedN8nLifecycle] = None
 n8n_gmail_service: Optional[N8nGmailService] = None
 n8n_agent_task_runtime: Optional[N8nAgentTaskRuntime] = None
 n8n_background_tasks: set[asyncio.Task[Any]] = set()
+external_api_background_tasks: set[asyncio.Task[Any]] = set()
+external_api_active_runs: Dict[str, set[str]] = {}
+external_api_run_sessions: Dict[str, str] = {}
+MAX_EXTERNAL_API_RUNS = 8
+MAX_EXTERNAL_API_RUNS_PER_KEY = 2
 extension_registry: Any = None
 connector_service: Optional[ConnectorService] = None
+external_agent_api_service: Optional[ExternalAgentApiService] = None
+integration_center_service: Optional[IntegrationCenterService] = None
+capability_status_service: Optional[CapabilityStatusService] = None
 host_tool_runtime: Optional[HostToolRuntime] = None
 mcp_coordinator: Optional[MCPSettingsCoordinator] = None
 model_governance: Optional[ModelGovernanceService] = None
@@ -1167,6 +1190,7 @@ _KNOWLEDGE_TEXT_LIMIT = 128 * 1024
 _KNOWLEDGE_LABEL_LIMIT = 512
 _KNOWLEDGE_SECRET_PATTERNS = (
     re.compile(r"\bnvapi-[A-Za-z0-9_-]{8,}\b", re.IGNORECASE),
+    re.compile(r"\bwbk_[a-f0-9]{12}_[A-Za-z0-9_-]{43}\b", re.IGNORECASE),
     re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b"),
     re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b", re.IGNORECASE),
     re.compile(r"\bxox[a-z]-[A-Za-z0-9-]{10,}\b", re.IGNORECASE),
@@ -2019,6 +2043,10 @@ def _schedule_n8n_runtime_start(lifecycle: Any) -> None:
             await asyncio.to_thread(lifecycle.start)
         except Exception as exc:  # fail closed; core Workbench stays available
             print(f"[N8N] Managed runtime remained disabled: {type(exc).__name__}")
+        finally:
+            # Connector, MCP and inbound-API migration must not depend on the
+            # optional managed n8n process starting successfully.
+            await asyncio.to_thread(_migrate_existing_integration_policies)
 
     task = asyncio.create_task(run(), name="managed-n8n-startup")
     n8n_background_tasks.add(task)
@@ -2178,13 +2206,14 @@ async def _app_runtime_lifespan(_app: FastAPI):
             # cannot complete; never broaden the stop target as a fallback.
             print(f"[N8N] Disabled runtime reconciliation incomplete: {type(exc).__name__}")
     profile = database.get_n8n_gmail_profile()
-    if (
+    n8n_auto_start = bool(
         lifecycle is not None
         and extension_is_enabled("builtin.n8n")
         and profile
         and bool(profile.get("enabled"))
         and bool(profile.get("auto_start"))
-    ):
+    )
+    if n8n_auto_start:
         _schedule_n8n_runtime_start(lifecycle)
     if (
         mail_service is not None
@@ -2213,6 +2242,8 @@ async def _app_runtime_lifespan(_app: FastAPI):
             )
         except Exception as exc:
             print(f"[MCP] Startup reconciliation failed: {type(exc).__name__}")
+    if not n8n_auto_start:
+        await asyncio.to_thread(_migrate_existing_integration_policies)
     try:
         await hook_dispatcher.observe(
             "app.ready",
@@ -2230,9 +2261,12 @@ async def _app_runtime_lifespan(_app: FastAPI):
                 metadata={"app_version": APP_VERSION},
             ),
         )
-        if n8n_background_tasks:
+        background_tasks = tuple(
+            set(n8n_background_tasks) | set(external_api_background_tasks)
+        )
+        if background_tasks:
             _, pending = await asyncio.wait(
-                tuple(n8n_background_tasks), timeout=30.0
+                background_tasks, timeout=30.0
             )
             for task in pending:
                 task.cancel()
@@ -2346,7 +2380,7 @@ update_startup(
 
 def _extension_runtime_health(item: Dict[str, Any]) -> tuple[str, Any]:
     extension_id = str(item.get("id") or "")
-    if extension_id in {"connector.github", "connector.notion"}:
+    if extension_id in {"connector.github", "connector.notion", "connector.gmail"}:
         assert connector_service is not None
         return connector_service.extension_health(extension_id)
     if extension_id == "builtin.n8n":
@@ -2438,10 +2472,40 @@ def _handle_project_extension_state_change(
         _schedule_mcp_sync()
 
 
+def _integration_connector_resource_filter(
+    project_id: str,
+    connector_id: str,
+    connection_id: str,
+    capability: str,
+    resources: Any,
+) -> List[Dict[str, Any]]:
+    """Return only connector roots selected in the active central policy."""
+
+    service = integration_center_service
+    if service is None:
+        raise RuntimeError("integration permission service is unavailable")
+    allowed: List[Dict[str, Any]] = []
+    for raw in list(resources or ())[:500]:
+        if not isinstance(raw, dict):
+            continue
+        decision = service.permission_decision(
+            project_id=project_id,
+            integration_id=connector_id,
+            capability=capability,
+            connection_id=connection_id,
+            resource_type=str(raw.get("resource_type") or ""),
+            resource_id=str(raw.get("resource_id") or ""),
+        )
+        if str(decision.get("decision") or "deny") != "deny":
+            allowed.append(dict(raw))
+    return allowed
+
+
 connector_service = ConnectorService(
     store=ConnectorStore(),
     secrets_store=ConnectorSecretStore(),
     project_exists=lambda project_id: database.get_project(project_id) is not None,
+    resource_policy_filter=_integration_connector_resource_filter,
 )
 connector_service.initialize()
 extension_registry = create_extension_registry(
@@ -2452,6 +2516,7 @@ extension_registry = create_extension_registry(
     health_probes={
         "github": _extension_runtime_health,
         "notion": _extension_runtime_health,
+        "gmail": _extension_runtime_health,
         "n8n": _extension_runtime_health,
         "mcp": _extension_runtime_health,
     },
@@ -2460,6 +2525,35 @@ extension_registry = create_extension_registry(
     project_state_change_handler=_handle_project_extension_state_change,
     synchronize=True,
 )
+
+
+def _external_agent_policy_guard(project_id: str, required_scope: str) -> bool:
+    """Fail closed until the unified Project policy service is ready."""
+
+    service = integration_center_service
+    if service is None:
+        raise ExternalAgentApiError(
+            "EXTERNAL_API_POLICY_UNAVAILABLE",
+            "整合權限服務尚未就緒，未執行外部要求。",
+            status_code=503,
+            recoverable=True,
+        )
+    return service.external_api_policy_guard(project_id, required_scope)
+
+
+external_agent_api_service = ExternalAgentApiService(
+    project_exists=lambda project_id: database.get_project(project_id) is not None,
+    policy_guard=_external_agent_policy_guard,
+)
+try:
+    external_agent_api_service.initialize()
+except Exception as exc:
+    # A copied/corrupt DPAPI vault must degrade only the inbound integration;
+    # core chat and the local management UI still need to start so the user can
+    # repair or explicitly reset the installation identity.
+    print(f"[EXTERNAL API] Credential initialization failed: {type(exc).__name__}")
+
+
 def _manifest_digest(extension_id: str) -> str:
     row = extension_registry.store.get(extension_id)
     return str((row or {}).get("manifest_sha256") or "")
@@ -2526,6 +2620,23 @@ async def _prepare_project_tools(project_id: str) -> None:
 
 
 def _resolve_tool_scope(definition: Any, call: Any) -> ToolScopeState:
+    if str(definition.extension_id) == CAPABILITY_STATUS_EXTENSION_ID:
+        project_available = bool(
+            call.project_id
+            and call.project_id != INDEPENDENT_TOOL_SCOPE
+            and database.get_project(call.project_id) is not None
+        )
+        return ToolScopeState(
+            installed=True,
+            trusted=True,
+            enabled=project_available,
+            healthy=project_available and capability_status_service is not None,
+            resource_allowed=project_available,
+            manifest_sha256=CAPABILITY_STATUS_MANIFEST_SHA256,
+            resource_revision=0,
+            connection_enabled=True,
+            reason="" if project_available else "PROJECT_REQUIRED",
+        )
     if str(definition.extension_id).startswith("mcp."):
         independent_scope = call.project_id == INDEPENDENT_TOOL_SCOPE
         registry_project_id = None if independent_scope else call.project_id
@@ -2635,8 +2746,126 @@ def _resolve_tool_scope(definition: Any, call: Any) -> ToolScopeState:
     )
 
 
-def _evaluate_tool_permission(definition, call, _scope) -> PolicyDecision:
-    """Apply the active project's explicit extension permission level."""
+_INTEGRATION_TOOL_CAPABILITIES = {
+    "github.list_repositories": "repository.read",
+    "github.read_file": "repository.read",
+    "github.list_commits": "repository.read",
+    "github.list_issues": "issue.read",
+    "github.get_issue": "issue.read",
+    "github.list_pull_requests": "pull_request.read",
+    "github.get_pull_request": "pull_request.read",
+    "github.get_check_runs": "checks.read",
+    "github.create_issue": "issue.write",
+    "github.update_issue": "issue.write",
+    # GitHub exposes Issue and Pull Request conversations through one endpoint.
+    "github.add_issue_comment": "discussion.comment",
+    "notion.search": "content.read",
+    "notion.retrieve_page": "content.read",
+    "notion.retrieve_database": "content.read",
+    "notion.create_page": "content.insert",
+    "notion.update_page": "content.update",
+    "notion.append_blocks": "content.update",
+    "gmail.search_messages": "message.read",
+    "gmail.get_message": "message.read",
+    "gmail.create_draft": "draft.create",
+    "gmail.send_draft": "draft.send",
+}
+
+
+def _unified_tool_permission(definition, call, scope) -> Optional[PolicyDecision]:
+    """Apply the central Project capability/resource policy at call time."""
+
+    service = integration_center_service
+    extension_id = str(definition.extension_id or "")
+    tool_name = str(definition.name or "")
+    integration_id = ""
+    capability = ""
+    connection_id = getattr(scope, "connection_id", None)
+    resource_type: Optional[str] = None
+    resource_id: Optional[str] = None
+
+    if extension_id.startswith("connector."):
+        integration_id = extension_id.split(".", 1)[1]
+        capability = _INTEGRATION_TOOL_CAPABILITIES.get(tool_name, "")
+        try:
+            invocation = connector_service.resolve_tool_invocation(
+                call.project_id,
+                tool_name,
+                call.arguments,
+                verify_remote_scope=True,
+            )
+        except (ConnectorServiceError, ConnectorStoreError):
+            return PolicyDecision(
+                PolicyAction.DENY,
+                "無法重新確認第三方連線與資源範圍。",
+            )
+        connection_id = str(invocation.get("connection_id") or "") or connection_id
+        policy_resource = invocation.get("verified_scope_root")
+        candidate_resource = str(
+            (policy_resource or {}).get("resource_id")
+            if isinstance(policy_resource, dict)
+            else invocation.get("resource_id") or ""
+        )
+        if candidate_resource and candidate_resource != "*":
+            resource_type = str(
+                (policy_resource or {}).get("resource_type")
+                if isinstance(policy_resource, dict)
+                else invocation.get("resource_type") or ""
+            ) or None
+            resource_id = candidate_resource
+    elif extension_id.startswith("mcp."):
+        integration_id = "mcp"
+        capability = "tool.invoke"
+        connection_id = extension_id
+        resource_type = "tool"
+        resource_id = tool_name
+    else:
+        return None
+
+    if service is None or not capability:
+        return PolicyDecision(
+            PolicyAction.DENY,
+            "整合權限服務尚未就緒，未執行外部工具。",
+        )
+    if not call.project_id or call.project_id == INDEPENDENT_TOOL_SCOPE:
+        return PolicyDecision(
+            PolicyAction.DENY,
+            "第三方與 MCP 工具必須先綁定 Project，才能套用整合權限。",
+        )
+    try:
+        decision = service.permission_decision(
+            project_id=call.project_id,
+            integration_id=integration_id,
+            capability=capability,
+            connection_id=connection_id,
+            resource_type=resource_type,
+            resource_id=resource_id,
+        )
+    except Exception:
+        return PolicyDecision(
+            PolicyAction.DENY,
+            "目前無法確認整合權限，已停止工具呼叫。",
+        )
+    action = str(decision.get("decision") or "deny")
+    if action == "allow":
+        return PolicyDecision(PolicyAction.ALLOW, "整合中心已允許此能力與資源")
+    if action == "require_approval":
+        return PolicyDecision(
+            PolicyAction.REQUIRE_APPROVAL,
+            "整合中心限制權限：此操作會改變外部資料，需逐次批准。",
+        )
+    return PolicyDecision(
+        PolicyAction.DENY,
+        "整合中心未放行此能力、連線或資源範圍。",
+    )
+
+
+def _evaluate_tool_permission(definition, call, scope) -> PolicyDecision:
+    """Intersect unified scope with the existing extension safety policy."""
+
+    unified = _unified_tool_permission(definition, call, scope)
+    if unified is not None and unified.action is PolicyAction.DENY:
+        return unified
 
     level = "restricted"
     if call.project_id:
@@ -2658,9 +2887,11 @@ def _evaluate_tool_permission(definition, call, _scope) -> PolicyDecision:
             "此專案未開放這項擴充權限；請到外掛詳細頁調整權限等級。",
         )
     if definition.access is ToolAccess.READ:
-        return PolicyDecision(PolicyAction.ALLOW, "唯讀操作已允許")
+        return unified or PolicyDecision(PolicyAction.ALLOW, "唯讀操作已允許")
+    if unified is not None and unified.action is PolicyAction.REQUIRE_APPROVAL:
+        return unified
     if level == "open":
-        return PolicyDecision(
+        return unified or PolicyDecision(
             PolicyAction.ALLOW,
             "此專案已明確選擇開放權限",
         )
@@ -2685,11 +2916,31 @@ tool_dispatcher = ToolDispatcher(
     hook_dispatcher=hook_dispatcher,
     policy_evaluator=_evaluate_tool_permission,
 )
+
+
+async def _query_capability_status(project_id: str, query: str) -> Dict[str, Any]:
+    service = capability_status_service
+    if service is None:
+        return {
+            "schema_version": 1,
+            "project_id": str(project_id or ""),
+            "query": str(query or "")[:500],
+            "items": [],
+            "summary": {"total": 0, "available": 0, "blocked": 0},
+            "error": {
+                "code": "CAPABILITY_STATUS_UNAVAILABLE",
+                "message": "Workbench 功能狀態服務尚未就緒。",
+            },
+        }
+    return await service.query(project_id, query)
+
+
 host_tool_runtime = HostToolRuntime(
     registry=tool_registry,
     dispatcher=tool_dispatcher,
     approval_broker=tool_approval_broker,
     prepare_project=_prepare_project_tools,
+    capability_status_query=_query_capability_status,
     independent_scope_id=INDEPENDENT_TOOL_SCOPE,
     resolve_call_context=lambda project_id, definition, arguments: (
         connector_service.resolve_host_call_context(
@@ -2733,7 +2984,12 @@ app.add_middleware(
     allow_origin_regex=r"^http://(?:127\.0\.0\.1|localhost|\[::1\])(?::\d+)?$",
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["Content-Type", "X-Workbench-Token"],
+    allow_headers=[
+        "Authorization",
+        "Content-Type",
+        "Idempotency-Key",
+        "X-Workbench-Token",
+    ],
 )
 
 
@@ -2754,6 +3010,62 @@ async def redacted_request_validation_error(
             }
         )
     return JSONResponse(status_code=422, content={"detail": errors})
+
+
+_PUBLIC_AGENT_API_BODY_LIMIT = 128 * 1024
+
+
+@app.middleware("http")
+async def limit_public_agent_api_body(request: Request, call_next):
+    """Bound unauthenticated request parsing before the public route runs."""
+
+    if (
+        request.url.path.startswith("/api/public/v1/")
+        and request.method in {"POST", "PUT", "PATCH"}
+    ):
+        content_length = request.headers.get("content-length")
+        try:
+            declared = int(content_length) if content_length is not None else None
+        except ValueError:
+            declared = -1
+        if declared is not None and (
+            declared < 0 or declared > _PUBLIC_AGENT_API_BODY_LIMIT
+        ):
+            return JSONResponse(
+                status_code=413,
+                content=error_payload(
+                    "EXTERNAL_API_REQUEST_TOO_LARGE",
+                    "對外 API 要求內容不可超過 128 KiB。",
+                    recoverable=False,
+                ),
+            )
+        chunks: List[bytes] = []
+        size = 0
+        async for chunk in request.stream():
+            size += len(chunk)
+            if size > _PUBLIC_AGENT_API_BODY_LIMIT:
+                return JSONResponse(
+                    status_code=413,
+                    content=error_payload(
+                        "EXTERNAL_API_REQUEST_TOO_LARGE",
+                        "對外 API 要求內容不可超過 128 KiB。",
+                        recoverable=False,
+                    ),
+                )
+            chunks.append(chunk)
+        body = b"".join(chunks)
+        request._body = body
+        delivered = False
+
+        async def replay_body() -> Dict[str, Any]:
+            nonlocal delivered
+            if delivered:
+                return {"type": "http.request", "body": b"", "more_body": False}
+            delivered = True
+            return {"type": "http.request", "body": body, "more_body": False}
+
+        request._receive = replay_body
+    return await call_next(request)
 
 
 @app.middleware("http")
@@ -3099,6 +3411,25 @@ def _resolve_live_n8n_agent_policy(project_id: str) -> Dict[str, Any]:
     return n8n_agent_governance.get_policy(project_id)
 
 
+def _integration_n8n_permission(
+    project_id: str,
+    capability: str,
+    *,
+    resource_type: Optional[str] = None,
+    resource_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    service = integration_center_service
+    if service is None:
+        raise RuntimeError("integration permission service is unavailable")
+    return service.permission_decision(
+        project_id=project_id,
+        integration_id="n8n",
+        capability=capability,
+        resource_type=resource_type,
+        resource_id=resource_id,
+    )
+
+
 n8n_agent_task_runtime = N8nAgentTaskRuntime(
     cipher=AesGcmContentCipher(n8n_agent_secret_store.content_key),
     hmac_secret_provider=n8n_secret_store.inbound_hmac_verifier_key,
@@ -3109,6 +3440,7 @@ n8n_agent_task_runtime = N8nAgentTaskRuntime(
     execution_gate=lambda project_id: extension_registry.require_enabled(
         "builtin.n8n", project_id
     ),
+    integration_permission_check=_integration_n8n_permission,
     workflow_revision_resolver=_resolve_live_managed_n8n_workflow_revision,
 )
 
@@ -3294,6 +3626,27 @@ _n8n_recipient_is_configured = bool(
     _configured_n8n_recipient
     and _configured_n8n_recipient.casefold() != FIXED_TEST_RECIPIENT.casefold()
 )
+
+
+def _integration_gmail_permission(
+    project_id: str,
+    capability: str,
+    *,
+    resource_type: Optional[str] = None,
+    resource_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    service = integration_center_service
+    if service is None:
+        raise RuntimeError("integration permission service is unavailable")
+    return service.permission_decision(
+        project_id=project_id,
+        integration_id="gmail",
+        capability=capability,
+        resource_type=resource_type,
+        resource_id=resource_id,
+    )
+
+
 n8n_gmail_service = N8nGmailService(
     cipher=AesGcmContentCipher(n8n_secret_store.content_key),
     hmac_secret_provider=n8n_secret_store.inbound_hmac_verifier_key,
@@ -3307,9 +3660,214 @@ n8n_gmail_service = N8nGmailService(
         secret_provider=n8n_secret_store.outbound_webhook_key,
     ),
     enable_guard=n8n_profile_enable_guard,
+    permission_check=_integration_gmail_permission,
     fixed_recipient=_configured_n8n_recipient or FIXED_TEST_RECIPIENT,
     recipient_configured=_n8n_recipient_is_configured,
 )
+
+
+def _integration_n8n_status() -> Dict[str, Any]:
+    state = n8n_lifecycle.status(probe_node=False)
+    status = str(state.get("state") or "stopped")
+    return {
+        "status": status,
+        "healthy": status == "ready",
+        "managed": bool(state.get("managed")),
+        "version": str(state.get("version") or "")[:128] or None,
+    }
+
+
+def _integration_gmail_status() -> Dict[str, Any]:
+    profile = n8n_gmail_service.get_profile()
+    return {
+        "configured": bool(profile.get("configured")),
+        "enabled": bool(profile.get("enabled")),
+        "project_id": profile.get("project_id"),
+        "required_label": str(profile.get("required_label") or "")[:256] or None,
+        "fixed_recipient": str(profile.get("fixed_recipient") or "")[:320] or None,
+        "recipient_configured": bool(profile.get("recipient_configured")),
+        "crypto_ready": bool(profile.get("crypto_ready")),
+        "isolation_ready": bool(profile.get("isolation_ready")),
+        "pending_approvals": int(
+            n8n_gmail_service.public_event_snapshot().get("pending_approvals") or 0
+        ),
+    }
+
+
+def _integration_mcp_status() -> Dict[str, Any]:
+    snapshot = mcp_coordinator.health()
+    extensions = snapshot.get("extensions") if isinstance(snapshot, dict) else {}
+    return {
+        "status": str(snapshot.get("status") or "stopped"),
+        "healthy": str(snapshot.get("status") or "") == "healthy",
+        "running": int(snapshot.get("running") or 0),
+        "extensions": [
+            {
+                "extension_id": str(extension_id),
+                "status": str((record or {}).get("status") or "unknown"),
+                "running": bool((record or {}).get("running")),
+                "projects": [str(value) for value in (record or {}).get("projects") or []],
+                "tool_count": int((record or {}).get("tool_count") or 0),
+            }
+            for extension_id, record in list((extensions or {}).items())[:64]
+            if isinstance(record, dict)
+        ],
+    }
+
+
+def _integration_external_api_status(project_id: str) -> Dict[str, Any]:
+    payload = external_agent_api_service.list_keys()
+    keys = [
+        item
+        for item in payload.get("api_keys") or []
+        if isinstance(item, dict) and str(item.get("project_id") or "") == project_id
+    ]
+    active = sum(str(item.get("status") or "") == "active" for item in keys)
+    recovery_required = bool(payload.get("credential_recovery_required"))
+    return {
+        "configured": bool(keys),
+        "enabled": active > 0 and not recovery_required,
+        "healthy": active > 0 and not recovery_required,
+        "status": (
+            "credential_recovery_required"
+            if recovery_required
+            else "ready"
+            if active
+            else "not_configured"
+        ),
+        "credential_recovery_required": recovery_required,
+        "active_key_count": active,
+        "key_count": len(keys),
+    }
+
+
+def _integration_runtime_audits(
+    project_id: str,
+    limit: int,
+) -> List[Dict[str, Any]]:
+    """Merge safe connector and inbound-API events for one Project."""
+
+    bounded = max(1, min(int(limit), 500))
+    result: List[Dict[str, Any]] = []
+    try:
+        rows = external_agent_api_service.store.list_audits(
+            limit=min(500, bounded * 4)
+        )
+    except Exception:
+        rows = []
+    for row in rows:
+        if str(row.get("project_id") or "") != project_id:
+            continue
+        result.append(
+            {
+                "audit_id": str(row.get("audit_id") or "")[:128],
+                "project_id": project_id,
+                "action": str(row.get("action") or "external_api.operation")[:128],
+                "actor": "external_api",
+                "status": str(row.get("status") or "unknown")[:64],
+                "details": row.get("details") if isinstance(row.get("details"), dict) else {},
+                "error_code": str(row.get("error_code") or "")[:128] or None,
+                "created_at": str(row.get("created_at") or "")[:80],
+                "source": "external_api",
+            }
+        )
+    for connector_id in ("github", "notion", "gmail"):
+        try:
+            connector_rows = connector_service.store.list_audits(
+                connector_id,
+                limit=min(500, bounded * 4),
+            )
+        except Exception:
+            connector_rows = []
+        for row in connector_rows:
+            if str(row.get("project_id") or "") != project_id:
+                continue
+            result.append(
+                {
+                    "audit_id": str(row.get("audit_id") or "")[:128],
+                    "project_id": project_id,
+                    "action": str(row.get("action") or "connector.operation")[:128],
+                    "actor": f"connector.{connector_id}",
+                    "status": str(row.get("status") or "unknown")[:64],
+                    "details": row.get("details") if isinstance(row.get("details"), dict) else {},
+                    "error_code": str(row.get("error_code") or "")[:128] or None,
+                    "created_at": str(row.get("created_at") or "")[:80],
+                    "source": "connector",
+                }
+            )
+    return result[: min(500, bounded * 3)]
+
+
+def _integration_runtime_gate_setter(
+    _project_id: str,
+    _mode: str,
+    _grants: List[Dict[str, Any]],
+) -> Any:
+    """Attest that operation-time policy checks are connected.
+
+    Policy persistence remains the source of truth. Connector and MCP tools
+    consult it in ``_evaluate_tool_permission``; n8n/Gmail retain their
+    extension/project gates; the inbound API consults ``policy_guard`` on every
+    request. The applier calls this adapter before committing so a missing live
+    service cannot produce a policy that only looks active in the UI.
+    """
+
+    if integration_center_service is None:
+        raise RuntimeError("integration runtime gate is unavailable")
+    return lambda: None
+
+
+integration_policy_applier = AuthoritativeIntegrationPolicyApplier(
+    extension_registry=extension_registry,
+    connector_service=connector_service,
+    connector_gate_setter=_integration_runtime_gate_setter,
+    n8n_gate_setter=_integration_runtime_gate_setter,
+    mcp_gate_setter=_integration_runtime_gate_setter,
+    external_api_gate_setter=_integration_runtime_gate_setter,
+)
+integration_center_service = IntegrationCenterService(
+    store=IntegrationCenterStore(),
+    project_exists=lambda project_id: database.get_project(project_id) is not None,
+    authoritative_applier=integration_policy_applier,
+    extension_catalog_provider=extension_registry.catalog,
+    connector_service=connector_service,
+    n8n_status_provider=_integration_n8n_status,
+    gmail_profile_provider=_integration_gmail_status,
+    mcp_status_provider=_integration_mcp_status,
+    external_api_summary_provider=_integration_external_api_status,
+    audit_providers=(_integration_runtime_audits,),
+)
+integration_center_service.initialize()
+capability_status_service = CapabilityStatusService(
+    project_exists=lambda project_id: database.get_project(project_id) is not None,
+    integration_overview_provider=integration_center_service.overview,
+    extension_catalog_provider=extension_registry.catalog,
+    model_overview_provider=lambda project_id: model_governance.overview(
+        project_id=project_id,
+        providers=load_settings().get("model_providers") or [],
+    ),
+)
+for _definition in build_capability_status_tool_definitions(capability_status_service):
+    tool_registry.register(_definition, replace_existing=True)
+
+
+def _migrate_existing_integration_policies() -> None:
+    """One-shot, fail-closed import of healthy pre-existing Project grants."""
+
+    for project in database.get_projects():
+        project_id = str((project or {}).get("id") or "").strip()
+        if not project_id:
+            continue
+        try:
+            integration_center_service.import_existing_project_policy(project_id)
+        except Exception as exc:
+            # An uncertain integration remains blocked. One Project migration
+            # must never prevent core chat or another Project from loading.
+            print(
+                f"[INTEGRATION] Existing policy import failed for {project_id[:64]}: "
+                f"{type(exc).__name__}"
+            )
+
 n8n_agent_governance = N8nAgentGovernanceService(
     broker=N8nApiBroker(n8n_agent_secret_store.api_key),
     cipher=AesGcmContentCipher(n8n_agent_secret_store.content_key),
@@ -3322,6 +3880,7 @@ n8n_agent_governance = N8nAgentGovernanceService(
     graph_binding_activator=_activate_n8n_graph_bindings,
     policy_change_callback=_on_n8n_agent_policy_change,
     workflow_change_callback=_on_n8n_agent_workflow_change,
+    integration_permission_check=_integration_n8n_permission,
 )
 
 
@@ -3535,6 +4094,12 @@ run_results_router = build_run_results_router(
     error_payload=error_payload,
 )
 
+integration_center_router = build_integration_center_router(
+    service=integration_center_service,
+    require_local=require_local_workbench,
+    error_payload=error_payload,
+)
+
 for domain_router in (
     system_router,
     sessions_router,
@@ -3556,6 +4121,7 @@ for domain_router in (
     operations_router,
     mlops_router,
     knowledge_router,
+    integration_center_router,
 ):
     app.include_router(domain_router)
 
@@ -4573,6 +5139,358 @@ def run_execution_snapshot(run_id: str):
     }
 
 
+def _external_api_runtime_error(exc: HTTPException) -> ExternalAgentApiError:
+    """Translate an internal chat rejection without exposing provider details."""
+
+    detail = exc.detail if isinstance(exc.detail, dict) else {}
+    code = str(detail.get("code") or "EXTERNAL_API_RUN_REJECTED")[:128]
+    status_code = int(exc.status_code)
+    if code in {
+        "MODEL_ROUTE_APPROVAL_REQUIRED",
+        "MODEL_DATA_CONSENT_REQUIRED",
+        "MODEL_BUDGET_OVERRIDE_REQUIRED",
+    }:
+        message = "此工作需要先回到 Workbench 完成模型、資料傳送或預算同意。"
+    elif status_code == 429:
+        message = "Agent 目前忙碌或已達使用限制，請稍後再試。"
+    elif status_code in {401, 403}:
+        message = "目前的 Project 政策不允許執行這項工作。"
+    elif status_code == 404:
+        message = "找不到這項工作需要的本機資源。"
+    else:
+        message = "Workbench 未能接受這項 Agent 工作，請回到執行紀錄檢查設定。"
+    return ExternalAgentApiError(
+        code,
+        message,
+        status_code=max(400, min(status_code, 503)),
+        recoverable=bool(detail.get("recoverable", status_code >= 409)),
+    )
+
+
+def _release_external_api_slot(api_key_id: str, run_id: str) -> None:
+    active = external_api_active_runs.get(api_key_id)
+    if active is not None:
+        active.discard(run_id)
+        if not active:
+            external_api_active_runs.pop(api_key_id, None)
+    external_api_run_sessions.pop(run_id, None)
+
+
+async def _consume_external_api_stream(
+    response: StreamingResponse,
+    *,
+    api_key_id: str,
+    run_id: str,
+) -> None:
+    """Drive the existing SSE runtime while keeping its internals private."""
+
+    try:
+        async for _chunk in response.body_iterator:
+            # Public callers poll the strict Run DTO. Raw SSE, prompts, tool
+            # arguments and provider payloads never cross this boundary.
+            pass
+    except asyncio.CancelledError:
+        cancel_or_defer_chat_run(run_id)
+        raise
+    except Exception as exc:
+        # The mature chat runtime persists a redacted failure whenever it has
+        # registered the Run. Keep the core Workbench alive if an unexpected
+        # iterator error occurs before that persistence point.
+        print(f"[EXTERNAL API] Background Run failed: {type(exc).__name__}")
+    finally:
+        _release_external_api_slot(api_key_id, run_id)
+
+
+async def _external_api_submit_run(
+    run_id: str,
+    payload: Dict[str, Any],
+    auth_context: Dict[str, Any],
+) -> Dict[str, Any]:
+    project_id = str(auth_context.get("project_id") or "")
+    api_key_id = str(auth_context.get("api_key_id") or "")
+    if not project_id or not api_key_id or database.get_project(project_id) is None:
+        raise ExternalAgentApiError(
+            "EXTERNAL_API_PROJECT_NOT_FOUND",
+            "找不到此 API Key 綁定的 Project。",
+            status_code=404,
+            recoverable=False,
+        )
+    total_active = sum(len(item) for item in external_api_active_runs.values())
+    key_active = external_api_active_runs.setdefault(api_key_id, set())
+    if total_active >= MAX_EXTERNAL_API_RUNS or len(key_active) >= MAX_EXTERNAL_API_RUNS_PER_KEY:
+        if not key_active:
+            external_api_active_runs.pop(api_key_id, None)
+        raise ExternalAgentApiError(
+            "EXTERNAL_API_CONCURRENCY_LIMITED",
+            "此 Workbench 或 API Key 已有過多執行中的工作，請稍後再試。",
+            status_code=429,
+            recoverable=True,
+            retry_after=5,
+        )
+
+    settings = load_settings()
+    model = str(payload.get("model") or settings.get("default_chat_model") or "").strip()
+    if not model:
+        raise ExternalAgentApiError(
+            "EXTERNAL_API_MODEL_UNAVAILABLE",
+            "目前沒有可用的主要對話模型。",
+            status_code=409,
+            recoverable=True,
+        )
+    session_id = create_id("sess")
+    database.create_session(
+        session_id,
+        title="外部 API 工作",
+        mode="chat",
+        model=model,
+        project_id=project_id,
+    )
+    key_active.add(run_id)
+    external_api_run_sessions[run_id] = session_id
+    try:
+        response = await chat(
+            ChatRequest(
+                session_id=session_id,
+                message=str(payload.get("message") or ""),
+                model=model,
+                use_rag=bool(payload.get("use_rag")),
+                run_id=run_id,
+            )
+        )
+        if not isinstance(response, StreamingResponse):
+            raise ExternalAgentApiError(
+                "EXTERNAL_API_RUNTIME_CONTRACT_INVALID",
+                "Agent 執行服務未建立有效的串流工作。",
+                status_code=502,
+                recoverable=True,
+            )
+        task = asyncio.create_task(
+            _consume_external_api_stream(
+                response,
+                api_key_id=api_key_id,
+                run_id=run_id,
+            ),
+            name=f"external-agent-{run_id}",
+        )
+        external_api_background_tasks.add(task)
+        task.add_done_callback(external_api_background_tasks.discard)
+    except HTTPException as exc:
+        _release_external_api_slot(api_key_id, run_id)
+        if database.get_run(run_id) is None and not database.get_messages_by_session(session_id):
+            database.delete_session(session_id)
+        raise _external_api_runtime_error(exc) from exc
+    except ExternalAgentApiError:
+        _release_external_api_slot(api_key_id, run_id)
+        if database.get_run(run_id) is None and not database.get_messages_by_session(session_id):
+            database.delete_session(session_id)
+        raise
+    except Exception as exc:
+        _release_external_api_slot(api_key_id, run_id)
+        if database.get_run(run_id) is None and not database.get_messages_by_session(session_id):
+            database.delete_session(session_id)
+        raise ExternalAgentApiError(
+            "EXTERNAL_API_RUNTIME_UNAVAILABLE",
+            "Agent 執行服務暫時無法使用。",
+            status_code=503,
+            recoverable=True,
+        ) from exc
+    return {
+        "run_id": run_id,
+        "project_id": project_id,
+        "session_id": session_id,
+        "model": model,
+        "status": "queued",
+        "created_at": now_iso(),
+    }
+
+
+def _external_api_run_status(value: Any) -> str:
+    status = str(value or "").strip().casefold()
+    if status in {"waiting_approval", "awaiting_approval", "approval_required"}:
+        return "approval_required"
+    if status in {"queued", "pending", "running", "completed", "failed", "cancelled"}:
+        return status
+    return "running"
+
+
+def _external_api_public_run_error(run: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    raw = _run_public_error(run)
+    if raw is None:
+        return None
+    code = str(raw.get("code") or "RUN_FAILED")[:128]
+    if code == "RUN_CANCELLED":
+        message = "此 Agent 工作已取消。"
+    else:
+        message = "Agent 工作執行失敗；請回到 Workbench 查看受治理的執行紀錄。"
+    return {
+        "code": code,
+        "message": message,
+        "recoverable": bool(raw.get("recoverable")),
+    }
+
+
+def _external_api_get_run(
+    run_id: str,
+    auth_context: Dict[str, Any],
+) -> Dict[str, Any]:
+    project_id = str(auth_context.get("project_id") or "")
+    run = database.get_run(run_id)
+    if run is None:
+        session_id = external_api_run_sessions.get(run_id)
+        if session_id:
+            return {
+                "run_id": run_id,
+                "project_id": project_id,
+                "session_id": session_id,
+                "status": "running" if get_chat_run(run_id) is not None else "queued",
+            }
+        return {
+            "run_id": run_id,
+            "project_id": project_id,
+            "status": "failed",
+            "error": {
+                "code": "EXTERNAL_API_RUN_NOT_STARTED",
+                "message": "Agent 工作未能啟動，請使用新的 Idempotency-Key 明確重試。",
+                "recoverable": True,
+            },
+        }
+    if str(run.get("project_id") or "") != project_id:
+        raise ExternalAgentApiError(
+            "EXTERNAL_API_RUN_NOT_FOUND",
+            "找不到此 Project 的 Agent 工作。",
+            status_code=404,
+            recoverable=False,
+        )
+    result: Dict[str, Any] = {
+        "run_id": run_id,
+        "project_id": project_id,
+        "session_id": str(run.get("session_id") or "") or None,
+        "model": str(run.get("model") or "") or None,
+        "status": _external_api_run_status(run.get("status")),
+        "created_at": str(run.get("created_at") or "") or None,
+        "completed_at": str(run.get("completed_at") or "") or None,
+    }
+    if result["status"] == "completed" and result.get("session_id"):
+        turn_id = str(run.get("turn_id") or "")
+        for message in reversed(database.get_messages_by_session(result["session_id"])):
+            if str(message.get("role") or "") != "assistant":
+                continue
+            if turn_id and str(message.get("turn_id") or "") != turn_id:
+                continue
+            result["answer"] = str(message.get("visible_content") or message.get("content") or "")[:262_144]
+            break
+    public_error = _external_api_public_run_error(run)
+    if public_error is not None:
+        result["error"] = public_error
+    return {key: value for key, value in result.items() if value is not None}
+
+
+def _external_api_cancel_run(
+    run_id: str,
+    auth_context: Dict[str, Any],
+) -> Dict[str, Any]:
+    project_id = str(auth_context.get("project_id") or "")
+    existing = database.get_run(run_id)
+    if existing is not None and str(existing.get("project_id") or "") != project_id:
+        raise ExternalAgentApiError(
+            "EXTERNAL_API_RUN_NOT_FOUND",
+            "找不到此 Project 的 Agent 工作。",
+            status_code=404,
+            recoverable=False,
+        )
+    if existing is not None and str(existing.get("status") or "") in {
+        "completed",
+        "failed",
+        "cancelled",
+    }:
+        return _external_api_get_run(run_id, auth_context)
+    cancel_or_defer_chat_run(run_id)
+    return {
+        "run_id": run_id,
+        "project_id": project_id,
+        "session_id": (
+            str(existing.get("session_id") or "")
+            if existing is not None
+            else external_api_run_sessions.get(run_id)
+        ),
+        "model": str(existing.get("model") or "") if existing is not None else None,
+        "status": "cancelled",
+    }
+
+
+async def _external_api_capabilities(
+    auth_context: Dict[str, Any],
+) -> Dict[str, Any]:
+    project_id = str(auth_context.get("project_id") or "")
+    if not project_id or database.get_project(project_id) is None:
+        raise ExternalAgentApiError(
+            "EXTERNAL_API_PROJECT_NOT_FOUND",
+            "找不到此 API Key 綁定的 Project。",
+            status_code=404,
+            recoverable=False,
+        )
+    try:
+        await _prepare_project_tools(project_id)
+        definitions = tool_registry.for_project(project_id)
+    except Exception:
+        definitions = ()
+    policy = integration_center_service.get_policy(project_id)
+    grants = policy.get("grants") if isinstance(policy, dict) else []
+    tools: List[str] = []
+    for definition in definitions:
+        extension_id = str(definition.extension_id or "")
+        allowed = True
+        if extension_id.startswith("connector."):
+            integration_id = extension_id.split(".", 1)[1]
+            capability = _INTEGRATION_TOOL_CAPABILITIES.get(definition.name, "")
+            allowed = any(
+                grant.get("integration_id") == integration_id
+                and capability in (grant.get("capabilities") or [])
+                for grant in grants or []
+                if isinstance(grant, dict)
+            )
+        elif extension_id.startswith("mcp."):
+            allowed = any(
+                grant.get("integration_id") == "mcp"
+                and "tool.invoke" in (grant.get("capabilities") or [])
+                and grant.get("connection_id") in {None, "", extension_id}
+                for grant in grants or []
+                if isinstance(grant, dict)
+            )
+        if allowed:
+            tools.append(str(definition.name)[:255])
+    settings = load_settings()
+    models: List[str] = []
+    for item in model_inventory():
+        name = str(item.get("name") or "").strip()
+        if not name:
+            continue
+        try:
+            profile = model_profile_for_model(settings, name, project_id=project_id)
+            provider_for_model(settings, name, project_id=project_id)
+        except (PermissionError, ValueError):
+            continue
+        if profile.eligible_for_primary:
+            models.append(name[:255])
+    return {
+        "project_id": project_id,
+        "chat": True,
+        "streaming": False,
+        "tools": sorted(set(tools))[:256],
+        "models": sorted(set(models))[:256],
+    }
+
+
+external_agent_api_router = build_external_agent_api_router(
+    service=external_agent_api_service,
+    require_local=require_local_workbench,
+    error_payload=error_payload,
+    submit_run=_external_api_submit_run,
+    get_run=_external_api_get_run,
+    cancel_run=_external_api_cancel_run,
+    capabilities=_external_api_capabilities,
+)
+app.include_router(external_agent_api_router)
 app.include_router(chat_router)
 
 

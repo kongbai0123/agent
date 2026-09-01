@@ -2629,9 +2629,17 @@ def get_n8n_gmail_draft_by_run(run_id: str) -> Optional[Dict[str, Any]]:
         return dict(row) if row else None
 
 
-def list_n8n_gmail_drafts(*, status: Optional[str] = None, limit: int = 100) -> List[Dict[str, Any]]:
+def list_n8n_gmail_drafts(
+    *,
+    status: Optional[str] = None,
+    project_id: Optional[str] = None,
+    limit: int = 100,
+) -> List[Dict[str, Any]]:
     sql = "SELECT * FROM n8n_gmail_drafts WHERE tombstoned_at IS NULL"
     values: List[Any] = []
+    if project_id is not None:
+        sql += " AND project_id = ?"
+        values.append(str(project_id))
     if status:
         sql += " AND status = ?"
         values.append(status)

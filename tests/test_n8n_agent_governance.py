@@ -79,6 +79,7 @@ def governed(tmp_path, monkeypatch):
         cipher=AesGcmContentCipher(lambda: b"k" * 32),
         n8n_running=lambda: running["value"],
         high_risk_runner_ready=lambda: runner["value"],
+        integration_permission_check=lambda *_args, **_kwargs: {"decision": "allow"},
         boot_id="boot-a",
         _allow_legacy_raw_workflows_for_tests=True,
     )
@@ -123,6 +124,7 @@ def test_runtime_callbacks_receive_policy_and_workflow_changes(governed):
             (project_id, reason)
         ),
         workflow_change_callback=lambda context: workflow_changes.append(dict(context)),
+        integration_permission_check=lambda *_args, **_kwargs: {"decision": "allow"},
         _allow_legacy_raw_workflows_for_tests=True,
     )
 
@@ -172,6 +174,69 @@ def test_default_restricted_executes_only_safe_draft(governed):
     with pytest.raises(N8nGovernanceError) as error:
         service.create_operation(proposal(payload={"workflow": {"name": "Unsafe", "nodes": [{"type": "n8n-nodes-base.code"}]}}))
     assert error.value.code == "N8N_HIGH_RISK_FORBIDDEN"
+
+
+def test_unified_integration_policy_is_fail_closed(governed):
+    service, broker, _, _ = governed
+    service.integration_permission_check = None
+
+    with pytest.raises(N8nGovernanceError) as unavailable:
+        service.list_workflows("project_a")
+
+    assert unavailable.value.code == "N8N_INTEGRATION_POLICY_UNAVAILABLE"
+    assert unavailable.value.status_code == 503
+    assert broker.calls == []
+
+
+def test_policy_revocation_after_review_blocks_broker_side_effect(governed):
+    service, broker, _, _ = governed
+    policy = {"decision": "allow"}
+    service.integration_permission_check = (
+        lambda *_args, **_kwargs: {
+            "decision": policy["decision"],
+            "policy_revision": 7 if policy["decision"] == "allow" else 8,
+        }
+    )
+    operation = service.create_planned_operation(proposal())
+    assert operation["status"] == "pending"
+    policy["decision"] = "deny"
+
+    with pytest.raises(N8nGovernanceError) as denied:
+        service.decide(
+            operation["id"],
+            project_id="project_a",
+            expected_digest=operation["digest"],
+            approved=True,
+        )
+
+    assert denied.value.code == "N8N_INTEGRATION_POLICY_DENIED"
+    assert broker.calls == []
+
+
+def test_restricted_operation_binds_the_reviewed_integration_policy_revision(governed):
+    service, broker, _, _ = governed
+    policy = {"revision": 21}
+    service.integration_permission_check = (
+        lambda *_args, **_kwargs: {
+            "decision": "require_approval",
+            "policy_revision": policy["revision"],
+        }
+    )
+    operation = service.create_planned_operation(proposal())
+    assert operation["status"] == "pending"
+    assert operation["integration_policy_revision"] == 21
+    policy["revision"] = 22
+
+    with pytest.raises(N8nGovernanceError) as stale:
+        service.decide(
+            operation["id"],
+            project_id="project_a",
+            expected_digest=operation["digest"],
+            approved=True,
+        )
+
+    assert stale.value.code == "N8N_INTEGRATION_APPROVAL_STALE"
+    assert broker.calls == []
 
 
 @pytest.mark.parametrize(

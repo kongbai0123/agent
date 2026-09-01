@@ -1,4 +1,4 @@
-"""HTTP boundaries for local GitHub and Notion connectors."""
+"""HTTP boundaries for local OAuth connectors."""
 
 from __future__ import annotations
 
@@ -310,7 +310,9 @@ def build_connectors_router(
 
 
 def _callback_html(*, success: bool, connector_id: str) -> HTMLResponse:
-    connector = "GitHub" if connector_id == "github" else "Notion"
+    connector = {"github": "GitHub", "notion": "Notion", "gmail": "Gmail"}.get(
+        connector_id, "Connector"
+    )
     if success:
         title = f"{connector} connected"
         message = "The account is connected. You can close this window and return to Workbench."
@@ -384,6 +386,14 @@ def build_connector_callback_router(
         error: Optional[str] = Query(default=None, max_length=512),
     ):
         return complete("notion", state=state, code=code, provider_error=error)
+
+    @router.get("/oauth/callback/gmail", include_in_schema=False)
+    def gmail_callback(
+        state: str = Query(min_length=16, max_length=512),
+        code: Optional[str] = Query(default=None, max_length=4096),
+        error: Optional[str] = Query(default=None, max_length=512),
+    ):
+        return complete("gmail", state=state, code=code, provider_error=error)
 
     return router
 

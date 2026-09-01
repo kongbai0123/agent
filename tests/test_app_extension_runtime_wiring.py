@@ -245,6 +245,43 @@ def test_mcp_scope_resolution_is_project_bound_and_fails_closed(monkeypatch):
         workbench_app._resolve_tool_scope(definition, call)
 
 
+def test_capability_status_tools_are_globally_registered_but_project_scoped(monkeypatch):
+    names = {item.name for item in workbench_app.tool_registry.for_project("project-one")}
+    assert {
+        "workbench.list_capabilities",
+        "workbench.get_capability_status",
+    } <= names
+
+    definition = next(
+        item
+        for item in workbench_app.tool_registry.for_project("project-one")
+        if item.name == "workbench.get_capability_status"
+    )
+    monkeypatch.setattr(
+        workbench_app.database,
+        "get_project",
+        lambda project_id: {"id": project_id} if project_id == "project-one" else None,
+    )
+    scope = workbench_app._resolve_tool_scope(
+        definition,
+        SimpleNamespace(project_id="project-one", arguments={}),
+    )
+    assert scope.installed is True
+    assert scope.trusted is True
+    assert scope.enabled is True
+    assert scope.healthy is True
+    assert scope.resource_allowed is True
+    assert scope.manifest_sha256 == definition.manifest_sha256
+
+    independent = workbench_app._resolve_tool_scope(
+        definition,
+        SimpleNamespace(project_id=workbench_app.INDEPENDENT_TOOL_SCOPE, arguments={}),
+    )
+    assert independent.enabled is False
+    assert independent.resource_allowed is False
+    assert independent.reason == "PROJECT_REQUIRED"
+
+
 def test_global_mcp_extension_state_is_persisted_before_runtime_sync(monkeypatch):
     settings = {
         "mcp_servers": [
@@ -473,6 +510,10 @@ def test_project_permission_level_controls_fixed_tool_policy(
             return {"project_permission": {"level": level, "revision": 3}}
 
     monkeypatch.setattr(workbench_app, "extension_registry", Registry())
+    # This test isolates the legacy fixed extension policy. The unified
+    # integration gate has separate scope/revision coverage and is intersected
+    # with this result in production.
+    monkeypatch.setattr(workbench_app, "_unified_tool_permission", lambda *_args: None)
     definition = SimpleNamespace(
         extension_id="connector.github" if tool_name.startswith("connector.") else "mcp.browser",
         name=tool_name,
@@ -484,7 +525,7 @@ def test_project_permission_level_controls_fixed_tool_policy(
     assert decision.action.value == expected
 
 
-def test_independent_chat_uses_global_extension_permission(monkeypatch):
+def test_independent_chat_cannot_bypass_project_scoped_integration_policy(monkeypatch):
     calls = []
 
     class Registry:
@@ -503,5 +544,5 @@ def test_independent_chat_uses_global_extension_permission(monkeypatch):
 
     decision = workbench_app._evaluate_tool_permission(definition, call, None)
 
-    assert decision.action.value == "allow"
-    assert calls == [("mcp.browser-playwright", None, False)]
+    assert decision.action.value == "deny"
+    assert calls == []

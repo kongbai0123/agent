@@ -20,7 +20,17 @@ from n8n_gmail_crypto import AesGcmContentCipher
 from n8n_gmail_service import FIXED_TEST_RECIPIENT, N8nGmailService
 
 
-def _setup(tmp_path, monkeypatch, *, require_extension=None):
+def _allow_permission(*_args, **_kwargs):
+    return {"decision": "allow"}
+
+
+def _setup(
+    tmp_path,
+    monkeypatch,
+    *,
+    require_extension=None,
+    permission_check=_allow_permission,
+):
     monkeypatch.setattr(database, "DB_PATH", str(tmp_path / "routes.db"))
     database.init_db()
     database.create_project("fixed_project", "Fixed", str(tmp_path / "fixed"))
@@ -41,6 +51,7 @@ def _setup(tmp_path, monkeypatch, *, require_extension=None):
         },
         delivery_dispatcher=lambda payload: None,
         enable_guard=lambda profile: True,
+        permission_check=permission_check,
         clock=lambda: now,
         id_factory=ids,
     )
@@ -151,3 +162,16 @@ def test_external_gmail_work_is_blocked_when_n8n_extension_is_disabled(
     assert response.status_code == 409
     assert response.json()["detail"]["code"] == "EXTENSION_DISABLED"
     assert calls == [("builtin.n8n", "fixed_project")]
+
+
+def test_gmail_routes_fail_closed_when_unified_permission_gate_is_missing(
+    tmp_path,
+    monkeypatch,
+):
+    client, _ = _setup(tmp_path, monkeypatch, permission_check=None)
+    response = client.post(
+        "/api/integrations/n8n/mail/compose",
+        json={"instruction": "Draft", "subject": "Hello", "model": None},
+    )
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "gmail_permission_unavailable"

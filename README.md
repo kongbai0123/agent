@@ -16,6 +16,7 @@ Local AI Workbench 是一套以 Windows 與本機優先為核心的 AI Agent 工
 - **專案知識檢索**：提供文件匯入、增量索引、專案隔離檢索與可追溯引用；預設採本機保守基線，也可選擇既有本機 Embedding／Reranker 模型或受治理的模型服務。
 - **回答事實核對**：Basic Chat 可依專案知識的證據標記核對最終回答，並提供提醒、嚴格與關閉三種模式；預設核對器是保守的本機基線，不等同通用事實查核服務。
 - **外掛程式中心**：集中管理安裝、信任、啟停、健康狀態、權限與 Audit。
+- **統一整合與對外 Agent API**：集中管理 Gmail、GitHub、Notion、n8n、本機 MCP、Project 權限與本機安裝綁定的 API Key，讓受信任的外部系統呼叫 Agent。
 - **安全工具執行**：工具依目前 Project、Connection 與資源範圍動態提供；外部寫入必須經過使用者批准。
 - **本機 MCP 擴充**：支援經信任的本機 `stdio` MCP Tool，並以獨立程序隔離故障。
 - **MLOps 工作區**：以共用執行、政策、產物與健康契約管理本機資料集、實驗、訓練及模型版本。
@@ -85,6 +86,7 @@ docs/         各功能的詳細設計、操作與治理文件
 - [Windows Launcher 與更新流程](docs/WINDOWS_LAUNCHER_AND_UPDATER.md)
 - [Hermes 部署與維運](docs/HERMES_PRODUCTION_RUNBOOK.md)
 - [n8n Agent、治理與 Gmail 整合](docs/N8N_AGENT_GOVERNANCE.md)
+- [Workbench 對外 Agent API](docs/EXTERNAL_AGENT_API.md)
 - [依賴與供應鏈稽核](docs/DEPENDENCY_AUDIT.md)
 - [執行安全與權限交接](docs/handoff-execution-guards-20260728.md)
 

@@ -25,8 +25,8 @@ def test_extension_center_is_a_primary_workspace_reachable_from_basic_chat():
 
 def test_extension_workspace_exposes_required_information_architecture():
     for tab, label in (
+        ("available", "探索"),
         ("installed", "已安裝"),
-        ("available", "未安裝"),
         ("connections", "連線"),
         ("local", "私人／本機"),
     ):
@@ -38,14 +38,47 @@ def test_extension_workspace_exposes_required_information_architecture():
     assert 'id="extension-detail-view"' in INDEX
     assert 'id="extension-detail-back"' in INDEX
     assert 'id="extension-detail-content"' in INDEX
-    assert INDEX.index('data-extension-tab="installed"') < INDEX.index('data-extension-tab="available"')
+    assert INDEX.index('data-extension-tab="available"') < INDEX.index('data-extension-tab="installed"')
     assert 'class="extension-tab-btn is-primary active"' in INDEX
     assert 'class="extension-tab-btn is-secondary"' in INDEX
-    assert 'data-extension-panel="installed">' in INDEX
-    assert 'data-extension-panel="available" hidden' in INDEX
-    assert "activeTab: 'installed'" in EXTENSIONS
-    assert "async function open(tab = 'installed'" in EXTENSIONS
-    assert "window.workbenchExtensions?.open('installed')" in APP
+    assert 'data-extension-panel="installed" hidden' in INDEX
+    assert 'data-extension-panel="available">' in INDEX
+    assert "activeTab: 'available'" in EXTENSIONS
+    assert "async function open(tab = 'available'" in EXTENSIONS
+    assert "window.workbenchExtensions?.open('available')" in APP
+
+
+def test_extension_discovery_precedes_installation_and_exposes_integrations():
+    assert "探索 → 審查" not in INDEX  # represented as accessible individual steps
+    for step in ("探索", "審查用途與風險", "安裝／連線", "Project 放行", "Agent 使用"):
+        assert step in INDEX
+    assert "window.workbenchIntegrationCenter?.catalog?.()" in EXTENSIONS
+    assert "createIntegrationDiscoveryCard" in EXTENSIONS
+    assert "item.discovery_only" in EXTENSIONS
+    assert "openIntegrationCenter" in EXTENSIONS
+    for integration in ("gmail", "mcp", "external_api", "google_drive", "google_calendar", "slack"):
+        assert integration in EXTENSIONS or integration in (ROOT / "frontend" / "integration-center.js").read_text(encoding="utf-8")
+
+
+def test_discovery_cards_use_local_third_party_brand_assets():
+    assert "function brandLogoFor(item)" in EXTENSIONS
+    assert "function appendCatalogIcon(container, item" in EXTENSIONS
+    assert "assets/brands/" in EXTENSIONS
+    assert "extension-brand-logo" in EXTENSIONS
+    assert "extension-card-icon has-brand-logo" not in EXTENSIONS  # class is added only when a logo exists
+    brand_root = ROOT / "frontend" / "assets" / "brands"
+    for filename in (
+        "gmail.svg", "github.svg", "notion.svg", "n8n.svg", "nvidia.svg",
+        "ollama.svg", "playwright.svg", "cursor.svg", "excel.svg",
+        "google-drive.svg", "google-calendar.svg", "slack.svg",
+    ):
+        payload = (brand_root / filename).read_text(encoding="utf-8")
+        assert payload.startswith("<svg")
+        assert "<script" not in payload.lower()
+        assert "href=\"http" not in payload.lower()
+        assert "xlink:href=\"http" not in payload.lower()
+    assert ".extension-brand-logo" in STYLE
+    assert ".extension-card-icon.has-brand-logo" in STYLE
 
 
 def test_extension_catalog_is_shallow_and_details_disclose_information_in_order():
@@ -202,7 +235,7 @@ def test_extension_workspace_keeps_permission_review_as_a_modal():
 
 
 def test_connection_workspace_supports_local_oauth_and_project_resources():
-    assert "connector-center.js?v=1.0.1-extension-gate" in INDEX
+    assert "connector-center.js?v=1.1.0-gmail-import" in INDEX
     for contract in (
         "/api/connectors",
         "/auth-profile/status",
@@ -266,7 +299,7 @@ def test_frontend_paths_and_payload_keys_match_the_strict_backend_contract():
     assert "global_enabled: true" in EXTENSIONS
 
 
-def test_uninstalled_keeps_unavailable_entries_visible_without_overlapping_installed():
+def test_explore_keeps_installed_and_unavailable_entries_visible():
     script = r"""
 global.window = {};
 require('./frontend/extension-center.js');
@@ -277,6 +310,7 @@ class FakeElement {
         this.children = [];
         this.dataset = {};
         this.className = '';
+        this.classList = { add: (...names) => { this.className += ` ${names.join(' ')}`; } };
         this.disabled = false;
         this.hidden = false;
         this.checked = false;
@@ -285,7 +319,8 @@ class FakeElement {
     }
     appendChild(child) { this.children.push(child); return child; }
     append(...children) { this.children.push(...children); }
-    addEventListener() {}
+        addEventListener() {}
+        setAttribute() {}
 }
 
 global.document = {
@@ -348,7 +383,7 @@ console.log(JSON.stringify({
     )
     result = json.loads(completed.stdout)
 
-    assert result["exploreIds"] == ["builtin.cursor"]
+    assert result["exploreIds"] == ["builtin.cursor", "builtin.excel"]
     assert result["installedIds"] == ["builtin.excel"]
     assert result["cursor"]["install"]["disabled"] is True
     assert "Cursor" in result["cursor"]["install"]["title"]

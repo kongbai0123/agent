@@ -36,6 +36,7 @@ PROTECTED_WORKFLOW_NAMES = {
     "workbench-agent-bridge-v1", "workbench-approval-gate-v1",
     "workbench-approval-bridge-v1",
 }
+_NEW_WORKFLOW_RESOURCE = "__new__"
 MUTATING_OPERATIONS = OPERATIONS
 SAFE_DRAFT_OPERATIONS = {"create_draft", "update_draft"}
 HIGH_RISK_MARKERS = (
@@ -683,6 +684,7 @@ class N8nAgentGovernanceService:
         graph_binding_activator: Optional[Callable[[Mapping[str, Any]], Any]] = None,
         policy_change_callback: Optional[Callable[[str, str], Any]] = None,
         workflow_change_callback: Optional[Callable[[Mapping[str, Any]], Any]] = None,
+        integration_permission_check: Optional[Callable[..., Any]] = None,
         _allow_legacy_raw_workflows_for_tests: bool = False,
     ) -> None:
         self.broker = broker
@@ -695,9 +697,98 @@ class N8nAgentGovernanceService:
         self.graph_binding_activator = graph_binding_activator
         self.policy_change_callback = policy_change_callback
         self.workflow_change_callback = workflow_change_callback
+        self.integration_permission_check = integration_permission_check
         self._allow_legacy_raw_workflows_for_tests = bool(_allow_legacy_raw_workflows_for_tests)
         self._lock = threading.RLock()
         self._ensure_schema()
+
+    def _integration_permission(
+        self,
+        project_id: str,
+        capability: str,
+        *,
+        resource_type: Optional[str] = None,
+        resource_id: Optional[str] = None,
+        approval_satisfied: bool = False,
+        approval_revision: Optional[int] = None,
+        permit_review: bool = False,
+    ) -> tuple[str, Optional[int]]:
+        """Re-evaluate the unified Project grant at the operation boundary.
+
+        The callback returns the Integration Center decision (or ``True`` for a
+        narrowly scoped test/legacy adapter).  ``require_approval`` is accepted
+        only after this service's immutable approval has been satisfied.  A
+        missing callback is deliberately unavailable instead of silently
+        falling back to the older n8n-only policy.
+        """
+
+        callback = self.integration_permission_check
+        if not callable(callback):
+            raise N8nGovernanceError(
+                "N8N_INTEGRATION_POLICY_UNAVAILABLE",
+                "The unified Project integration policy is unavailable.",
+                status_code=503,
+            )
+        try:
+            result = callback(
+                project_id,
+                capability,
+                resource_type=resource_type,
+                resource_id=resource_id,
+            )
+        except N8nGovernanceError:
+            raise
+        except Exception as exc:
+            raise N8nGovernanceError(
+                "N8N_INTEGRATION_POLICY_UNAVAILABLE",
+                "The unified Project integration policy could not be verified.",
+                status_code=503,
+            ) from exc
+        if result is True:
+            decision = "allow"
+            policy_revision = None
+        elif isinstance(result, Mapping):
+            decision = str(result.get("decision") or "deny").strip().casefold()
+            try:
+                policy_revision = int(result["policy_revision"])
+            except (KeyError, TypeError, ValueError):
+                policy_revision = None
+        else:
+            decision = "deny"
+            policy_revision = None
+        if decision == "allow":
+            return decision, policy_revision
+        if decision == "require_approval" and permit_review:
+            if policy_revision is None:
+                raise N8nGovernanceError(
+                    "N8N_INTEGRATION_POLICY_UNAVAILABLE",
+                    "The unified Project policy revision is unavailable.",
+                    status_code=503,
+                )
+            return decision, policy_revision
+        if decision == "require_approval" and approval_satisfied:
+            if (
+                policy_revision is None
+                or approval_revision is None
+                or policy_revision != int(approval_revision)
+            ):
+                raise N8nGovernanceError(
+                    "N8N_INTEGRATION_APPROVAL_STALE",
+                    "The Project integration policy changed; review this operation again.",
+                    status_code=409,
+                )
+            return decision, policy_revision
+        if decision == "require_approval":
+            raise N8nGovernanceError(
+                "N8N_INTEGRATION_APPROVAL_REQUIRED",
+                "This n8n operation requires approval under the unified Project policy.",
+                status_code=409,
+            )
+        raise N8nGovernanceError(
+            "N8N_INTEGRATION_POLICY_DENIED",
+            "The unified Project integration policy does not allow this n8n operation.",
+            status_code=403,
+        )
 
     def _ensure_schema(self) -> None:
         with database.get_db_conn() as conn:
@@ -716,7 +807,8 @@ class N8nAgentGovernanceService:
                     status TEXT NOT NULL, approval_stage INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL, updated_at TEXT NOT NULL, expires_at TEXT NOT NULL,
                     result_json TEXT, error_code TEXT,
-                    origin TEXT NOT NULL DEFAULT 'browser'
+                    origin TEXT NOT NULL DEFAULT 'browser',
+                    integration_policy_revision INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE TABLE IF NOT EXISTS n8n_agent_audits (
                     id INTEGER PRIMARY KEY AUTOINCREMENT, operation_id TEXT NOT NULL,
@@ -743,6 +835,10 @@ class N8nAgentGovernanceService:
             if "origin" not in columns:
                 conn.execute(
                     "ALTER TABLE n8n_agent_operations ADD COLUMN origin TEXT NOT NULL DEFAULT 'browser'"
+                )
+            if "integration_policy_revision" not in columns:
+                conn.execute(
+                    "ALTER TABLE n8n_agent_operations ADD COLUMN integration_policy_revision INTEGER NOT NULL DEFAULT 0"
                 )
 
     def _project(self, project_id: str) -> Mapping[str, Any]:
@@ -979,6 +1075,12 @@ class N8nAgentGovernanceService:
                 "An exact workflow id is required.",
                 status_code=422,
             )
+        self._integration_permission(
+            project_id,
+            "workflow.read",
+            resource_type="workflow",
+            resource_id=workflow_id,
+        )
         snapshot = self._assert_workflow_not_protected(workflow_id)
         self._assert_workflow_project_scope(project_id, workflow_id)
         if operation == "update_draft" and bool(snapshot and snapshot.get("active")):
@@ -1168,6 +1270,18 @@ class N8nAgentGovernanceService:
         policy = self.get_policy(project_id, session_id=session_id)
         if policy["mode"] == "off":
             raise N8nGovernanceError("N8N_AGENT_DISABLED", "n8n Agent access is disabled.", status_code=403)
+        workflow_id = str(semantic.get("workflow_id") or "").strip()
+        # Materialization may inspect an existing workflow, but it does not
+        # itself perform the mutation.  A restricted write grant may therefore
+        # proceed to the immutable review step; execution still rechecks after
+        # the user approval.
+        self._integration_permission(
+            project_id,
+            "workflow.execute",
+            resource_type="workflow",
+            resource_id=workflow_id or _NEW_WORKFLOW_RESOURCE,
+            permit_review=True,
+        )
         self._require_broker_ready()
         authoring = self._authoring()
         semantic = _safe_json(semantic)
@@ -1300,6 +1414,12 @@ class N8nAgentGovernanceService:
         self._project(project_id); self._session(session_id, project_id)
         if self.get_policy(project_id, session_id=session_id)["mode"] == "off":
             raise N8nGovernanceError("N8N_AGENT_DISABLED", "n8n Agent access is disabled.", status_code=403)
+        self._integration_permission(
+            project_id,
+            "workflow.read",
+            resource_type="workflow",
+            resource_id=str(workflow_id or "").strip() or None,
+        )
         self._require_broker_ready()
         snapshot = self._assert_workflow_not_protected(str(workflow_id or "").strip())
         with database.get_db_conn() as conn:
@@ -1358,6 +1478,7 @@ class N8nAgentGovernanceService:
         policy = self.get_policy(project_id, session_id=session_id)
         if policy["mode"] == "off":
             raise N8nGovernanceError("N8N_AGENT_DISABLED", "n8n Agent access is disabled.", status_code=403)
+        self._integration_permission(project_id, "workflow.read")
         self._require_broker_ready()
         workflows = self.broker.list_workflows()
         with database.get_db_conn() as conn:
@@ -1367,12 +1488,28 @@ class N8nAgentGovernanceService:
                     (project_id,),
                 ).fetchall()
             }
+        visible: list[Mapping[str, Any]] = []
+        for item in workflows:
+            if not isinstance(item, Mapping):
+                continue
+            workflow_id = str(item.get("id") or "").strip()
+            if workflow_id not in managed_ids:
+                continue
+            try:
+                self._integration_permission(
+                    project_id,
+                    "workflow.read",
+                    resource_type="workflow",
+                    resource_id=workflow_id,
+                )
+            except N8nGovernanceError as exc:
+                if exc.code == "N8N_INTEGRATION_POLICY_DENIED":
+                    continue
+                raise
+            visible.append(item)
         return {
             "project_id": project_id,
-            "workflows": [
-                item for item in workflows
-                if isinstance(item, Mapping) and str(item.get("id") or "") in managed_ids
-            ],
+            "workflows": visible,
         }
 
     def create_operation(self, value: Mapping[str, Any]) -> dict[str, Any]:
@@ -1412,6 +1549,19 @@ class N8nAgentGovernanceService:
                 status_code=403,
             )
         payload = _safe_json(value.get("payload") or {})
+        proposed_workflow_id = str(payload.get("workflow_id") or "").strip()
+        integration_decision, integration_policy_revision = self._integration_permission(
+            project_id,
+            "workflow.execute",
+            resource_type="workflow",
+            resource_id=proposed_workflow_id or _NEW_WORKFLOW_RESOURCE,
+            # This step only records a bounded proposal.  A central
+            # require-approval decision is carried forward by forcing the
+            # operation out of the historical safe-draft direct path.
+            permit_review=True,
+        )
+        integration_policy_revision = int(integration_policy_revision or 0)
+        force_approval = force_approval or integration_decision == "require_approval"
         materialization: Optional[dict[str, Any]] = None
         if self.graph_authoring is not None:
             if origin == "planner":
@@ -1513,6 +1663,7 @@ class N8nAgentGovernanceService:
             "project_id": project_id, "session_id": session_id, "run_id": run_id,
             "operation": operation, "payload": payload, "diff": diff, "risk": risk,
             "origin": origin, "base_digest": base_digest,
+            "integration_policy_revision": integration_policy_revision,
             "catalog_digest": (materialization or {}).get("catalog_digest"),
             "after_graph_digest": (materialization or {}).get("graph_digest"),
             "plan_digest": value.get("plan_digest") if origin == "planner" else None,
@@ -1526,9 +1677,9 @@ class N8nAgentGovernanceService:
         now = _now()
         with database.get_db_conn() as conn:
             conn.execute("""
-                INSERT INTO n8n_agent_operations(id,project_id,session_id,run_id,operation,workflow_id,workflow_name,payload_json,diff_json,risk_json,digest,base_digest,high_risk,status,approval_stage,created_at,updated_at,expires_at,origin)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            """, (operation_id, project_id, session_id, run_id, operation, workflow_id or None, workflow_name, _canonical(payload), _canonical(diff), _canonical(risk), digest, base_digest, int(high_risk), status, 0, _iso(now), _iso(now), _iso(now + timedelta(minutes=10)), origin))
+                INSERT INTO n8n_agent_operations(id,project_id,session_id,run_id,operation,workflow_id,workflow_name,payload_json,diff_json,risk_json,digest,base_digest,high_risk,status,approval_stage,created_at,updated_at,expires_at,origin,integration_policy_revision)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, (operation_id, project_id, session_id, run_id, operation, workflow_id or None, workflow_name, _canonical(payload), _canonical(diff), _canonical(risk), digest, base_digest, int(high_risk), status, 0, _iso(now), _iso(now), _iso(now + timedelta(minutes=10)), origin, integration_policy_revision))
             conn.execute("UPDATE n8n_agent_policies SET last_activity_at=?,updated_at=? WHERE project_id=?", (_iso(now), _iso(now), project_id))
         self._audit(operation_id, project_id, "created", digest, {"operation": operation, "risk": risk, "automatic": direct, "origin": origin}, session_id=session_id, run_id=run_id, actor="agent")
         if direct:
@@ -1551,7 +1702,7 @@ class N8nAgentGovernanceService:
             "base_digest": row["base_digest"], "high_risk": bool(row["high_risk"]), "status": row["status"],
             "approval_stage": row["approval_stage"], "created_at": row["created_at"], "updated_at": row["updated_at"],
             "expires_at": row["expires_at"], "result": _loads(row["result_json"], None), "error_code": row["error_code"],
-            "origin": row["origin"],
+            "origin": row["origin"], "integration_policy_revision": int(row["integration_policy_revision"] or 0),
         }
 
     def list_operations(self, project_id: str, *, limit: int = 100) -> list[dict[str, Any]]:
@@ -1582,6 +1733,15 @@ class N8nAgentGovernanceService:
                 conn.execute("UPDATE n8n_agent_operations SET status='expired',updated_at=? WHERE id=?", (_iso(), operation_id))
             raise N8nGovernanceError("N8N_APPROVAL_EXPIRED", "The operation approval expired.", status_code=409)
         self._assert_operation_eligible(current)
+        if approved:
+            self._integration_permission(
+                project_id,
+                "workflow.execute",
+                resource_type="workflow",
+                resource_id=str(current.get("workflow_id") or "") or _NEW_WORKFLOW_RESOURCE,
+                approval_satisfied=True,
+                approval_revision=int(current.get("integration_policy_revision") or 0),
+            )
         if current["risk"].get("irreversible") and approved and confirmation != (current["workflow_name"] or current["workflow_id"]):
             raise N8nGovernanceError("N8N_DESTRUCTIVE_CONFIRMATION_REQUIRED", "Type the exact workflow or credential name to confirm deletion.", status_code=409)
         if not approved:
@@ -1638,11 +1798,19 @@ class N8nAgentGovernanceService:
             {"operation": current["operation"], "approval_stage": current["approval_stage"]},
             session_id=current.get("session_id"), run_id=current.get("run_id"), actor="local_user",
         )
-        return self._execute(operation_id)
+        return self._execute(operation_id, approval_satisfied=True)
 
-    def _execute(self, operation_id: str) -> dict[str, Any]:
+    def _execute(self, operation_id: str, *, approval_satisfied: bool = False) -> dict[str, Any]:
         current = self.get_operation(operation_id)
         self._assert_operation_eligible(current)
+        self._integration_permission(
+            str(current["project_id"]),
+            "workflow.execute",
+            resource_type="workflow",
+            resource_id=str(current.get("workflow_id") or "") or _NEW_WORKFLOW_RESOURCE,
+            approval_satisfied=approval_satisfied,
+            approval_revision=int(current.get("integration_policy_revision") or 0),
+        )
         self._require_broker_ready()
         with database.get_db_conn() as conn:
             row = conn.execute("SELECT payload_json FROM n8n_agent_operations WHERE id=?", (operation_id,)).fetchone()
@@ -1680,6 +1848,18 @@ class N8nAgentGovernanceService:
         try:
             if current["operation"].startswith("credential_"):
                 secret_value = self._consume_secret(current["project_id"], payload.get("secret_handle"))
+            # The Project policy may change after the durable claim.  Recheck
+            # immediately before the broker can mutate n8n or an external
+            # service.  Existing approval never carries authorization across a
+            # policy revision.
+            self._integration_permission(
+                str(current["project_id"]),
+                "workflow.execute",
+                resource_type="workflow",
+                resource_id=workflow_id or _NEW_WORKFLOW_RESOURCE,
+                approval_satisfied=approval_satisfied,
+                approval_revision=int(current.get("integration_policy_revision") or 0),
+            )
             broker_started = True
             result = self.broker.execute(current["operation"], payload, secret=secret_value)
             public_result = {

@@ -22,7 +22,7 @@ _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 _SECRET_KEY = re.compile(
     r"(?i)(authorization|cookie|password|secret|token|api[_-]?key|private[_-]?key|code_verifier)"
 )
-_CONNECTORS = {"github", "notion"}
+_CONNECTORS = {"github", "notion", "gmail"}
 _CONNECTION_STATUSES = {
     "connected",
     "degraded",

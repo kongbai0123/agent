@@ -155,6 +155,7 @@ def services(tmp_path, monkeypatch):
     governance = N8nAgentGovernanceService(
         broker=broker, cipher=AesGcmContentCipher(lambda: b"k" * 32),
         n8n_running=lambda: True, graph_authoring=_engine(),
+        integration_permission_check=lambda *_args, **_kwargs: {"decision": "allow"},
     )
     planner = N8nPlanningService(
         governance_service=governance, generator=_two_stage_generator(),

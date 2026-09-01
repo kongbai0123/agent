@@ -26,7 +26,10 @@ from n8n_gmail_crypto import AesGcmContentCipher
 
 HMAC_PROFILE = "agent-runtime"
 TASK_STATES = {"queued", "generating", "succeeded", "generation_failed", "cancelled"}
-APPROVAL_STATES = {"pending", "approved", "approved_by_grant", "rejected", "revoked", "expired"}
+APPROVAL_STATES = {
+    "pending", "approved", "approved_by_grant", "consumed",
+    "rejected", "revoked", "expired",
+}
 CREDENTIAL_STATES = {"unknown", "ready", "degraded", "revoked"}
 EXTERNAL_ACTIONS = {
     "send_email", "http_write", "database_write", "delete", "publish",
@@ -268,6 +271,7 @@ class N8nAgentTaskRuntime:
         credential_resolver: Optional[Callable[[str], Mapping[str, Any]]] = None,
         policy_resolver: Optional[Callable[[str], Mapping[str, Any]]] = None,
         execution_gate: Optional[Callable[[str], Any]] = None,
+        integration_permission_check: Optional[Callable[..., Any]] = None,
         workflow_revision_resolver: Optional[Callable[[str], Any]] = None,
         clock: Callable[[], datetime] = _utcnow,
         id_factory: Callable[[str], str] = lambda prefix: f"{prefix}_{secrets.token_urlsafe(18)}",
@@ -281,6 +285,7 @@ class N8nAgentTaskRuntime:
         self._credential_resolver = credential_resolver
         self._policy_resolver = policy_resolver
         self._execution_gate = execution_gate
+        self._integration_permission_check = integration_permission_check
         self._workflow_revision_resolver = workflow_revision_resolver
         self._clock = clock
         self._id_factory = id_factory
@@ -313,6 +318,95 @@ class N8nAgentTaskRuntime:
                 "The n8n extension is disabled for this Project.",
                 status_code=409,
             )
+
+    def _require_integration_permission(
+        self,
+        project_id: str,
+        capability: str,
+        *,
+        resource_type: Optional[str] = None,
+        resource_id: Optional[str] = None,
+        approval_satisfied: bool = False,
+        approval_revision: Optional[int] = None,
+        permit_review: bool = False,
+    ) -> tuple[str, Optional[int]]:
+        """Re-evaluate the unified Project grant at the runtime boundary.
+
+        No task input, model output, credential or approval token is exposed to
+        the callback.  A restricted ``require_approval`` result is accepted
+        only when this runtime has already verified its server-owned workflow
+        binding or immutable action approval.  Missing or broken policy wiring
+        is deliberately unavailable rather than falling back to the legacy
+        n8n-only policy.
+        """
+
+        callback = self._integration_permission_check
+        if not callable(callback):
+            raise N8nAgentTaskError(
+                "N8N_INTEGRATION_POLICY_UNAVAILABLE",
+                "The unified Project integration policy is unavailable.",
+                status_code=503,
+            )
+        try:
+            result = callback(
+                project_id,
+                capability,
+                resource_type=resource_type,
+                resource_id=resource_id,
+            )
+        except N8nAgentTaskError:
+            raise
+        except Exception as exc:
+            raise N8nAgentTaskError(
+                "N8N_INTEGRATION_POLICY_UNAVAILABLE",
+                "The unified Project integration policy could not be verified.",
+                status_code=503,
+            ) from exc
+        if result is True:
+            decision = "allow"
+            policy_revision = None
+        elif isinstance(result, Mapping):
+            decision = str(result.get("decision") or "deny").strip().casefold()
+            try:
+                policy_revision = int(result["policy_revision"])
+            except (KeyError, TypeError, ValueError):
+                policy_revision = None
+        else:
+            decision = "deny"
+            policy_revision = None
+        if decision == "allow":
+            return decision, policy_revision
+        if decision == "require_approval" and permit_review:
+            if policy_revision is None:
+                raise N8nAgentTaskError(
+                    "N8N_INTEGRATION_POLICY_UNAVAILABLE",
+                    "The unified Project policy revision is unavailable.",
+                    status_code=503,
+                )
+            return decision, policy_revision
+        if decision == "require_approval" and approval_satisfied:
+            if (
+                policy_revision is None
+                or approval_revision is None
+                or policy_revision != int(approval_revision)
+            ):
+                raise N8nAgentTaskError(
+                    "N8N_INTEGRATION_APPROVAL_STALE",
+                    "The Project integration policy changed; approve this action again.",
+                    status_code=409,
+                )
+            return decision, policy_revision
+        if decision == "require_approval":
+            raise N8nAgentTaskError(
+                "N8N_INTEGRATION_APPROVAL_REQUIRED",
+                "This n8n operation requires approval under the unified Project policy.",
+                status_code=409,
+            )
+        raise N8nAgentTaskError(
+            "N8N_INTEGRATION_POLICY_DENIED",
+            "The unified Project integration policy does not allow this n8n operation.",
+            status_code=403,
+        )
 
     def _ensure_schema(self) -> None:
         with database.get_db_conn() as conn:
@@ -420,6 +514,7 @@ class N8nAgentTaskRuntime:
                     target_digest TEXT NOT NULL, target_display TEXT NOT NULL,
                     action TEXT NOT NULL, run_key TEXT NOT NULL, task_id TEXT,
                     request_digest TEXT NOT NULL, policy_epoch INTEGER NOT NULL,
+                    integration_policy_revision INTEGER NOT NULL DEFAULT 0,
                     status TEXT NOT NULL, grant_id TEXT, created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL, expires_at TEXT NOT NULL,
                     UNIQUE(workflow_id, request_id)
@@ -435,6 +530,7 @@ class N8nAgentTaskRuntime:
                     target_digest TEXT NOT NULL, action TEXT NOT NULL,
                     scope TEXT NOT NULL, run_key TEXT, boot_id TEXT NOT NULL,
                     policy_epoch INTEGER NOT NULL, status TEXT NOT NULL,
+                    integration_policy_revision INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL, expires_at TEXT NOT NULL,
                     revoked_at TEXT, revoke_reason TEXT
                 );
@@ -481,6 +577,10 @@ class N8nAgentTaskRuntime:
                 conn.execute(
                     "ALTER TABLE n8n_agent_runtime_approvals ADD COLUMN manifest_digest TEXT NOT NULL DEFAULT ''"
                 )
+            if "integration_policy_revision" not in approval_columns:
+                conn.execute(
+                    "ALTER TABLE n8n_agent_runtime_approvals ADD COLUMN integration_policy_revision INTEGER NOT NULL DEFAULT 0"
+                )
             grant_columns = {
                 str(row[1]) for row in conn.execute(
                     "PRAGMA table_info(n8n_agent_runtime_grants)"
@@ -493,6 +593,10 @@ class N8nAgentTaskRuntime:
             if "manifest_digest" not in grant_columns:
                 conn.execute(
                     "ALTER TABLE n8n_agent_runtime_grants ADD COLUMN manifest_digest TEXT NOT NULL DEFAULT ''"
+                )
+            if "integration_policy_revision" not in grant_columns:
+                conn.execute(
+                    "ALTER TABLE n8n_agent_runtime_grants ADD COLUMN integration_policy_revision INTEGER NOT NULL DEFAULT 0"
                 )
 
     def _project(self, project_id: str) -> Mapping[str, Any]:
@@ -1528,6 +1632,16 @@ class N8nAgentTaskRuntime:
             binding_id=binding_id, workflow_id=workflow_id, workflow_revision=workflow_revision,
             node_id=node_id, project_id=project_id,
         )
+        # A reviewed workflow binding is not itself an Integration Center
+        # approval for this exact task input.  Restricted mode therefore stays
+        # fail-closed until an explicit task-approval contract exists; open
+        # Project grants can enqueue and are rechecked again by the worker.
+        self._require_integration_permission(
+            project_id,
+            "agent.task.submit",
+            resource_type="workflow",
+            resource_id=workflow_id,
+        )
         input_value = _bounded_json(value.get("input"), _MAX_INPUT_BYTES, reject_secrets=True)
         input_sha = _digest(input_value)
         request_digest = _digest(
@@ -1610,10 +1724,21 @@ class N8nAgentTaskRuntime:
         if row["workflow_id"] != _safe_id(workflow_id, "workflow_id"):
             raise N8nAgentTaskError("N8N_AGENT_TASK_NOT_FOUND", "The Agent task was not found.", status_code=404)
         project_id, _ = self._workflow_project(workflow_id)
+        if not hmac.compare_digest(str(row["project_id"]), project_id):
+            raise N8nAgentTaskError("N8N_AGENT_TASK_NOT_FOUND", "The Agent task was not found.", status_code=404)
+        self._require_execution_enabled(project_id)
         self._assert_live_workflow_token(
             project_id=project_id,
             workflow_id=workflow_id,
             workflow_revision=str(row["workflow_revision"]),
+        )
+        # Returning a completed result to n8n is an execution boundary: a
+        # Project owner may have revoked the integration after generation.
+        self._require_integration_permission(
+            project_id,
+            "agent.task.submit",
+            resource_type="workflow",
+            resource_id=workflow_id,
         )
         return self._task_public(row, include_result=True)
 
@@ -1637,7 +1762,6 @@ class N8nAgentTaskRuntime:
     def process_task(self, task_id: str) -> dict[str, Any]:
         task_id = _safe_id(task_id, "task_id")
         pending = self._task_row(task_id)
-        self._require_execution_enabled(str(pending["project_id"]))
         now = _iso(self._now())
         with database.get_db_conn() as conn:
             claimed = conn.execute(
@@ -1651,6 +1775,16 @@ class N8nAgentTaskRuntime:
             return self._task_public(self._task_row(task_id), include_result=False)
         row = self._task_row(task_id)
         try:
+            # Claim first so a revoked queued task becomes terminal instead of
+            # permanently blocking process_next_task at the head of the queue.
+            # No model or external action occurs before both live gates pass.
+            self._require_execution_enabled(str(row["project_id"]))
+            self._require_integration_permission(
+                str(row["project_id"]),
+                "agent.task.submit",
+                resource_type="workflow",
+                resource_id=str(row["workflow_id"]),
+            )
             self._assert_live_workflow_token(
                 project_id=str(row["project_id"]),
                 workflow_id=str(row["workflow_id"]),
@@ -1675,8 +1809,15 @@ class N8nAgentTaskRuntime:
                 "untrusted_input": input_value,
             }
             # Recheck immediately before model execution.  Approval, queueing,
-            # or decryption time never carries extension authority forward.
+            # or decryption time never carries extension or Project authority
+            # forward.
             self._require_execution_enabled(str(row["project_id"]))
+            self._require_integration_permission(
+                str(row["project_id"]),
+                "agent.task.submit",
+                resource_type="workflow",
+                resource_id=str(row["workflow_id"]),
+            )
             output = self._generator(request)
             output = _bounded_json(output, _MAX_OUTPUT_BYTES, reject_secrets=True)
             schema = config.get("output_schema")
@@ -2087,6 +2228,7 @@ class N8nAgentTaskRuntime:
         run_key = _safe_id(value.get("run_key"), "run_key")
         task_id = str(value.get("task_id") or "").strip() or None
         project_id, _ = self._workflow_project(workflow_id)
+        self._require_execution_enabled(project_id)
         manifest_row, manifest = self._resolve_runtime_approval_manifest(
             project_id=project_id,
             workflow_id=workflow_id,
@@ -2094,6 +2236,18 @@ class N8nAgentTaskRuntime:
             approval_binding_id=approval_binding_id,
             manifest_digest=manifest_digest,
         )
+        # Creating this record is only the review step; no external action is
+        # released.  A restricted Project grant may therefore proceed into the
+        # existing immutable approval flow.  Denied or unavailable policies do
+        # not create an approval at all.
+        _integration_decision, integration_policy_revision = self._require_integration_permission(
+            project_id,
+            "workflow.execute",
+            resource_type="workflow",
+            resource_id=workflow_id,
+            permit_review=True,
+        )
+        integration_policy_revision = int(integration_policy_revision or 0)
         node_id = str(manifest_row["node_id"])
         alias = str(manifest["credential_alias"])
         action = str(manifest["action"])
@@ -2145,6 +2299,7 @@ class N8nAgentTaskRuntime:
                 "target_kind": manifest["target_kind"], "target_digest": target_digest,
                 "action": action, "run_key": run_key, "task_id": task_id,
                 "policy_epoch": epoch,
+                "integration_policy_revision": integration_policy_revision,
             }
         )
         self._expire_runtime_state()
@@ -2167,7 +2322,20 @@ class N8nAgentTaskRuntime:
         if existing:
             if existing["request_digest"] != request_digest:
                 raise N8nAgentTaskError("N8N_RUNTIME_ACTION_CONFLICT", "The action request id was reused with different content.", status_code=409)
-            result = self._approval_public(dict(existing)); result["idempotent"] = True
+            existing_row = dict(existing)
+            if str(existing_row.get("status") or "") in {"approved", "approved_by_grant"}:
+                self._require_integration_permission(
+                    project_id,
+                    "workflow.execute",
+                    resource_type="workflow",
+                    resource_id=workflow_id,
+                    approval_satisfied=True,
+                    approval_revision=int(existing_row.get("integration_policy_revision") or 0),
+                )
+                result = self._consume_runtime_authorization(existing_row)
+            else:
+                result = self._approval_public(existing_row)
+            result["idempotent"] = True
             return result
         now = self._now()
         with database.get_db_conn() as conn:
@@ -2177,13 +2345,14 @@ class N8nAgentTaskRuntime:
                  WHERE project_id=? AND workflow_id=? AND workflow_revision=? AND node_id=?
                    AND approval_binding_id=? AND manifest_digest=?
                    AND credential_alias=? AND target_digest=? AND action=? AND status='active'
-                   AND boot_id=? AND policy_epoch=? AND expires_at>?
+                    AND boot_id=? AND policy_epoch=? AND integration_policy_revision=? AND expires_at>?
                  ORDER BY created_at DESC
                 """,
                 (
                     project_id, workflow_id, workflow_revision, node_id,
                     approval_binding_id, manifest_digest, alias, target_digest,
-                    action, self.boot_id, epoch, _iso(now),
+                    action, self.boot_id, epoch, integration_policy_revision,
+                    _iso(now),
                 ),
             ).fetchall()
         matching = next(
@@ -2203,18 +2372,33 @@ class N8nAgentTaskRuntime:
                     approval_id,request_id,project_id,workflow_id,workflow_revision,node_id,
                     approval_binding_id,manifest_digest,credential_alias,target_kind,
                     target_digest,target_display,action,run_key,task_id,
-                    request_digest,policy_epoch,status,grant_id,created_at,updated_at,expires_at
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    request_digest,policy_epoch,integration_policy_revision,
+                    status,grant_id,created_at,updated_at,expires_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     approval_id, request_id, project_id, workflow_id, workflow_revision, node_id,
                     approval_binding_id, manifest_digest, alias,
                     str(manifest["target_kind"]), target_digest, target_display, action,
-                    run_key, task_id, request_digest, epoch, status, grant_id,
+                    run_key, task_id, request_digest, epoch, integration_policy_revision,
+                    status, grant_id,
                     _iso(now), _iso(now), _iso(expires),
                 ),
             )
-        result = self._approval_public(self._approval_row(approval_id)); result["idempotent"] = False
+        created_row = self._approval_row(approval_id)
+        if str(created_row.get("status") or "") == "approved_by_grant":
+            self._require_integration_permission(
+                project_id,
+                "workflow.execute",
+                resource_type="workflow",
+                resource_id=workflow_id,
+                approval_satisfied=True,
+                approval_revision=integration_policy_revision,
+            )
+            result = self._consume_runtime_authorization(created_row)
+        else:
+            result = self._approval_public(created_row)
+        result["idempotent"] = False
         return result
 
     def _approval_row(self, approval_id: str) -> dict[str, Any]:
@@ -2226,6 +2410,64 @@ class N8nAgentTaskRuntime:
         if not row:
             raise N8nAgentTaskError("N8N_RUNTIME_APPROVAL_NOT_FOUND", "The runtime approval was not found.", status_code=404)
         return dict(row)
+
+    def _consume_runtime_authorization(self, row: Mapping[str, Any]) -> dict[str, Any]:
+        """Atomically release an approved action exactly once.
+
+        The first caller receives the original approved status while durable
+        state moves to ``consumed``.  A retry sees ``consumed`` and therefore
+        cannot trigger the external action again.  The conditional update also
+        binds Project, workflow revision and both policy revisions.
+        """
+
+        if str(row.get("status") or "") not in {"approved", "approved_by_grant"}:
+            return self._approval_public(row)
+        now = _iso(self._now())
+        with database.get_db_conn() as conn:
+            changed = conn.execute(
+                """
+                UPDATE n8n_agent_runtime_approvals
+                   SET status='consumed',updated_at=?
+                 WHERE approval_id=? AND project_id=? AND workflow_id=?
+                   AND workflow_revision=? AND request_digest=?
+                   AND policy_epoch=? AND integration_policy_revision=?
+                   AND status=? AND expires_at>?
+                   AND (
+                        grant_id IS NULL
+                        OR EXISTS (
+                            SELECT 1 FROM n8n_agent_runtime_grants AS grant_row
+                             WHERE grant_row.grant_id=n8n_agent_runtime_approvals.grant_id
+                               AND grant_row.project_id=n8n_agent_runtime_approvals.project_id
+                               AND grant_row.workflow_id=n8n_agent_runtime_approvals.workflow_id
+                               AND grant_row.workflow_revision=n8n_agent_runtime_approvals.workflow_revision
+                               AND grant_row.policy_epoch=n8n_agent_runtime_approvals.policy_epoch
+                               AND grant_row.integration_policy_revision=n8n_agent_runtime_approvals.integration_policy_revision
+                               AND grant_row.boot_id=? AND grant_row.status='active'
+                               AND grant_row.expires_at>?
+                        )
+                   )
+                """,
+                (
+                    now,
+                    row["approval_id"],
+                    row["project_id"],
+                    row["workflow_id"],
+                    row["workflow_revision"],
+                    row["request_digest"],
+                    int(row["policy_epoch"]),
+                    int(row.get("integration_policy_revision") or 0),
+                    row["status"],
+                    now,
+                    self.boot_id,
+                    now,
+                ),
+            )
+        if changed.rowcount != 1:
+            self._expire_runtime_state()
+            return self._approval_public(self._approval_row(str(row["approval_id"])))
+        # Return the one successful authorization response without rewriting
+        # its status to consumed; only subsequent requests observe consumed.
+        return self._approval_public(dict(row))
 
     @staticmethod
     def _approval_public(row: Mapping[str, Any]) -> dict[str, Any]:
@@ -2247,6 +2489,9 @@ class N8nAgentTaskRuntime:
         if row["workflow_id"] != _safe_id(workflow_id, "workflow_id"):
             raise N8nAgentTaskError("N8N_RUNTIME_APPROVAL_NOT_FOUND", "The runtime approval was not found.", status_code=404)
         project_id, _ = self._workflow_project(workflow_id)
+        if not hmac.compare_digest(str(row["project_id"]), project_id):
+            raise N8nAgentTaskError("N8N_RUNTIME_APPROVAL_NOT_FOUND", "The runtime approval was not found.", status_code=404)
+        self._require_execution_enabled(project_id)
         self._resolve_runtime_approval_manifest(
             project_id=project_id,
             workflow_id=workflow_id,
@@ -2258,6 +2503,20 @@ class N8nAgentTaskRuntime:
                 row.get("manifest_digest"), "manifest_digest"
             ),
         )
+        # n8n polls pending/rejected records without receiving authority.  The
+        # moment an approved decision would be released, re-evaluate the
+        # current Project grant so a later policy revocation wins.
+        if str(row["status"]) in {"approved", "approved_by_grant"}:
+            self._require_integration_permission(
+                project_id,
+                "workflow.execute",
+                resource_type="workflow",
+                resource_id=workflow_id,
+                approval_satisfied=True,
+                approval_revision=int(row.get("integration_policy_revision") or 0),
+            )
+        if str(row["status"]) in {"approved", "approved_by_grant"}:
+            return self._consume_runtime_authorization(row)
         return self._approval_public(row)
 
     def list_runtime_approvals(self, project_id: str, *, status: Optional[str] = None, limit: int = 100) -> list[dict[str, Any]]:
@@ -2295,6 +2554,7 @@ class N8nAgentTaskRuntime:
                     (_iso(now), approval_id),
                 )
             return self._approval_public(self._approval_row(approval_id))
+        self._require_execution_enabled(project_id)
         self._resolve_runtime_approval_manifest(
             project_id=project_id,
             workflow_id=str(row["workflow_id"]),
@@ -2308,6 +2568,17 @@ class N8nAgentTaskRuntime:
         )
         if row["policy_epoch"] != self._policy_epoch(project_id):
             raise N8nAgentTaskError("N8N_RUNTIME_APPROVAL_STALE", "The Project policy changed.", status_code=409)
+        # Human approval does not override a grant that was removed while the
+        # approval card was open.  Recheck before persisting either a one-shot
+        # approval or a reusable timed grant.
+        self._require_integration_permission(
+            project_id,
+            "workflow.execute",
+            resource_type="workflow",
+            resource_id=str(row["workflow_id"]),
+            approval_satisfied=True,
+            approval_revision=int(row.get("integration_policy_revision") or 0),
+        )
         # Zero minutes is a one-shot decision for this exact request.  It must
         # not create a reusable per-run grant: a workflow can emit the same
         # external action more than once, and the default contract requires
@@ -2359,15 +2630,17 @@ class N8nAgentTaskRuntime:
                 INSERT INTO n8n_agent_runtime_grants(
                     grant_id,project_id,workflow_id,workflow_revision,node_id,
                     approval_binding_id,manifest_digest,credential_alias,
-                    target_digest,action,scope,run_key,boot_id,policy_epoch,status,created_at,expires_at
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'active',?,?)
+                    target_digest,action,scope,run_key,boot_id,policy_epoch,
+                    integration_policy_revision,status,created_at,expires_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'active',?,?)
                 """,
                 (
                     grant_id, project_id, row["workflow_id"], row["workflow_revision"], row["node_id"],
                     row["approval_binding_id"], row["manifest_digest"],
                     row["credential_alias"], row["target_digest"], row["action"], scope,
                     None, self.boot_id,
-                    row["policy_epoch"], _iso(now), _iso(expires),
+                    row["policy_epoch"], int(row.get("integration_policy_revision") or 0),
+                    _iso(now), _iso(expires),
                 ),
             )
             changed = conn.execute(

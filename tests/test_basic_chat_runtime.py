@@ -240,6 +240,266 @@ def test_independent_task_tool_note_explains_project_requirement():
     assert payload["messages"][0]["content"] == "system"
 
 
+def test_capability_status_question_queries_host_before_model_answer(monkeypatch):
+    fake_db = FakeDatabase()
+    monkeypatch.setattr(chat_runtime, "database", fake_db)
+    queries = []
+    captured = {}
+
+    async def capability_query(project_id, query):
+        queries.append((project_id, query))
+        return {
+            "schema_version": 1,
+            "project_id": project_id,
+            "query": query,
+            "items": [
+                {
+                    "id": "gmail",
+                    "name": "Gmail",
+                    "available": False,
+                    "reason_code": "connection_required",
+                    "reason": "尚未完成帳號或服務連線。",
+                    "repair": {
+                        "workspace": "integrations",
+                        "section": "connections",
+                        "label": "開啟統一整合中心",
+                    },
+                }
+            ],
+            "summary": {"total": 1, "available": 0, "blocked": 1},
+        }
+
+    class Approvals:
+        def close_run(self, _run_id):
+            return None
+
+    registry = ToolRegistry()
+    runtime = HostToolRuntime(
+        registry=registry,
+        dispatcher=ToolDispatcher(
+            registry,
+            scope_resolver=lambda _definition, _call: ToolScopeState(
+                installed=True, trusted=True, enabled=True, healthy=True
+            ),
+        ),
+        approval_broker=Approvals(),
+        capability_status_query=capability_query,
+    )
+    response = FakeResponse([
+        encoded_chunk("Gmail 尚未連線。"),
+        encoded_chunk(done=True, prompt_eval_count=8, eval_count=4),
+    ])
+
+    def fake_post_chat(_settings, payload, **_kwargs):
+        captured["payload"] = payload
+        return response
+
+    control = ChatRunControl(
+        "run_capability_status", "sess_basic", "turn_current", "model-a", "chat"
+    )
+    control.start_deadline(60)
+    events = parse_sse(asyncio.run(collect_stream(
+        request=SimpleNamespace(messages=[]),
+        settings={"ollama_url": "http://127.0.0.1:11434", "model_provider": "ollama"},
+        model="model-a",
+        session_id="sess_basic",
+        turn_id="turn_current",
+        run_id="run_capability_status",
+        prompt_sha256="digest",
+        user_message_id=3,
+        user_query="Gmail 是否已啟用並連線？",
+        temporary_context="",
+        images=[],
+        run_control=control,
+        project_id="project-one",
+        post_chat=fake_post_chat,
+        host_tool_runtime=runtime,
+    )))
+
+    assert queries == [("project-one", "Gmail 是否已啟用並連線？")]
+    assert [name for name, _payload in events] == [
+        "meta", "capability_status", "token", "metrics", "done"
+    ]
+    status = events[1][1]
+    assert status["items"][0]["reason_code"] == "connection_required"
+    system_text = "\n".join(
+        str(item.get("content") or "")
+        for item in captured["payload"]["messages"]
+        if item.get("role") == "system"
+    )
+    assert "Workbench 已在回答前查詢" in system_text
+    assert "connection_required" in system_text
+
+
+def test_capability_status_query_failure_is_explicit_and_not_guessed(monkeypatch):
+    fake_db = FakeDatabase()
+    monkeypatch.setattr(chat_runtime, "database", fake_db)
+    captured = {}
+
+    async def failing_query(_project_id, _query):
+        raise RuntimeError("nvapi-secret-must-not-escape")
+
+    class Approvals:
+        def close_run(self, _run_id):
+            return None
+
+    registry = ToolRegistry()
+    runtime = HostToolRuntime(
+        registry=registry,
+        dispatcher=ToolDispatcher(
+            registry,
+            scope_resolver=lambda _definition, _call: ToolScopeState(
+                installed=True, trusted=True, enabled=True, healthy=True
+            ),
+        ),
+        approval_broker=Approvals(),
+        capability_status_query=failing_query,
+    )
+    response = FakeResponse([
+        encoded_chunk("目前無法驗證後台狀態。"),
+        encoded_chunk(done=True, prompt_eval_count=8, eval_count=4),
+    ])
+
+    def fake_post_chat(_settings, payload, **_kwargs):
+        captured["payload"] = payload
+        return response
+
+    control = ChatRunControl(
+        "run_capability_failure", "sess_basic", "turn_current", "model-a", "chat"
+    )
+    control.start_deadline(60)
+    events = parse_sse(asyncio.run(collect_stream(
+        request=SimpleNamespace(messages=[]),
+        settings={"ollama_url": "http://127.0.0.1:11434", "model_provider": "ollama"},
+        model="model-a",
+        session_id="sess_basic",
+        turn_id="turn_current",
+        run_id="run_capability_failure",
+        prompt_sha256="digest",
+        user_message_id=3,
+        user_query="MCP 為何無法使用？",
+        temporary_context="",
+        images=[],
+        run_control=control,
+        project_id="project-one",
+        post_chat=fake_post_chat,
+        host_tool_runtime=runtime,
+    )))
+
+    status = next(payload for name, payload in events if name == "capability_status")
+    assert status["error"]["code"] == "CAPABILITY_STATUS_UNAVAILABLE"
+    assert "nvapi-secret" not in str(status)
+    assert "目前無法驗證" in str(captured["payload"])
+
+
+def test_ordinary_question_does_not_query_capability_service(monkeypatch):
+    fake_db = FakeDatabase()
+    monkeypatch.setattr(chat_runtime, "database", fake_db)
+    calls = []
+
+    async def unexpected_query(*args):
+        calls.append(args)
+        return {}
+
+    class Approvals:
+        def close_run(self, _run_id):
+            return None
+
+    registry = ToolRegistry()
+    runtime = HostToolRuntime(
+        registry=registry,
+        dispatcher=ToolDispatcher(
+            registry,
+            scope_resolver=lambda _definition, _call: ToolScopeState(
+                installed=True, trusted=True, enabled=True, healthy=True
+            ),
+        ),
+        approval_broker=Approvals(),
+        capability_status_query=unexpected_query,
+    )
+    response = FakeResponse([
+        encoded_chunk("一般回答"),
+        encoded_chunk(done=True, prompt_eval_count=8, eval_count=4),
+    ])
+    control = ChatRunControl(
+        "run_ordinary", "sess_basic", "turn_current", "model-a", "chat"
+    )
+    control.start_deadline(60)
+    events = parse_sse(asyncio.run(collect_stream(
+        request=SimpleNamespace(messages=[]),
+        settings={"ollama_url": "http://127.0.0.1:11434", "model_provider": "ollama"},
+        model="model-a",
+        session_id="sess_basic",
+        turn_id="turn_current",
+        run_id="run_ordinary",
+        prompt_sha256="digest",
+        user_message_id=3,
+        user_query="請解釋 n8n 的工作流程概念",
+        temporary_context="",
+        images=[],
+        run_control=control,
+        project_id="project-one",
+        post_chat=lambda *_args, **_kwargs: response,
+        host_tool_runtime=runtime,
+    )))
+    assert calls == []
+    assert "capability_status" not in [name for name, _payload in events]
+
+
+def test_independent_status_question_returns_project_selection_repair(monkeypatch):
+    fake_db = FakeDatabase()
+    monkeypatch.setattr(chat_runtime, "database", fake_db)
+
+    class Approvals:
+        def close_run(self, _run_id):
+            return None
+
+    registry = ToolRegistry()
+    runtime = HostToolRuntime(
+        registry=registry,
+        dispatcher=ToolDispatcher(
+            registry,
+            scope_resolver=lambda _definition, _call: ToolScopeState(
+                installed=True, trusted=True, enabled=True, healthy=True
+            ),
+        ),
+        approval_broker=Approvals(),
+        independent_scope_id="__independent_chat__",
+    )
+    response = FakeResponse([
+        encoded_chunk("請先選擇 Project。"),
+        encoded_chunk(done=True, prompt_eval_count=8, eval_count=4),
+    ])
+    control = ChatRunControl(
+        "run_project_required", "sess_basic", "turn_current", "model-a", "chat"
+    )
+    control.start_deadline(60)
+    events = parse_sse(asyncio.run(collect_stream(
+        request=SimpleNamespace(messages=[]),
+        settings={"ollama_url": "http://127.0.0.1:11434", "model_provider": "ollama"},
+        model="model-a",
+        session_id="sess_basic",
+        turn_id="turn_current",
+        run_id="run_project_required",
+        prompt_sha256="digest",
+        user_message_id=3,
+        user_query="Gmail 是否已連線？",
+        temporary_context="",
+        images=[],
+        run_control=control,
+        project_id=None,
+        post_chat=lambda *_args, **_kwargs: response,
+        host_tool_runtime=runtime,
+    )))
+    status = next(payload for name, payload in events if name == "capability_status")
+    assert status["items"][0]["reason_code"] == "project_required"
+    assert status["items"][0]["repair"] == {
+        "workspace": "chat",
+        "section": "project_switcher",
+        "label": "選擇 Project",
+    }
+
+
 def test_basic_stream_has_no_agent_events_or_tool_payload(monkeypatch):
     fake_db = FakeDatabase()
     monkeypatch.setattr(chat_runtime, "database", fake_db)

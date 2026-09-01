@@ -1323,12 +1323,12 @@ async function saveModelProviderSecrets() {
 
     const state = {
         deps: null,
-        activeTab: 'installed',
+        activeTab: 'available',
         projectId: null,
         response: { extensions: [], sections: {} },
         selectedExtensionId: null,
         detailReturnExtensionId: null,
-        detailReturnTab: 'installed',
+        detailReturnTab: 'available',
         n8nService: null,
         n8nServiceLoading: false,
         pendingReview: null,
@@ -1377,6 +1377,54 @@ async function saveModelProviderSecrets() {
         builtin: 'puzzle',
         local: 'package-open'
     }[item.kind] || (item.origin === 'local' ? 'package-open' : 'puzzle'));
+
+    function brandLogoFor(item) {
+        const id = String(item?.id || '').toLowerCase();
+        const integrationId = String(item?.integration_id || '').toLowerCase();
+        const name = String(item?.name || '').toLowerCase();
+        const exact = ({
+            'builtin.cursor': 'cursor.svg',
+            'builtin.excel': 'excel.svg',
+            'builtin.n8n': 'n8n.svg',
+            'builtin.ollama': 'ollama.svg',
+            'connector.github': 'github.svg',
+            'connector.notion': 'notion.svg',
+            'connector.gmail': 'gmail.svg',
+            gmail: 'gmail.svg',
+            github: 'github.svg',
+            notion: 'notion.svg',
+            n8n: 'n8n.svg',
+            google_drive: 'google-drive.svg',
+            google_calendar: 'google-calendar.svg',
+            slack: 'slack.svg',
+        })[integrationId || id];
+        if (exact) return `assets/brands/${exact}`;
+        if (name.includes('nvidia')) return 'assets/brands/nvidia.svg';
+        if (name.includes('ollama')) return 'assets/brands/ollama.svg';
+        if (name.includes('playwright')) return 'assets/brands/playwright.svg';
+        if (name.includes('cursor')) return 'assets/brands/cursor.svg';
+        if (name.includes('excel')) return 'assets/brands/excel.svg';
+        return null;
+    }
+
+    function appendCatalogIcon(container, item, fallback = null) {
+        const logo = brandLogoFor(item);
+        if (logo) {
+            container.classList.add('has-brand-logo');
+            const image = document.createElement('img');
+            image.className = 'extension-brand-logo';
+            image.src = logo;
+            image.alt = '';
+            image.setAttribute('aria-hidden', 'true');
+            image.loading = 'lazy';
+            image.decoding = 'async';
+            container.appendChild(image);
+            return;
+        }
+        const iconElement = document.createElement('i');
+        iconElement.dataset.lucide = fallback || iconFor(item);
+        container.appendChild(iconElement);
+    }
 
     function messageFrom(data, fallback) {
         const detail = data?.detail;
@@ -1506,6 +1554,8 @@ async function saveModelProviderSecrets() {
             'connector.github.issue.write': [tr('更新 GitHub 協作內容', 'Update GitHub collaboration content'), tr('經你逐次同意後建立或更新議題，以及加入一般留言。', 'Create or update issues and add ordinary comments after per-operation approval.')],
             'connector.notion.content.read': [tr('讀取已選取的 Notion 內容', 'Read selected Notion content'), tr('讀取專案已綁定的頁面、資料庫與其子項。', 'Read project-bound pages, databases, and their descendants.')],
             'connector.notion.content.write': [tr('更新 Notion 內容', 'Update Notion content'), tr('經你逐次同意後建立頁面、更新頁面或附加內容區塊。', 'Create pages, update pages, or append blocks after per-operation approval.')],
+            'connector.gmail.message.read': [tr('搜尋與讀取 Gmail', 'Search and read Gmail'), tr('搜尋並讀取目前專案已允許的 Gmail 信箱。', 'Search and read the Gmail mailbox allowed for this project.')],
+            'connector.gmail.draft.write': [tr('建立或寄送 Gmail 草稿', 'Create or send Gmail drafts'), tr('建立草稿或寄送指定草稿前，依權限政策取得你的批准。', 'Create or send a specified draft after approval under the active policy.')],
             'process.mcp': [tr('啟動本機工具程序', 'Start a local tool process'), tr('啟動已信任的本機 MCP 工具服務；不會自動安裝程式。', 'Start a trusted local MCP tool service. No software is installed automatically.')],
         }[id];
         return {
@@ -1523,16 +1573,10 @@ async function saveModelProviderSecrets() {
             .filter(Boolean);
         const explicit = normalize(response?.sections?.[section]);
         if (section === 'available') {
-            // Keep unavailable catalog entries discoverable even if an older
-            // release recorded them as installed. Their controls remain
-            // fail-closed through extensionControlPolicy().
-            const unavailable = normalize(response?.sections?.unavailable);
-            const unique = new Map(
-                [...explicit, ...unavailable]
-                    .filter(item => item.installed !== true)
-                    .map(item => [String(item.id), item])
-            );
-            if (unique.size) return [...unique.values()];
+            // Explore is a complete capability catalog, not merely an
+            // "uninstalled" filter. Installation and enablement remain
+            // separate, explicit actions on each item.
+            return all;
         }
         if (explicit.length) return explicit;
         if (section === 'installed') return all.filter(item => item.installed);
@@ -1543,7 +1587,32 @@ async function saveModelProviderSecrets() {
     }
 
     function sectionItems(section) {
-        return catalogSectionItems(state.response, section);
+        const items = catalogSectionItems(state.response, section);
+        if (section !== 'available') return items;
+        const represented = new Set(items.flatMap(item => {
+            const id = String(item.id || '').toLowerCase();
+            const kind = String(item.kind || '').toLowerCase();
+            if (id === 'builtin.n8n') return ['n8n'];
+            if (id === 'connector.github') return ['github'];
+            if (id === 'connector.notion') return ['notion'];
+            if (id === 'connector.gmail') return ['gmail'];
+            if (kind === 'mcp') return ['mcp'];
+            return [];
+        }));
+        const discovery = window.workbenchIntegrationCenter?.catalog?.() || [];
+        const supplements = discovery
+            .filter(item => !represented.has(String(item.id || '').toLowerCase()))
+            .map(item => ({
+                ...item,
+                id: `integration.${item.id}`,
+                integration_id: item.id,
+                discovery_only: true,
+                category: 'integration',
+                publisher: 'Workbench',
+                runtime_available: item.availability !== 'planned',
+                availability_reason: item.availability === 'planned' ? 'adapter_not_implemented' : null,
+            }));
+        return [...items, ...supplements];
     }
 
     function unavailableExplanation(item) {
@@ -1645,6 +1714,7 @@ async function saveModelProviderSecrets() {
     }
 
     function createExtensionCard(item) {
+        if (item.discovery_only) return createIntegrationDiscoveryCard(item);
         const card = document.createElement('article');
         card.className = `extension-card extension-discovery-card ${item.runtime_available === false ? 'is-disabled' : ''}`.trim();
         card.dataset.extensionId = String(item.id);
@@ -1653,9 +1723,7 @@ async function saveModelProviderSecrets() {
         head.className = 'extension-card-head';
         const icon = document.createElement('span');
         icon.className = 'extension-card-icon';
-        const iconElement = document.createElement('i');
-        iconElement.dataset.lucide = iconFor(item);
-        icon.appendChild(iconElement);
+        appendCatalogIcon(icon, item);
         const copy = document.createElement('div');
         copy.className = 'extension-card-copy';
         const title = document.createElement('div');
@@ -1709,6 +1777,68 @@ async function saveModelProviderSecrets() {
         }
 
         footer.append(stateLabel, actions);
+        card.append(head, footer);
+        return card;
+    }
+
+    function createIntegrationDiscoveryCard(item) {
+        const planned = item.availability === 'planned';
+        const englishCopy = ({
+            gmail: ['Email service', 'Use governed n8n workflows to receive labelled messages, create drafts, and require Workbench approval before sending.'],
+            mcp: ['Local tools', 'Expose tools through trusted local stdio MCP processes governed by the same Project policy.'],
+            external_api: ['External access', 'Issue an API key bound to this Workbench installation so n8n or another system can create and monitor Agent runs.'],
+            google_drive: ['Cloud files', 'A future connector can search, read, and export authorized Drive, Docs, Sheets, and Slides files within a Project.'],
+            google_calendar: ['Calendar', 'A future connector can read authorized events and create or update events after approval.'],
+            slack: ['Team collaboration', 'A future connector can read authorized channels, collect approvals, and deliver work results.'],
+        })[String(item.integration_id || '')];
+        const card = document.createElement('article');
+        card.className = `extension-card extension-discovery-card ${planned ? 'is-disabled' : ''}`.trim();
+        card.dataset.extensionId = String(item.id);
+        const head = document.createElement('div');
+        head.className = 'extension-card-head';
+        const icon = document.createElement('span');
+        icon.className = 'extension-card-icon';
+        appendCatalogIcon(icon, item, item.icon || 'plug');
+        const copy = document.createElement('div');
+        copy.className = 'extension-card-copy';
+        const title = document.createElement('div');
+        title.className = 'extension-card-title';
+        const titleText = document.createElement('span');
+        titleText.textContent = item.name;
+        title.appendChild(titleText);
+        const meta = document.createElement('div');
+        meta.className = 'extension-card-meta';
+        meta.textContent = `${isEnglish() ? (englishCopy?.[0] || 'Integration') : (item.kind || '整合服務')} · Workbench`;
+        const description = document.createElement('div');
+        description.className = 'extension-card-description';
+        description.textContent = isEnglish()
+            ? (englishCopy?.[1] || 'No description is available.')
+            : (item.description || '尚未提供說明。');
+        copy.append(title, meta, description);
+        head.append(icon, copy);
+
+        const footer = document.createElement('div');
+        footer.className = 'extension-card-summary-footer';
+        const status = document.createElement('span');
+        status.className = `extension-card-state ${planned ? '' : 'is-active'}`.trim();
+        status.textContent = planned ? tr('尚未提供', 'Not yet available') : tr('可查看與設定', 'Available to review');
+        const actions = document.createElement('div');
+        actions.className = 'extension-card-actions extension-card-primary-action';
+        const button = actionButton(
+            planned ? tr('尚未提供', 'Not yet available') : tr('了解詳情', 'Review details'),
+            'discover',
+            planned ? 'clock-3' : 'chevron-right',
+            'btn btn-secondary compact'
+        );
+        button.disabled = planned;
+        if (!planned) {
+            button.addEventListener('click', () => {
+                const tab = item.integration_id === 'external_api' ? 'api' : 'services';
+                state.deps?.openIntegrationCenter?.(tab);
+            });
+        }
+        actions.appendChild(button);
+        footer.append(status, actions);
         card.append(head, footer);
         return card;
     }
@@ -2339,7 +2469,7 @@ async function saveModelProviderSecrets() {
             node.textContent = String(count);
             node.setAttribute('aria-label', section === 'installed'
                 ? tr(`${count} 個已安裝`, `${count} installed`)
-                : tr(`${count} 個未安裝`, `${count} not installed`));
+                : tr(`${count} 個可探索功能`, `${count} discoverable capabilities`));
         });
         ['installed', 'available', 'local'].forEach(section => {
             const list = byId(`extension-${section}-list`);
@@ -2355,7 +2485,7 @@ async function saveModelProviderSecrets() {
             if (!items.length) {
                 list.appendChild(stateBlock(query ? tr('找不到符合的擴充。', 'No matching extension was found.') : {
                     installed: tr('尚未安裝任何擴充。', 'No extension is installed.'),
-                    available: tr('目前沒有未安裝的擴充。', 'There are no extensions available to install.'),
+                    available: tr('目前沒有可探索的功能。', 'There are no capabilities to discover.'),
                     local: tr('尚未註冊本機受信任擴充。', 'No trusted local extension is registered.')
                 }[section]));
                 return;
@@ -2884,7 +3014,7 @@ async function saveModelProviderSecrets() {
         });
     }
 
-    async function open(tab = 'installed', projectId = null) {
+    async function open(tab = 'available', projectId = null) {
         if (!state.initialized) return;
         applyExtensionLocale();
         closePermissionReview({ restoreFocus: false });

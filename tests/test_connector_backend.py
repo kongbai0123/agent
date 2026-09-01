@@ -188,6 +188,33 @@ def _connect_notion(service: ConnectorService, http: FakeHttp) -> dict:
     return service.complete_oauth("notion", state=_state(started), code="one-time-code")
 
 
+def _connect_gmail(service: ConnectorService, http: FakeHttp) -> dict:
+    _configure(service, "gmail")
+    started = service.start_oauth("gmail")
+    parsed = urlsplit(started["authorization_url"])
+    params = parse_qs(parsed.query)
+    assert parsed.netloc == "accounts.google.com"
+    assert "https://www.googleapis.com/auth/gmail.readonly" in params["scope"][0]
+    assert "https://www.googleapis.com/auth/gmail.compose" in params["scope"][0]
+    assert params["code_challenge_method"] == ["S256"]
+    http.add(
+        "POST",
+        "https://oauth2.googleapis.com/token",
+        {
+            "access_token": "gmail-access-token",
+            "refresh_token": "gmail-refresh-token",
+            "token_type": "Bearer",
+            "expires_in": 3600,
+        },
+    )
+    http.add(
+        "GET",
+        "https://gmail.googleapis.com/gmail/v1/users/me/profile",
+        {"emailAddress": "owner@example.com", "messagesTotal": 10, "threadsTotal": 8},
+    )
+    return service.complete_oauth("gmail", state=_state(started), code="one-time-code")
+
+
 def _github_write_dispatcher(
     service: ConnectorService,
     store: ConnectorStore,
@@ -710,6 +737,76 @@ def test_notion_bound_root_read_and_write_gate(components):
     assert len(http.calls) == call_count
 
 
+def test_gmail_import_search_and_approved_draft_creation(components):
+    service, store, secrets, http, _tmp_path = components
+    connection = _connect_gmail(service, http)
+    connection_id = connection["connection_id"]
+    assert connection["display_name"] == "owner@example.com"
+    assert secrets.get("connection", connection_id)["refresh_token"] == "gmail-refresh-token"
+    service.put_project_binding(
+        project_id="project-1",
+        connection_id=connection_id,
+        enabled=True,
+        mode="read_write",
+    )
+    mailbox = {
+        "resource_type": "mailbox",
+        "resource_id": "owner@example.com",
+        "display_label": "owner@example.com",
+    }
+    bound = service.replace_resources(
+        project_id="project-1",
+        connection_id=connection_id,
+        expected_revision=0,
+        resources=[mailbox],
+    )
+    assert bound["resources"][0]["resource_type"] == "mailbox"
+    definitions = {item["function"]["name"] for item in service.list_tool_definitions("project-1")}
+    assert {"gmail.search_messages", "gmail.get_message", "gmail.create_draft", "gmail.send_draft"} <= definitions
+
+    http.add(
+        "GET",
+        "https://gmail.googleapis.com/gmail/v1/users/me/messages",
+        {"messages": [{"id": "m_1"}], "resultSizeEstimate": 1},
+    )
+    http.add(
+        "GET",
+        "https://gmail.googleapis.com/gmail/v1/users/me/messages/m_1",
+        {
+            "id": "m_1",
+            "threadId": "t_1",
+            "snippet": "Quarterly report",
+            "payload": {"headers": [{"name": "Subject", "value": "Q3 report"}]},
+        },
+    )
+    search = service.execute_tool(
+        "project-1", "gmail.search_messages", {"query": "subject:Q3", "limit": 5}
+    )
+    assert search["result"]["messages"][0]["headers"]["subject"] == "Q3 report"
+
+    call_count = len(http.calls)
+    arguments = {
+        "to": ["recipient@example.com"],
+        "subject": "Follow-up",
+        "body": "Hello from Workbench.",
+    }
+    with pytest.raises(ConnectorServiceError) as approval:
+        service.execute_tool("project-1", "gmail.create_draft", arguments)
+    assert approval.value.code == "CONNECTOR_WRITE_APPROVAL_REQUIRED"
+    assert len(http.calls) == call_count
+    http.add(
+        "POST",
+        "https://gmail.googleapis.com/gmail/v1/users/me/drafts",
+        {"id": "draft_1", "message": {"id": "message_2"}},
+        status_code=201,
+    )
+    created = service.execute_tool(
+        "project-1", "gmail.create_draft", arguments, approved=True
+    )
+    assert created["result"]["draft_id"] == "draft_1"
+    assert "gmail-access-token" not in json.dumps(store.list_audits("gmail"))
+
+
 def test_router_contract_and_callbacks_are_secret_free(components):
     service, _store, secret_store, http, _tmp_path = components
     app = FastAPI()
@@ -729,7 +826,7 @@ def test_router_contract_and_callbacks_are_secret_free(components):
     client = TestClient(app)
 
     catalog = client.get("/api/connectors").json()
-    assert {item["id"] for item in catalog["connectors"]} == {"github", "notion"}
+    assert {item["id"] for item in catalog["connectors"]} == {"github", "notion", "gmail"}
     profile_response = client.put(
         "/api/connectors/github/auth-profile",
         json={
@@ -805,3 +902,91 @@ def test_invalid_callback_must_be_exact_loopback(components):
         "unavailable",
         {"reason": "no_account_connected"},
     )
+
+
+def test_central_policy_filters_repository_catalog_without_expanding_scope(components):
+    service, store, _secrets, http, _tmp_path = components
+    connection = _connect_github(service, http)
+    connection_id = connection["connection_id"]
+    service.put_project_binding(
+        project_id="project-1",
+        connection_id=connection_id,
+        enabled=True,
+        mode="read_only",
+    )
+    store.replace_resource_bindings(
+        project_id="project-1",
+        connection_id=connection_id,
+        expected_revision=0,
+        resources=[
+            {
+                "resource_type": "repository",
+                "resource_id": "openai/allowed",
+                "display_label": "openai/allowed",
+            },
+            {
+                "resource_type": "repository",
+                "resource_id": "openai/connector-only",
+                "display_label": "openai/connector-only",
+            },
+        ],
+    )
+    service.resource_policy_filter = (
+        lambda _project, _connector, _connection, _capability, resources: [
+            item for item in resources if item["resource_id"] == "openai/allowed"
+        ]
+    )
+
+    result = service.execute_tool(
+        "project-1",
+        "github.list_repositories",
+        {"connection_id": connection_id},
+    )
+
+    assert [item["resource_id"] for item in result["result"]["repositories"]] == [
+        "openai/allowed"
+    ]
+
+
+def test_notion_verified_child_reports_the_bound_policy_root(components):
+    service, store, _secrets, http, _tmp_path = components
+    connection = _connect_notion(service, http)
+    connection_id = connection["connection_id"]
+    service.put_project_binding(
+        project_id="project-1",
+        connection_id=connection_id,
+        enabled=True,
+        mode="read_only",
+    )
+    root_id = "11111111-1111-1111-1111-111111111111"
+    child_id = "22222222-2222-2222-2222-222222222222"
+    store.replace_resource_bindings(
+        project_id="project-1",
+        connection_id=connection_id,
+        expected_revision=0,
+        resources=[
+            {
+                "resource_type": "page",
+                "resource_id": root_id,
+                "display_label": "Allowed root",
+            }
+        ],
+    )
+    http.add(
+        "GET",
+        f"https://api.notion.com/v1/pages/{child_id}",
+        {"id": child_id, "parent": {"page_id": root_id}},
+    )
+
+    invocation = service.resolve_tool_invocation(
+        "project-1",
+        "notion.retrieve_page",
+        {"connection_id": connection_id, "page_id": child_id},
+        verify_remote_scope=True,
+    )
+
+    assert invocation["resource_id"] == child_id
+    assert invocation["verified_scope_root"] == {
+        "resource_type": "page",
+        "resource_id": root_id,
+    }

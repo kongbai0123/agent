@@ -1,4 +1,4 @@
-"""Governed local OAuth connectors for GitHub and Notion.
+"""Governed local OAuth connectors for GitHub, Notion and Gmail.
 
 The service owns provider HTTP traffic, token refresh, project/resource scope
 checks and normalized tool metadata.  Access tokens never leave this module.
@@ -9,6 +9,7 @@ pass ``approved=True`` only after a single-use approval has been consumed.
 from __future__ import annotations
 
 import base64
+from email.message import EmailMessage
 import hashlib
 import json
 import re
@@ -39,6 +40,10 @@ NOTION_API = "https://api.notion.com/v1"
 NOTION_AUTHORIZE = "https://api.notion.com/v1/oauth/authorize"
 NOTION_TOKEN = "https://api.notion.com/v1/oauth/token"
 NOTION_VERSION = "2022-06-28"
+GOOGLE_AUTHORIZE = "https://accounts.google.com/o/oauth2/v2/auth"
+GOOGLE_TOKEN = "https://oauth2.googleapis.com/token"
+GOOGLE_REVOKE = "https://oauth2.googleapis.com/revoke"
+GMAIL_API = "https://gmail.googleapis.com/gmail/v1"
 HTTP_TIMEOUT = (5, 30)
 
 _REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$")
@@ -51,6 +56,8 @@ _WRITE_TOOLS = {
     "notion.create_page",
     "notion.update_page",
     "notion.append_blocks",
+    "gmail.create_draft",
+    "gmail.send_draft",
 }
 
 
@@ -69,6 +76,7 @@ CONNECTOR_CATALOG: tuple[dict[str, Any], ...] = (
             "issue.write",
             "pull_request.read",
             "pull_request.comment",
+            "discussion.comment",
             "checks.read",
         ],
         "permissions": [
@@ -92,6 +100,20 @@ CONNECTOR_CATALOG: tuple[dict[str, Any], ...] = (
             {"name": "content", "access": "read"},
             {"name": "content", "access": "insert"},
             {"name": "content", "access": "update"},
+        ],
+    },
+    {
+        "id": "gmail",
+        "extension_id": "connector.gmail",
+        "name": "Gmail",
+        "description": "搜尋與閱讀信件，並在逐次批准後建立或寄送草稿。",
+        "auth_mode": "google_oauth2_pkce",
+        "callback_path": "/oauth/callback/gmail",
+        "resource_types": ["mailbox"],
+        "capabilities": ["message.read", "draft.create", "draft.send"],
+        "permissions": [
+            {"name": "messages", "access": "read"},
+            {"name": "drafts", "access": "write"},
         ],
     },
 )
@@ -244,6 +266,41 @@ TOOL_DEFINITIONS: tuple[dict[str, Any], ...] = (
         ("page_id", "children"),
         write=True,
     ),
+    _tool(
+        "gmail.search_messages",
+        "搜尋目前專案已授權 Gmail 帳號中的信件。",
+        {
+            "connection_id": _CONNECTION_PROPERTY,
+            "query": {"type": "string", "description": "Gmail 搜尋條件，例如 from:someone@example.com is:unread。"},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 20},
+        },
+    ),
+    _tool(
+        "gmail.get_message",
+        "讀取 Gmail 搜尋結果中的單一信件。",
+        {"connection_id": _CONNECTION_PROPERTY, "message_id": {"type": "string"}},
+        ("message_id",),
+    ),
+    _tool(
+        "gmail.create_draft",
+        "在 Gmail 建立草稿；建立前需要使用者逐次批准。",
+        {
+            "connection_id": _CONNECTION_PROPERTY,
+            "to": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 20},
+            "cc": {"type": "array", "items": {"type": "string"}, "maxItems": 20},
+            "subject": {"type": "string"},
+            "body": {"type": "string"},
+        },
+        ("to", "subject", "body"),
+        write=True,
+    ),
+    _tool(
+        "gmail.send_draft",
+        "寄送指定 Gmail 草稿；寄送前需要使用者逐次批准。",
+        {"connection_id": _CONNECTION_PROPERTY, "draft_id": {"type": "string"}},
+        ("draft_id",),
+        write=True,
+    ),
 )
 
 
@@ -333,6 +390,7 @@ class ConnectorService:
         secrets_store: Optional[ConnectorSecretStore] = None,
         http_session: Optional[requests.Session] = None,
         project_exists: Optional[Callable[[str], bool]] = None,
+        resource_policy_filter: Optional[Callable[..., Sequence[Mapping[str, Any]]]] = None,
     ) -> None:
         self.store = store or ConnectorStore()
         self.secrets = secrets_store or ConnectorSecretStore()
@@ -340,8 +398,66 @@ class ConnectorService:
         if hasattr(self.http, "trust_env"):
             self.http.trust_env = False
         self.project_exists = project_exists or (lambda _project_id: True)
+        self.resource_policy_filter = resource_policy_filter
         self._refresh_locks: dict[str, threading.Lock] = {}
         self._refresh_locks_guard = threading.RLock()
+
+    def _policy_filtered_resources(
+        self,
+        *,
+        project_id: str,
+        connector_id: str,
+        connection_id: str,
+        capability: str,
+        resources: Sequence[Mapping[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Apply the optional central policy without permitting scope growth."""
+
+        original = [dict(item) for item in resources if isinstance(item, Mapping)]
+        if self.resource_policy_filter is None:
+            return original
+        try:
+            filtered = self.resource_policy_filter(
+                project_id,
+                connector_id,
+                connection_id,
+                capability,
+                tuple(original),
+            )
+        except Exception as exc:
+            raise ConnectorServiceError(
+                "INTEGRATION_POLICY_UNAVAILABLE",
+                "目前無法確認第三方資源權限。",
+                status_code=503,
+                recoverable=True,
+            ) from exc
+        allowed_keys = {
+            (str(item.get("resource_type") or ""), str(item.get("resource_id") or ""))
+            for item in original
+        }
+        result: list[dict[str, Any]] = []
+        for raw in filtered or ():
+            if not isinstance(raw, Mapping):
+                raise ConnectorServiceError(
+                    "INTEGRATION_POLICY_INVALID",
+                    "第三方資源權限結果無效。",
+                    status_code=503,
+                    recoverable=True,
+                )
+            item = dict(raw)
+            key = (
+                str(item.get("resource_type") or ""),
+                str(item.get("resource_id") or ""),
+            )
+            if key not in allowed_keys:
+                raise ConnectorServiceError(
+                    "INTEGRATION_POLICY_SCOPE_EXPANDED",
+                    "第三方資源權限結果超出既有 Project 範圍。",
+                    status_code=503,
+                    recoverable=False,
+                )
+            result.append(item)
+        return result
 
     def initialize(self) -> dict[str, int]:
         self.store.ensure_schema()
@@ -499,7 +615,7 @@ class ConnectorService:
                 "allow_signup": "false",
             }
             authorization_url = f"{GITHUB_AUTHORIZE}?{urlencode(params)}"
-        else:
+        elif connector == "notion":
             params = {
                 "client_id": profile["client_id"],
                 "response_type": "code",
@@ -508,6 +624,25 @@ class ConnectorService:
                 "state": state,
             }
             authorization_url = f"{NOTION_AUTHORIZE}?{urlencode(params)}"
+        else:
+            params = {
+                "client_id": profile["client_id"],
+                "response_type": "code",
+                "redirect_uri": profile["callback_uri"],
+                "state": state,
+                "code_challenge": challenge,
+                "code_challenge_method": "S256",
+                "access_type": "offline",
+                "include_granted_scopes": "true",
+                "prompt": "consent",
+                "scope": " ".join(
+                    (
+                        "https://www.googleapis.com/auth/gmail.readonly",
+                        "https://www.googleapis.com/auth/gmail.compose",
+                    )
+                ),
+            }
+            authorization_url = f"{GOOGLE_AUTHORIZE}?{urlencode(params)}"
         self.store.audit(
             connector_id=connector,
             connection_id=connection_id,
@@ -736,6 +871,55 @@ class ConnectorService:
         }
         return tokens, self._token_expiry(token_payload), identity
 
+    def _exchange_gmail(
+        self,
+        *,
+        profile: Mapping[str, Any],
+        client_secret: str,
+        code: str,
+        verifier: str,
+    ) -> tuple[dict[str, str], Optional[str], dict[str, Any]]:
+        token_payload = self._request_json(
+            "POST",
+            GOOGLE_TOKEN,
+            data={
+                "client_id": profile["client_id"],
+                "client_secret": client_secret,
+                "code": code,
+                "code_verifier": verifier,
+                "grant_type": "authorization_code",
+                "redirect_uri": profile["callback_uri"],
+            },
+        )
+        if not isinstance(token_payload, Mapping) or token_payload.get("error"):
+            raise ConnectorServiceError(
+                "OAUTH_TOKEN_EXCHANGE_FAILED", "Google 拒絕 OAuth 授權碼。", status_code=502
+            )
+        tokens = self._token_values(token_payload)
+        profile_payload = self._request_json(
+            "GET",
+            f"{GMAIL_API}/users/me/profile",
+            headers=self._gmail_headers(tokens["access_token"]),
+        )
+        email_address = str(
+            profile_payload.get("emailAddress") if isinstance(profile_payload, Mapping) else ""
+        ).strip()
+        if not email_address:
+            raise ConnectorServiceError(
+                "CONNECTOR_ACCOUNT_INVALID", "Gmail 未回傳有效的帳號資料。", status_code=502
+            )
+        identity = {
+            "account_id": email_address.casefold(),
+            "display_name": email_address,
+            "workspace_id": None,
+            "metadata": {
+                "email_address": email_address,
+                "messages_total": int(profile_payload.get("messagesTotal") or 0),
+                "threads_total": int(profile_payload.get("threadsTotal") or 0),
+            },
+        }
+        return tokens, self._token_expiry(token_payload), identity
+
     def complete_oauth(
         self,
         connector_id: str,
@@ -795,11 +979,18 @@ class ConnectorService:
                     code=authorization_code,
                     verifier=verifier,
                 )
-            else:
+            elif connector == "notion":
                 tokens, token_expiry, identity = self._exchange_notion(
                     profile=profile,
                     client_secret=client_secret,
                     code=authorization_code,
+                )
+            else:
+                tokens, token_expiry, identity = self._exchange_gmail(
+                    profile=profile,
+                    client_secret=client_secret,
+                    code=authorization_code,
+                    verifier=verifier,
                 )
             target_id = str(flow.get("connection_id") or "")
             if target_id:
@@ -962,7 +1153,7 @@ class ConnectorService:
                         "refresh_token": refresh_token,
                     },
                 )
-            else:
+            elif connector == "notion":
                 basic = base64.b64encode(
                     f"{profile['client_id']}:{client_secret}".encode("utf-8")
                 ).decode("ascii")
@@ -976,6 +1167,17 @@ class ConnectorService:
                         "Notion-Version": NOTION_VERSION,
                     },
                     json={"grant_type": "refresh_token", "refresh_token": refresh_token},
+                )
+            else:
+                payload = self._request_json(
+                    "POST",
+                    GOOGLE_TOKEN,
+                    data={
+                        "client_id": profile["client_id"],
+                        "client_secret": client_secret,
+                        "grant_type": "refresh_token",
+                        "refresh_token": refresh_token,
+                    },
                 )
             if not isinstance(payload, Mapping):
                 raise ConnectorServiceError(
@@ -1013,11 +1215,17 @@ class ConnectorService:
                     f"{GITHUB_API}/user",
                     headers=self._github_headers(access_token),
                 )
-            else:
+            elif connector == "notion":
                 self._request_json(
                     "GET",
                     f"{NOTION_API}/users/me",
                     headers=self._notion_headers(access_token),
+                )
+            else:
+                self._request_json(
+                    "GET",
+                    f"{GMAIL_API}/users/me/profile",
+                    headers=self._gmail_headers(access_token),
                 )
             current = self.store.update_connection_status(
                 connection_id, status="connected", validated=True
@@ -1081,7 +1289,7 @@ class ConnectorService:
                             },
                             json={"access_token": access_token},
                         )
-                    else:
+                    elif connector == "notion":
                         self._request_json(
                             "POST",
                             f"{NOTION_API}/oauth/revoke",
@@ -1093,6 +1301,14 @@ class ConnectorService:
                                 "Notion-Version": NOTION_VERSION,
                             },
                             json={"token": access_token},
+                        )
+                    else:
+                        self._request_json(
+                            "POST",
+                            GOOGLE_REVOKE,
+                            mutation=True,
+                            headers={"Content-Type": "application/x-www-form-urlencoded"},
+                            data={"token": access_token},
                         )
             except Exception as exc:
                 code = getattr(exc, "code", "CONNECTOR_REVOKE_FAILED")
@@ -1141,6 +1357,14 @@ class ConnectorService:
             "Authorization": f"Bearer {access_token}",
             "Content-Type": "application/json",
             "Notion-Version": NOTION_VERSION,
+        }
+
+    @staticmethod
+    def _gmail_headers(access_token: str) -> dict[str, str]:
+        return {
+            "Accept": "application/json",
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
         }
 
     def put_project_binding(
@@ -1287,7 +1511,7 @@ class ConnectorService:
                     )
                     if len(items) < 100:
                         break
-        else:
+        elif connector == "notion":
             if requested_type and requested_type not in {"page", "database"}:
                 return []
             cursor: Optional[str] = None
@@ -1317,6 +1541,33 @@ class ConnectorService:
                 cursor = str(payload.get("next_cursor") or "") or None
                 if not payload.get("has_more") or not cursor:
                     break
+        else:
+            if requested_type and requested_type != "mailbox":
+                return []
+            profile = self._request_json(
+                "GET",
+                f"{GMAIL_API}/users/me/profile",
+                headers=self._gmail_headers(access_token),
+            )
+            email_address = str(
+                profile.get("emailAddress") if isinstance(profile, Mapping) else ""
+            ).strip()
+            if not email_address:
+                raise ConnectorServiceError(
+                    "CONNECTOR_RESPONSE_INVALID", "Gmail 未回傳有效的信箱資料。", status_code=502
+                )
+            resources.append(
+                {
+                    "resource_type": "mailbox",
+                    "resource_id": email_address.casefold(),
+                    "parent_id": None,
+                    "display_label": email_address,
+                    "metadata": {
+                        "messages_total": int(profile.get("messagesTotal") or 0),
+                        "threads_total": int(profile.get("threadsTotal") or 0),
+                    },
+                }
+            )
         deduplicated: dict[tuple[str, str], dict[str, Any]] = {}
         for resource in resources:
             if q and q not in resource["display_label"].casefold() and q not in resource["resource_id"].casefold():
@@ -1346,6 +1597,17 @@ class ConnectorService:
             if not isinstance(payload, Mapping) or not payload.get("full_name"):
                 raise ConnectorServiceError("RESOURCE_NOT_FOUND", "The repository was not found.", status_code=404)
             return self._github_resource(payload, resource.get("parent_id"))
+        if connector == "gmail":
+            email_address = str((connection.get("metadata") or {}).get("email_address") or connection.get("account_id") or "").strip()
+            if kind != "mailbox" or identity.casefold() != email_address.casefold():
+                raise ConnectorServiceError("RESOURCE_NOT_FOUND", "Gmail 信箱與此連線不相符。", status_code=404)
+            return {
+                "resource_type": "mailbox",
+                "resource_id": email_address.casefold(),
+                "parent_id": None,
+                "display_label": email_address,
+                "metadata": {},
+            }
         notion_id = self._notion_id(identity)
         if kind == "page":
             endpoint = f"{NOTION_API}/pages/{quote(notion_id, safe='')}"
@@ -1594,22 +1856,25 @@ class ConnectorService:
         connection: Mapping[str, Any],
         resource_id: str,
         resource_type: str = "page",
-    ) -> None:
+    ) -> dict[str, Any]:
         connection_id = connection["connection_id"]
         bound = self.store.list_resource_bindings(
             project_id=project_id, connection_id=connection_id
         )["resources"]
-        allowed = {self._notion_key(item["resource_id"]) for item in bound}
+        allowed = {
+            self._notion_key(item["resource_id"]): dict(item)
+            for item in bound
+        }
         current = self._notion_id(resource_id)
         if self._notion_key(current) in allowed:
-            return
+            return allowed[self._notion_key(current)]
         access_token, _ = self._access_token(connection)
         current_type = resource_type
         visited: set[str] = set()
         for _depth in range(32):
             key = self._notion_key(current)
             if key in allowed:
-                return
+                return allowed[key]
             if key in visited:
                 break
             visited.add(key)
@@ -1651,10 +1916,17 @@ class ConnectorService:
     ) -> Any:
         connection_id = str(connection["connection_id"])
         if tool_name == "github.list_repositories":
+            visible = self._policy_filtered_resources(
+                project_id=project_id,
+                connector_id="github",
+                connection_id=connection_id,
+                capability="repository.read",
+                resources=resources["resources"],
+            )
             return {
                 "repositories": [
                     item
-                    for item in resources["resources"]
+                    for item in visible
                     if item["resource_type"] == "repository"
                 ]
             }
@@ -1807,10 +2079,17 @@ class ConnectorService:
     ) -> Any:
         if tool_name == "notion.search":
             query = str(arguments.get("query") or "").strip().casefold()
+            visible = self._policy_filtered_resources(
+                project_id=project_id,
+                connector_id="notion",
+                connection_id=str(connection["connection_id"]),
+                capability="content.read",
+                resources=resources["resources"],
+            )
             return {
                 "results": [
                     item
-                    for item in resources["resources"]
+                    for item in visible
                     if not query
                     or query in item["display_label"].casefold()
                     or query in item["resource_id"].casefold()
@@ -1904,6 +2183,170 @@ class ConnectorService:
             )
         raise ConnectorServiceError("CONNECTOR_TOOL_NOT_FOUND", "The connector tool was not found.", status_code=404)
 
+    @staticmethod
+    def _gmail_message_summary(payload: Mapping[str, Any]) -> dict[str, Any]:
+        message_payload = payload.get("payload") if isinstance(payload.get("payload"), Mapping) else {}
+        headers = message_payload.get("headers") if isinstance(message_payload.get("headers"), list) else []
+        selected: dict[str, str] = {}
+        for item in headers:
+            if not isinstance(item, Mapping):
+                continue
+            name = str(item.get("name") or "").casefold()
+            if name in {"from", "to", "cc", "subject", "date"}:
+                selected[name] = str(item.get("value") or "")[:2048]
+        return {
+            "id": str(payload.get("id") or ""),
+            "thread_id": str(payload.get("threadId") or ""),
+            "label_ids": [str(item) for item in list(payload.get("labelIds") or [])[:64]],
+            "snippet": str(payload.get("snippet") or "")[:4096],
+            "headers": selected,
+            "internal_date": str(payload.get("internalDate") or ""),
+        }
+
+    @classmethod
+    def _gmail_message_body(cls, payload: Mapping[str, Any]) -> str:
+        chunks: list[str] = []
+
+        def visit(part: Mapping[str, Any]) -> None:
+            mime_type = str(part.get("mimeType") or "").casefold()
+            body = part.get("body") if isinstance(part.get("body"), Mapping) else {}
+            encoded = str(body.get("data") or "")
+            if encoded and mime_type in {"text/plain", "text/html"}:
+                try:
+                    padding = "=" * (-len(encoded) % 4)
+                    decoded = base64.urlsafe_b64decode(encoded + padding).decode("utf-8", errors="replace")
+                    chunks.append(decoded[:131_072])
+                except (ValueError, UnicodeError):
+                    pass
+            for child in list(part.get("parts") or [])[:100]:
+                if isinstance(child, Mapping):
+                    visit(child)
+
+        root = payload.get("payload") if isinstance(payload.get("payload"), Mapping) else {}
+        visit(root)
+        return "\n".join(chunks)[:262_144]
+
+    @staticmethod
+    def _gmail_identifier(value: Any, label: str) -> str:
+        identifier = str(value or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,256}", identifier):
+            raise ConnectorServiceError("INVALID_TOOL_ARGUMENTS", f"{label} 無效。")
+        return identifier
+
+    def _gmail_call(
+        self,
+        *,
+        project_id: str,
+        connection: Mapping[str, Any],
+        resources: Mapping[str, Any],
+        tool_name: str,
+        arguments: Mapping[str, Any],
+    ) -> Any:
+        del project_id, resources
+        access_token, _ = self._access_token(connection)
+        headers = self._gmail_headers(access_token)
+        if tool_name == "gmail.search_messages":
+            query = str(arguments.get("query") or "").strip()
+            if len(query) > 1024:
+                raise ConnectorServiceError("INVALID_TOOL_ARGUMENTS", "Gmail 搜尋條件過長。")
+            limit = self._positive_int(arguments.get("limit") or 10, "limit", maximum=20)
+            listing = self._request_json(
+                "GET",
+                f"{GMAIL_API}/users/me/messages",
+                headers=headers,
+                params={"q": query, "maxResults": limit},
+            )
+            messages = listing.get("messages") if isinstance(listing, Mapping) else None
+            if messages is None:
+                messages = []
+            if not isinstance(messages, list):
+                raise ConnectorServiceError("CONNECTOR_RESPONSE_INVALID", "Gmail 搜尋結果格式無效。", status_code=502)
+            results = []
+            for item in messages[:limit]:
+                message_id = self._gmail_identifier(
+                    item.get("id") if isinstance(item, Mapping) else "", "Gmail 信件 ID"
+                )
+                detail = self._request_json(
+                    "GET",
+                    f"{GMAIL_API}/users/me/messages/{quote(message_id, safe='')}",
+                    headers=headers,
+                    params={
+                        "format": "metadata",
+                        "metadataHeaders": ["From", "To", "Cc", "Subject", "Date"],
+                    },
+                )
+                if isinstance(detail, Mapping):
+                    results.append(self._gmail_message_summary(detail))
+            return {
+                "messages": results,
+                "result_size_estimate": int(listing.get("resultSizeEstimate") or len(results)),
+            }
+        if tool_name == "gmail.get_message":
+            message_id = self._gmail_identifier(arguments.get("message_id"), "Gmail 信件 ID")
+            payload = self._request_json(
+                "GET",
+                f"{GMAIL_API}/users/me/messages/{quote(message_id, safe='')}",
+                headers=headers,
+                params={"format": "full"},
+            )
+            if not isinstance(payload, Mapping):
+                raise ConnectorServiceError("CONNECTOR_RESPONSE_INVALID", "Gmail 信件格式無效。", status_code=502)
+            return {**self._gmail_message_summary(payload), "body": self._gmail_message_body(payload)}
+        if tool_name == "gmail.create_draft":
+            recipients = arguments.get("to")
+            copies = arguments.get("cc", [])
+            if not isinstance(recipients, list) or not recipients or len(recipients) > 20:
+                raise ConnectorServiceError("INVALID_TOOL_ARGUMENTS", "收件者必須為 1 至 20 個地址。")
+            if not isinstance(copies, list) or len(copies) > 20:
+                raise ConnectorServiceError("INVALID_TOOL_ARGUMENTS", "副本收件者最多 20 個地址。")
+            email_pattern = re.compile(r"^[^\s@,]+@[^\s@,]+\.[^\s@,]+$")
+            to_values = [str(item).strip() for item in recipients]
+            cc_values = [str(item).strip() for item in copies]
+            if any(not email_pattern.fullmatch(item) for item in to_values + cc_values):
+                raise ConnectorServiceError("INVALID_TOOL_ARGUMENTS", "收件者地址格式無效。")
+            subject = str(arguments.get("subject") or "").strip()
+            body = str(arguments.get("body") or "")
+            if not subject or len(subject) > 998 or not body or len(body.encode("utf-8")) > 262_144:
+                raise ConnectorServiceError("INVALID_TOOL_ARGUMENTS", "Gmail 草稿主旨或內容無效。")
+            message = EmailMessage()
+            message["To"] = ", ".join(to_values)
+            if cc_values:
+                message["Cc"] = ", ".join(cc_values)
+            message["Subject"] = subject
+            message.set_content(body)
+            raw = base64.urlsafe_b64encode(message.as_bytes()).rstrip(b"=").decode("ascii")
+            payload = self._request_json(
+                "POST",
+                f"{GMAIL_API}/users/me/drafts",
+                expected=(200, 201),
+                mutation=True,
+                headers=headers,
+                json={"message": {"raw": raw}},
+            )
+            return {
+                "draft_id": str(payload.get("id") or ""),
+                "message_id": str((payload.get("message") or {}).get("id") or "") if isinstance(payload, Mapping) else "",
+                "subject": subject,
+                "to": to_values,
+                "cc": cc_values,
+            }
+        if tool_name == "gmail.send_draft":
+            draft_id = self._gmail_identifier(arguments.get("draft_id"), "Gmail 草稿 ID")
+            payload = self._request_json(
+                "POST",
+                f"{GMAIL_API}/users/me/drafts/send",
+                mutation=True,
+                headers=headers,
+                json={"id": draft_id},
+            )
+            return {
+                "draft_id": draft_id,
+                "message_id": str(payload.get("id") or "") if isinstance(payload, Mapping) else "",
+                "thread_id": str(payload.get("threadId") or "") if isinstance(payload, Mapping) else "",
+                "sent": True,
+            }
+        raise ConnectorServiceError("CONNECTOR_TOOL_NOT_FOUND", "找不到 Gmail 工具。", status_code=404)
+
     def resolve_tool_invocation(
         self,
         project_id: str,
@@ -1963,7 +2406,8 @@ class ConnectorService:
                 connection_id=connection["connection_id"],
                 repository=resource_id,
             )
-        elif connector == "notion":
+        verified_scope_root: Optional[dict[str, Any]] = None
+        if connector == "notion":
             for key, kind in (
                 ("page_id", "page"),
                 ("database_id", "database"),
@@ -1974,7 +2418,7 @@ class ConnectorService:
                     resource_id = self._notion_id(safe_arguments[key])
                     break
             if verify_remote_scope and resource_id != "*":
-                self._ensure_notion_scope(
+                verified_scope_root = self._ensure_notion_scope(
                     project_id=project_id,
                     connection=connection,
                     resource_id=resource_id,
@@ -1984,6 +2428,17 @@ class ConnectorService:
                         else "page"
                     ),
                 )
+        if connector == "gmail":
+            mailbox = next(
+                (item for item in resources["resources"] if item["resource_type"] == "mailbox"),
+                None,
+            )
+            if mailbox is None:
+                raise ConnectorServiceError(
+                    "RESOURCE_BINDING_REQUIRED", "此專案尚未允許 Gmail 信箱。", status_code=409
+                )
+            resource_type = "mailbox"
+            resource_id = str(mailbox["resource_id"])
         return {
             "connector_id": connector,
             "extension_id": f"connector.{connector}",
@@ -2002,6 +2457,14 @@ class ConnectorService:
                 }
                 for item in resources["resources"]
             ],
+            "verified_scope_root": (
+                {
+                    "resource_type": verified_scope_root["resource_type"],
+                    "resource_id": verified_scope_root["resource_id"],
+                }
+                if verified_scope_root is not None
+                else None
+            ),
             "arguments": safe_arguments,
             "arguments_sha256": _digest(safe_arguments),
         }
@@ -2046,8 +2509,16 @@ class ConnectorService:
                     tool_name=tool_name,
                     arguments=safe_arguments,
                 )
-            else:
+            elif connector == "notion":
                 result = self._notion_call(
+                    project_id=project_id,
+                    connection=connection,
+                    resources=resources,
+                    tool_name=tool_name,
+                    arguments=safe_arguments,
+                )
+            else:
+                result = self._gmail_call(
                     project_id=project_id,
                     connection=connection,
                     resources=resources,

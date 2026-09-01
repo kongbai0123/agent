@@ -223,7 +223,7 @@ def test_output_panel_tracks_workspace_escape_focus_and_runtime_resize():
         "function initWorkbench",
     )
     assert "workbenchRunInspector?.setAvailable?.(!managementMode" in workspace
-    assert "const managementMode = knowledgeMode || extensionMode || modelMode || cloudMode" in workspace
+    assert "const managementMode = knowledgeMode || extensionMode || integrationMode || modelMode || cloudMode" in workspace
     assert "runInspectorSuspendedWorkspace === primaryWorkspace" in workspace
     assert "workflowMode && !returningToSuspendedWorkspace" in workspace
     assert "syncChatDrawerA11y(drawer)" in workspace

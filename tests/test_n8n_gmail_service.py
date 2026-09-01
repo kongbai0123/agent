@@ -56,6 +56,7 @@ def gmail(tmp_path, monkeypatch):
         draft_generator=generator,
         delivery_dispatcher=lambda value: dispatched.append(dict(value)),
         enable_guard=lambda profile: {"ready": True},
+        permission_check=lambda *_args, **_kwargs: {"decision": "allow"},
         clock=lambda: now,
         id_factory=id_factory,
     )
@@ -124,6 +125,80 @@ def test_profile_auto_start_is_opt_in_and_persists_explicit_choice(gmail):
 
     assert updated["auto_start"] is True
     assert database.get_n8n_gmail_profile()["auto_start"] == 1
+
+
+def test_opaque_mail_ids_cannot_cross_the_enabled_profile_project(gmail):
+    service, generated, _dispatched, _now, db_path = gmail
+    database.create_project("project_two", "Other Project", str(db_path.parent / "project-two"))
+    queued = service.compose({"instruction": "Private draft", "subject": "Private"})
+    with database.get_db_conn() as conn:
+        conn.execute(
+            "UPDATE n8n_gmail_drafts SET project_id=? WHERE draft_id=?",
+            ("project_two", queued["draft_id"]),
+        )
+
+    operations = (
+        lambda: service.get_draft(queued["draft_id"]),
+        lambda: service.get_mail_run(queued["run_id"]),
+        lambda: service.generate_draft(queued["draft_id"]),
+        lambda: service.edit_draft(
+            queued["draft_id"],
+            {"expected_revision": 0, "expected_sha256": "0" * 64, "body": "changed"},
+        ),
+        lambda: service.approve_draft(
+            queued["draft_id"],
+            {"expected_revision": 0, "expected_sha256": "0" * 64},
+        ),
+        lambda: service.reject_draft(
+            queued["draft_id"],
+            {"expected_revision": 0, "expected_sha256": "0" * 64},
+        ),
+        lambda: service.regenerate_draft(
+            queued["draft_id"],
+            {"expected_revision": 0, "expected_sha256": "0" * 64},
+        ),
+        lambda: service.tombstone_draft(queued["draft_id"]),
+    )
+    for operation in operations:
+        with pytest.raises(GmailIntegrationError) as hidden:
+            operation()
+        assert hidden.value.status_code == 404
+
+    assert service.list_drafts() == []
+    assert generated == []
+
+
+def test_inbound_idempotency_record_cannot_cross_project_scope(gmail):
+    service, _generated, _dispatched, _now, _db_path = gmail
+    accepted = service.receive_event(inbound())
+    with database.get_db_conn() as conn:
+        conn.execute(
+            "UPDATE n8n_gmail_events SET project_id=? WHERE event_id=?",
+            ("different_project", accepted["event_id"]),
+        )
+
+    with pytest.raises(GmailIntegrationError) as hidden:
+        service.receive_event(inbound())
+
+    assert hidden.value.code == "event_not_found"
+    assert hidden.value.status_code == 404
+
+
+def test_thread_id_cannot_cross_the_enabled_profile_project(gmail):
+    service, _generated, _dispatched, _now, _db_path = gmail
+    queued = service.compose({"instruction": "Private draft", "subject": "Private"})
+    row = database.get_n8n_gmail_draft(queued["draft_id"])
+    with database.get_db_conn() as conn:
+        conn.execute(
+            "UPDATE n8n_gmail_threads SET project_id=? WHERE thread_id=?",
+            ("different_project", row["thread_id"]),
+        )
+
+    with pytest.raises(GmailIntegrationError) as hidden:
+        service.delete_thread(row["thread_id"])
+
+    assert hidden.value.code == "mail_thread_not_found"
+    assert hidden.value.status_code == 404
 
 
 def test_profile_enable_fails_closed_without_local_recipient_configuration(gmail):
@@ -533,3 +608,48 @@ def test_enable_guard_failure_keeps_profile_disabled(gmail):
         })
     assert rejected.value.code == "isolation_not_ready"
     assert blocked.get_profile()["enabled"] is False
+
+
+def test_permission_gate_covers_read_draft_generation_and_send_recheck(gmail):
+    service, generated, dispatched, _, _ = gmail
+    calls = []
+
+    def guarded(project_id, capability, *, resource_type=None, resource_id=None):
+        calls.append((project_id, capability, resource_type, resource_id))
+        if capability == "message.send":
+            return {"decision": "require_approval"}
+        return {"decision": "allow"}
+
+    service._permission_check = guarded
+    queued = service.compose({"instruction": "Draft", "subject": "Hello", "model": None})
+    service.generate_draft(queued["draft_id"])
+    draft = service.get_draft(queued["draft_id"])
+    approved = service.approve_draft(
+        queued["draft_id"],
+        {
+            "expected_revision": draft["revision"],
+            "expected_sha256": draft["content_sha256"],
+        },
+    )
+    assert approved["status"] == "approved_queued"
+    assert any(call[1] == "draft.create" for call in calls)
+    assert any(call[1] == "message.read" for call in calls)
+    assert any(call[1] == "message.send" for call in calls)
+
+    service._permission_check = lambda *_args, **_kwargs: {"decision": "deny"}
+    with pytest.raises(GmailIntegrationError) as denied:
+        service.dispatch_delivery(approved["delivery_id"])
+    assert denied.value.code == "gmail_permission_denied"
+    assert dispatched == []
+    assert len(generated) == 1
+
+
+def test_background_generation_rechecks_policy_before_model_call(gmail):
+    service, generated, _, _, _ = gmail
+    queued = service.compose({"instruction": "Draft", "subject": "Hello", "model": None})
+    service._permission_check = lambda *_args, **_kwargs: {"decision": "deny"}
+    with pytest.raises(GmailIntegrationError) as denied:
+        service.generate_draft(queued["draft_id"])
+    assert denied.value.code == "gmail_permission_denied"
+    assert generated == []
+    assert database.get_n8n_gmail_draft(queued["draft_id"])["status"] == "generation_failed"

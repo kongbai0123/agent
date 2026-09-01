@@ -40,6 +40,7 @@ SECRET_KEY_PARTS = (
 SECRET_VALUE_PATTERNS = (
     re.compile(r"\bsk-[A-Za-z0-9]{16,}\b"),
     re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b"),
+    re.compile(r"\bwbk_[a-f0-9]{12}_[A-Za-z0-9_-]{43}\b", re.IGNORECASE),
     re.compile(r"\bBearer\s+[A-Za-z0-9._\-]{16,}\b", re.IGNORECASE),
     re.compile(r"\bX-Workbench-Token:\s*\S+", re.IGNORECASE),
 )
